@@ -200,13 +200,26 @@ void __global__ fmha_reference_mxfp8_kernel(
         sum += mS[k];
       ElementAccumulator inv_sum = 1.0f / sum;
 
-      // --- Phase 3: P * V (P=fp32, V=MXFP8 dequantized) ---
+      // --- Phase 2.5: Compute P scale factors (SFP) in real-time ---
+      // P in mS[k] is softmax output (non-negative).
+      // Groups of 32 along K-dim: compute per-group max, then biased exponent.
+      // Phase 1: SFP = 1.0 (biased exponent 127) — will become real in Phase 3.
+      // Store SFP at mS + K (reuse smem after softmax values consumed locally)
+      const int kNumSFPGroups = (size<1>(problem_shape) + kMXFP8GroupSize - 1) / kMXFP8GroupSize;
+      // In Phase 1, hardcode SFP = 1.0 (biased=127) for all groups.
+      // Since mS[k] is still needed for P*V loop below (per-thread), we cannot
+      // overwrite it globally. Instead, compute SFP values per group on-the-fly
+      // inside the P*V loop below, starting with constant 1.0.
+
+      // --- Phase 3: P * V (P = fp32 × SFP, V = MXFP8 dequantized) ---
+      // SFP = 1.0 in Phase 1, so sf_scale = 1.0 always.
       // SFV groups along K-seqlen, matching MMA
       for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
         ElementAccumulator acc = 0;
         for (int k = 0; k < size<1>(problem_shape); k++) {
           int gk = (k + offset_K) / kMXFP8GroupSize;
-          ElementAccumulator p_fp32 = mS[k];
+          // Phase 1: SFP = 1.0 (scale = 2^(127-127) = 1.0)
+          ElementAccumulator p_fp32 = mS[k];  // * 1.0 = same as before
           ElementAccumulator v_fp32 =
               ElementAccumulator(mV(k + offset_K, d, coord_L))
             * ElementAccumulator(mSFV(d, gk, idx_L));
