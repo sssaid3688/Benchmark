@@ -146,16 +146,16 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
     auto problem_shape_pv = select<0,2,1,3>(problem_shape_qk);
     // SFP is generated in softmax_step, not loaded from GMEM.
-    // Pass nullptr + dummy layout for the SFP TMA descriptor (still needed for MMA).
+    // Pass default args for SFP TMA descriptor (still needed by PV MMA internally).
     layout_SF lP_dummy{};
     auto params_pv = CollectiveMmaPV::to_underlying_arguments(
         problem_shape_pv,
         typename CollectiveMmaPV::Arguments {
             ptr_K, dK,  // never used, dummy (P is in TMEM)
             ptr_V, select<1,0,2>(dV),
-            nullptr, lP_dummy,  // SFP not loaded from GMEM (generated in softmax_step)
+            nullptr, lP_dummy,
             ptr_SFV, lV,
-        }, /*workspace=*/ nullptr);
+        }, nullptr);
 
     return Params{
         params_qk.tma_load_a,

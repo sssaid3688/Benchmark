@@ -201,25 +201,39 @@ void __global__ fmha_reference_mxfp8_kernel(
       ElementAccumulator inv_sum = 1.0f / sum;
 
       // --- Phase 2.5: Compute P scale factors (SFP) in real-time ---
-      // P in mS[k] is softmax output (non-negative).
-      // Groups of 32 along K-dim: compute per-group max, then biased exponent.
-      // Phase 1: SFP = 1.0 (biased exponent 127) — will become real in Phase 3.
-      // Store SFP at mS + K (reuse smem after softmax values consumed locally)
+      // P in mS[k] is softmax output (non-negative). Groups of 32 along K-dim.
+      // For each row idx_Q: compute per-group max → floor(log2) → biased exponent.
+      // P is non-negative, so amax = max(P[group]) (no abs needed).
+      // Store SFP in shared memory right after mS (at mS + K).
       const int kNumSFPGroups = (size<1>(problem_shape) + kMXFP8GroupSize - 1) / kMXFP8GroupSize;
-      // In Phase 1, hardcode SFP = 1.0 (biased=127) for all groups.
-      // Since mS[k] is still needed for P*V loop below (per-thread), we cannot
-      // overwrite it globally. Instead, compute SFP values per group on-the-fly
-      // inside the P*V loop below, starting with constant 1.0.
+      ElementAccumulator* mSFP = mS + size<1>(problem_shape);  // SFP after P in smem
+      for (int g = threadIdx.x; g < kNumSFPGroups; g += blockDim.x) {
+        int start_k = g * kMXFP8GroupSize;
+        int end_k = min(start_k + kMXFP8GroupSize, size<1>(problem_shape));
+        ElementAccumulator group_max = 0.0f;
+        for (int k = start_k; k < end_k; k++) {
+          group_max = max(group_max, mS[k]);
+        }
+        // P is non-negative, so max ≥ 0. Compute biased exponent.
+        float log2_max = (group_max > 0) ? log2f((float)group_max) : -127.0f;
+        int biased = (int)(floorf(log2_max)) + 127;
+        biased = min(max(biased, 0), 254);
+        mSFP[g] = ElementAccumulator(biased);
+      }
+      __syncthreads();  // ensure SFP written before P*V reads it
 
-      // --- Phase 3: P * V (P = fp32 × SFP, V = MXFP8 dequantized) ---
-      // SFP = 1.0 in Phase 1, so sf_scale = 1.0 always.
+      // --- Phase 3: P * V (P = fp32 × SFP dequant, V = MXFP8 dequantized) ---
+      // SFP computed from P in Phase 2.5 above.
       // SFV groups along K-seqlen, matching MMA
       for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
         ElementAccumulator acc = 0;
         for (int k = 0; k < size<1>(problem_shape); k++) {
           int gk = (k + offset_K) / kMXFP8GroupSize;
-          // Phase 1: SFP = 1.0 (scale = 2^(127-127) = 1.0)
-          ElementAccumulator p_fp32 = mS[k];  // * 1.0 = same as before
+          int gp = k / kMXFP8GroupSize;  // SFP group along K
+          // Dequantize P: p_fp32 * 2^(biased-127)
+          int biased = (int)(mSFP[gp]);
+          float sf_scale = exp2f((float)(biased - 127));
+          ElementAccumulator p_fp32 = mS[k] * sf_scale;
           ElementAccumulator v_fp32 =
               ElementAccumulator(mV(k + offset_K, d, coord_L))
             * ElementAccumulator(mSFV(d, gk, idx_L));
@@ -260,7 +274,9 @@ void fmha_reference_mxfp8(
 
   dim3 grid(size<0>(mO), size<2>(mO), 1);
   dim3 block(256);
-  int shared_mem = size<0>(mK) * int(sizeof(typename TensorLSE::value_type));
+  int max_k = size<0>(mK);
+  int num_sfp_groups = (max_k + kMXFP8GroupSize - 1) / kMXFP8GroupSize;
+  int shared_mem = (max_k + num_sfp_groups) * int(sizeof(typename TensorLSE::value_type));
   cudaError_t result;
   if (shared_mem >= (48 << 10)) {
     result = cudaFuncSetAttribute(

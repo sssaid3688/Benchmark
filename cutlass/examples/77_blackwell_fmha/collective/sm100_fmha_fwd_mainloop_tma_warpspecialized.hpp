@@ -1060,16 +1060,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // SFP computed from P (softmax output) in real-time.
     // Phase 2: hardcode SFP = 1.0 (biased exponent 127 → scale = 1.0).
     // Phase 4+: compute real SFP from tTMEM_LOADrS (still has P as float32).
-    // SFP SMEM layout: SmemLayoutSFP with StageCountQ staging.
-    // Each thread writes 4 scale factors for its row (128 FP8 / 32 = 4 groups).
+    // Fill all SFP SMEM elements with 127 (scale=1.0) using flattened indexing.
     // ================================================================
     {
-      Tensor sSFP = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
-      auto sSFP_stage = (stage == _0{}) ? sSFP(_, _, _, _0{}) : sSFP(_, _, _, _1{});
-      // Phase 2: hardcode SFP = 1.0
-      CUTLASS_PRAGMA_UNROLL
-      for (int g = 0; g < 4; g++) {
-        sSFP_stage(my_row, g) = ElementScale(127);  // biased exponent 127 → scale = 1.0
+      constexpr int kSfpSize = cute::cosize_v<SmemLayoutSFP>;
+      for (int i = threadIdx.x; i < kSfpSize; i += blockDim.x) {
+        storage.smem_sfp[i] = ElementScale(127);
       }
     }
 
