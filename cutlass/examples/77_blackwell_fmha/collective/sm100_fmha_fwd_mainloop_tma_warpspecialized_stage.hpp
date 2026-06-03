@@ -114,6 +114,33 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using SmemLayoutSFP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFA{}, Int<StageCountQ>{}));
   using SmemLayoutSFV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFB{}, Int<StageCountKV>{}));
   
+  using SmemLayoutAtomSFA_QK = typename CollectiveMmaQK::SmemLayoutAtomSFA;
+  using SmemLayoutAtomSFB_QK = typename CollectiveMmaQK::SmemLayoutAtomSFB;
+  using SmemLayoutAtomSFA_PV = typename CollectiveMmaPV::SmemLayoutAtomSFA;
+  using SmemLayoutAtomSFB_PV = typename CollectiveMmaPV::SmemLayoutAtomSFB;
+
+  // Manually-staged SF layouts with correct physical stage stride.
+  // Unlike unstageSmemLayout (which inherits stride-0 K-broadcast from
+  // the atom), these use size(filter_zeros(atom)) as the stage stride.
+  // This ensures filter_zeros on the staged layout correctly separates
+  // stages instead of collapsing them to the same physical address.
+  using SmemLayoutSFQ_Staged = decltype(make_layout(    //这个用来在Load处初始化SFQ的layout
+      append(shape(SmemLayoutAtomSFA_QK{}), Int<StageCountQ>{}),
+      append(stride(SmemLayoutAtomSFA_QK{}), cute::cosize(filter_zeros(SmemLayoutAtomSFA_QK{})))
+  ));
+  using SmemLayoutSFK_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFB_QK{}), Int<StageCountKV>{}),
+      append(stride(SmemLayoutAtomSFB_QK{}), cute::cosize(filter_zeros(SmemLayoutAtomSFB_QK{})))
+  ));
+  using SmemLayoutSFP_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFA_PV{}), Int<StageCountQ>{}),
+      append(stride(SmemLayoutAtomSFA_PV{}), cute::cosize(filter_zeros(SmemLayoutAtomSFA_PV{})))
+  ));
+  using SmemLayoutSFV_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFB_PV{}), Int<StageCountKV>{}),
+      append(stride(SmemLayoutAtomSFB_PV{}), cute::cosize(filter_zeros(SmemLayoutAtomSFB_PV{})))
+  ));
+  
   // SF TMEM fragment types
   using FrgTypeSFA_QK = typename CollectiveMmaQK::TiledMma::FrgTypeSFA;
   using FrgTypeSFB_QK = typename CollectiveMmaQK::TiledMma::FrgTypeSFB;
@@ -128,10 +155,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 // layout T:tmem_[8b](0x0000.0002) o (((_32,_4,(_4,_4)),_1),_1,_1,_1):(((_262144,_1,(_4,_8388608)),_0),_0,_0,_0)
 // layout S:UMMA::DescriptorIterator o (((_32,_1,_1,_4),_1),_1,_1,_1,_2):(((_1,_1,_1,_0),_0),_0,_0,_0,_32)
   // SF SMEM atom layouts (without staging)
-  using SmemLayoutAtomSFA_QK = typename CollectiveMmaQK::SmemLayoutAtomSFA;
-  using SmemLayoutAtomSFB_QK = typename CollectiveMmaQK::SmemLayoutAtomSFB;
-  using SmemLayoutAtomSFA_PV = typename CollectiveMmaPV::SmemLayoutAtomSFA;
-  using SmemLayoutAtomSFB_PV = typename CollectiveMmaPV::SmemLayoutAtomSFB;
 
   
   // Reuse shared memory for V and O.
@@ -172,8 +195,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // SFPV shares the same S0/S1 offsets (QK and PV phases are non-overlapping in time).
     SFQK0 = S1 + kSizeP,   // S1+32=160, used with Q1*K -> S0
     SFQK1 = S0 + kSizeP,   // S0+32=32,  used with Q2*K -> S1
-    SFPV0 = S0 + kSizeP2,   // S0+32=32,  same as SFQK1 (PV phase)
-    SFPV1 = S1 + kSizeP2,   // S1+32=160, same as SFQK0 (PV phase)
+    SFPV0 = S0 + kSizeP,   // S0+32=32,  same as SFQK1 (PV phase)
+    SFPV1 = S1 + kSizeP,   // S1+32=160, same as SFQK0 (PV phase)
 
 
     kSizeSF = 8,  // 8 columns for (SFQ + SFK) or (SFP + SFV) per half
@@ -320,34 +343,27 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         pipeline_sfp, pipeline_sfp_producer_state);
   }
 
-  // Helper: set up SMEM→TMEM UTCCP copy infrastructure for a single SF tensor
-  // FrgType: TMEM fragment type (e.g., FrgTypeSFA_QK)
-  // SmemAtomLayout: SMEM atom layout without staging (e.g., SmemLayoutAtomSFA_QK)
-  // SmemLayoutFull: SMEM layout with staging (e.g., SmemLayoutSFQ)
-  template<class FrgType, class SmemAtomLayout, class SmemLayoutFull, class TiledMma>
+  // Helper: set up SMEM→TMEM UTCCP copy for SF tensor.
+  // Uses manually-staged SMEM layout with correct physical stage stride.
+  template<class FrgType, class SmemAtomLayout, class SmemLayoutStaged, class TiledMma>
   CUTLASS_DEVICE auto
   setup_sf_utccp_copy(
       ElementScale* smem_ptr,
       uint32_t tmem_offset) {
-    // Create SMEM SF tensor with full staging layout
-    Tensor sSF = make_tensor(make_smem_ptr(smem_ptr), SmemLayoutFull{});
-
-    // Create TMEM SF tensor using the atom layout shape (no staging)
+    Tensor sSF = make_tensor(make_smem_ptr(smem_ptr), SmemLayoutStaged{});
     Tensor tSF = make_tensor<FrgType>(shape(SmemAtomLayout{}));
     tSF.data() = tSF.data().get() + tmem_offset;
 
-    // Compact both tensors (remove zero strides, preserves staging in SMEM)
     auto tSF_compact = make_tensor(tSF.data(), filter_zeros(tSF.layout()));
     auto sSF_compact = make_tensor(sSF.data(), filter_zeros(sSF.layout()));
 
-    // Determine UTCCP op based on CTA count (1CTA vs 2CTA)
     using AtomThrID = typename TiledMma::AtomThrID;
     using UtccpOp = cute::conditional_t<(decltype(cute::size(AtomThrID{}) == Int<2>{})::value),
         SM100_UTCCP_4x32dp128bit_2cta, SM100_UTCCP_4x32dp128bit_1cta>;
 
     auto tiled_copy_s2t = make_utccp_copy(UtccpOp{}, tSF_compact);
     auto thr_copy_s2t = tiled_copy_s2t.get_slice(0);
-    auto thr_sSF_s2t_ = thr_copy_s2t.partition_S(sSF_compact);
+    auto thr_sSF_s2t_ = thr_copy_s2t.partition_S(sSF);
     auto thr_sSF_s2t = get_utccp_smem_desc_tensor<UtccpOp>(thr_sSF_s2t_);
     auto thr_tSF_s2t = thr_copy_s2t.partition_D(tSF_compact);
 
@@ -416,41 +432,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     uint32_t sfq1_tmem_offset = sf_tmem_base_qk1;
     uint32_t sfk1_tmem_offset = sf_tmem_base_qk1 + 16;  // 8 columns gap between SFQ and SFK
 
-    auto [tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t, thr_tSFQ0_s2t, tCtSFQ0] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
+auto [tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t, thr_tSFQ0_s2t, tCtSFQ0] =
+        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ_Staged, typename CollectiveMmaQK::TiledMma>(
             storage.smem_sfq.data(), sfq0_tmem_offset);
-
     auto [tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t, thr_tSFQ1_s2t, tCtSFQ1] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
-          storage.smem_sfq.data(), sfq1_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ_Staged, typename CollectiveMmaQK::TiledMma>(
+            storage.smem_sfq.data(), sfq1_tmem_offset);
     auto [tiled_copy_s2t_SFK0, thr_sSFK0_s2t, thr_tSFK0_s2t, tCtSFK0] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
+        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK_Staged, typename CollectiveMmaQK::TiledMma>(
             storage.smem_sfk.data(), sfk0_tmem_offset);
-
     auto [tiled_copy_s2t_SFK1, thr_sSFK1_s2t, thr_tSFK1_s2t, tCtSFK1] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
+        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK_Staged, typename CollectiveMmaQK::TiledMma>(
             storage.smem_sfk.data(), sfk1_tmem_offset);
-    // Set up UTCCP copies and TMEM SF tensors for PV MMA (SF placed in S region gap)
+
     uint32_t sfp0_tmem_offset = sf_tmem_base_pv0;
     uint32_t sfv0_tmem_offset = sf_tmem_base_pv0 + 16;
-
     uint32_t sfp1_tmem_offset = sf_tmem_base_pv1;
     uint32_t sfv1_tmem_offset = sf_tmem_base_pv1 + 16;
 
     auto [tiled_copy_s2t_SFP0, thr_sSFP0_s2t, thr_tSFP0_s2t, tCtSFP0] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
+        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP_Staged, typename CollectiveMmaPV::TiledMma>(
             storage.smem_sfp.data(), sfp0_tmem_offset);
-
     auto [tiled_copy_s2t_SFP1, thr_sSFP1_s2t, thr_tSFP1_s2t, tCtSFP1] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
+        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP_Staged, typename CollectiveMmaPV::TiledMma>(
             storage.smem_sfp.data(), sfp1_tmem_offset);
-
     auto [tiled_copy_s2t_SFV0, thr_sSFV0_s2t, thr_tSFV0_s2t, tCtSFV0] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
+        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV_Staged, typename CollectiveMmaPV::TiledMma>(
             storage.smem_sfv.data(), sfv0_tmem_offset);
-
-      auto [tiled_copy_s2t_SFV1, thr_sSFV1_s2t, thr_tSFV1_s2t, tCtSFV1] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
+    auto [tiled_copy_s2t_SFV1, thr_sSFV1_s2t, thr_tSFV1_s2t, tCtSFV1] =
+        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV_Staged, typename CollectiveMmaPV::TiledMma>(
             storage.smem_sfv.data(), sfv1_tmem_offset);
 
     // ============================================================
@@ -497,98 +507,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-        // ===== DEBUG: print raw K + SF_K from SMEM (MMA warp, lane 0) =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // SF_K in SMEM — no swizzle, direct row-major (verified by tQsQ_sf layout)
-      // float* sfk_f = (storage.smem_sfk.data());
-      printf("\n[MMA] smem_sfk[0..7] (row0,g0..g3 then row1,g0..g3): ");
-      for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-
-      // K SMEM has Sw<3,4,3> swizzle. For cross-check, dump raw bytes
-      // of first 2 "rows" of 128 bytes each = first 256 bytes of smem_k.
-      // Sw<3,4,3> on (128,128) FP8: row0 bytes are at offsets 0,1,2,...
-      // but interleaved. We rely on CUTE to decode:
-      // uint8_t* kb = reinterpret_cast<uint8_t*>(storage.smem_k.data());
-      printf("\n[MMA] smem_k raw first 32B (row0 partial): ");
-      for (int i = 0; i < 32; i++) printf("%.6f ", (float)storage.smem_k[i]);
-
-      // Also print via the cute tensor with swizzle
-      auto sK_raw = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-      // SmemLayoutK = unstageSmemLayout(SmemLayoutB{}, 4), so pick stage=k_index
-      // The swizzled layout maps (atom_group, atom_row, atom_col, ...) → byte
-      // Use thr_mma partition to read
-      ThrMMA thr_tmp = mma_qk.get_slice(0);
-      auto tK_smem = thr_tmp.make_fragment_B(sK_raw);
-      // tK_smem(_, _, _, k_index) gives the fragment for this stage
-      // Each thread owns a piece of the tile; lane 0 gets specific elements
-      auto myK = tK_smem(_, _, _, k_index);
-      printf("\n[MMA] K fragment via thr_mma (lane0, stage=%d), size=%d: ",
-          k_index, (int)size(myK));
-      for (int i = 0; i < 8 && i < size(myK); i++) {
-        printf("%.3f ", (float)myK(i));
-      }
-      printf("\n\n");
-    }
-    // =========================================================
-
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-    //     constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-    //     printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-    //     for (int i = 0; i < 32; ++i) {
-    //         printf("  sfk[%d] = %f  |", i, (float)storage.smem_sfk[i]);
-    //     }
-    //   }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-        constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-        constexpr int K_size = cute::cosize_v<SmemLayoutK>; 
-        printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-        printf("=== smem_k, total elements=%d ===\n", K_size);
-      }
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384){
-
-    //   printf("blockIdx.z=%d, threadIdx.x=%d, threadIdx.y=%d, threadIdx.z=%d\n",blockIdx.z, threadIdx.x,threadIdx.y,threadIdx.z);
     // }
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
 
 
-    // ===== DEBUG: check UTCCP SFK partition vs SMEM SFK =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // Print what UTCCP will copy: the SFK fragment for this stage
-      auto dbg_sfk_src0 = thr_sSFK0_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK0] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src0));
-      for (int i = 0; i < size(dbg_sfk_src0); i++) printf("%.6f ", (float)dbg_sfk_src0(i));
-      printf("\n");
-      // Print raw SMEM SFK for same rows
-      float* sfk_raw = reinterpret_cast<float*>(storage.smem_sfk.data());
-      int sfk_smem_elems = cute::cosize_v<SmemLayoutSFK>;
-      printf("[DEBUG] smem_sfk cosize=%d, raw[0..15]: ", sfk_smem_elems);
-      for (int i = 0; i < 16 && i < sfk_smem_elems; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-      printf("\n");
-    }
-    // =========================================================
-
-    // ===== DEBUG: Print SMEM SF content for all CTAs =====
-    // Temporarily disabled - uncomment for debugging
-    // if (threadIdx.x == 384) {
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfq[0..7]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z);
-    //   for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfq[i]);
-    //
-    //   constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>;
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfk[0..%d]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z, min(SFK_size, 16)-1);
-    //   for (int i = 0; i < min(SFK_size, 16); i++) {
-    //     printf("%.6f ", (float)storage.smem_sfk[i]);
-    //   }
-    //   printf("\n");
-    // }
-    // ======================================================
-
 
     if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,q_index), thr_tSFQ0_s2t);  //Q1 * K1 (SFQ0→S1+32, output→S0)
+      copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,q_index), thr_tSFQ0_s2t);
       copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -629,16 +556,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // ============================================================
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);  // wait for softmax to release S0
 
-    // ===== DEBUG: SFK1 UTCCP partition =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      auto dbg_sfk_src1 = thr_sSFK1_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK1] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src1));
-      for (int i = 0; i < size(dbg_sfk_src1); i++) printf("%.6f ", (float)dbg_sfk_src1(i));
-      printf("\n");
-    }
-
     if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,q_index), thr_tSFQ1_s2t);  //Q2 * K1 (SFQ1→S0+32, output→S1)
+      copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,q_index), thr_tSFQ1_s2t);
       copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -670,7 +589,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s0.producer_acquire(pipeline_s0_producer_state); //等 Softmax0 消费完上一轮 S0 并释放。
 
     if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);    //释放了S0，SFPV使用S0
+      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);
       copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -714,7 +633,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_sfp_consumer_state;
 
       if (cute::elect_one_sync()) {  //wait SFP2的搬运
-          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);    //增加一个sfp2的搬运
+          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);
           copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
         // }
       }
@@ -744,7 +663,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       if (cute::elect_one_sync()) {
           copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,0), thr_tSFQ0_s2t);
-          copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);  //都是使用O0
+          copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);
       }
       cutlass::arch::fence_view_async_tmem_store();
 
@@ -770,7 +689,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // SFQK1 goes to S0+32 → must re-acquire S0 (was committed in Q1*K→S0 above)
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
       if (cute::elect_one_sync()) {
-          copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,1), thr_tSFQ1_s2t);  // SFQ1→S0+32
+          copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,1), thr_tSFQ1_s2t);
           copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
       }
 
@@ -808,7 +727,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
 
       if (cute::elect_one_sync()) {  
-        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);  
+        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);
         copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
       }
       cutlass::arch::fence_view_async_tmem_store();
@@ -860,7 +779,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
     if (cute::elect_one_sync()) {
-        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);    //问题在这
+        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);
         copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -935,25 +854,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // read all of S from tmem into reg mem
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));  //S计算完再使用S数据
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);  //从TMEM中搬运到寄存器中，tTMEM_LOADtS是从S0而来
-        // ===== DEBUG: print raw S from TMEM (softmax_step, runs on Softmax0/1 warps) =====
-    {
-      // Softmax0: threads 0-127 (warp 0), Softmax1: threads 128-255 (warp 4).
-      // Print from lane 0 of each softmax warp-group.
-      int sm_wg = threadIdx.x / 128;  // 0 for Softmax0, 1 for Softmax1
-      int sm_tid = threadIdx.x % 128;
-      if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 0) {
-        auto first_coord = tTMEM_LOADcS(_0{});
-        int my_row = get<0>(first_coord);
-        int base_k = get<1>(first_coord);
-        printf("[SM%d_S] row=%d K=%d..%d: ",
-            sm_wg, my_row, base_k, base_k + (int)size(tTMEM_LOADrS) - 1);
-        for (int i = 0; i < 8 && i < size(tTMEM_LOADrS); i++) {
-            printf("%.6f ", (float)tTMEM_LOADrS(i));
-        }
-        printf("\n");
-      }
-    }
-    // =============================================================
 
     if constexpr (need_apply_mask) {
       Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);

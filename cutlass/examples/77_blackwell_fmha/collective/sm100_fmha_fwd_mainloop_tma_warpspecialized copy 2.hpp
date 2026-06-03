@@ -133,6 +133,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using SmemLayoutAtomSFA_PV = typename CollectiveMmaPV::SmemLayoutAtomSFA;
   using SmemLayoutAtomSFB_PV = typename CollectiveMmaPV::SmemLayoutAtomSFB;
 
+
+  using SmemLayoutSFQ_Staged = decltype(make_layout(    //这个用来在Load处初始化SFQ的layout
+      append(shape(SmemLayoutAtomSFA_QK{}), Int<StageCountQ>{}),
+      append(stride(SmemLayoutAtomSFA_QK{}), size(filter_zeros(SmemLayoutAtomSFA_QK{})))
+  ));
+  using SmemLayoutSFK_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFB_QK{}), Int<StageCountKV>{}),
+      append(stride(SmemLayoutAtomSFB_QK{}), size(filter_zeros(SmemLayoutAtomSFB_QK{})))
+  ));
+  using SmemLayoutSFP_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFA_PV{}), Int<StageCountQ>{}),
+      append(stride(SmemLayoutAtomSFA_PV{}), size(filter_zeros(SmemLayoutAtomSFA_PV{})))
+  ));
+  using SmemLayoutSFV_Staged = decltype(make_layout(
+      append(shape(SmemLayoutAtomSFB_PV{}), Int<StageCountKV>{}),
+      append(stride(SmemLayoutAtomSFB_PV{}), size(filter_zeros(SmemLayoutAtomSFB_PV{})))
+  ));
   
   // Reuse shared memory for V and O.
   static constexpr bool IsOrderLoadEpilogue = std::is_same_v<OrderLoadEpilogue, cute::true_type>;
@@ -144,12 +161,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     };
     cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutP>> smem_p;
 
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFQ>> smem_sfq;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFQ_Staged>> smem_sfq;
     union {
-      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFK>> smem_sfk;
-      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFV>> smem_sfv;
+      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFK_Staged>> smem_sfk;
+      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFV_Staged>> smem_sfv;
     };
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFP>> smem_sfp;
+    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFP_Staged>> smem_sfp;
     // P data SMEM (MXFP8 E4M3, written by softmax, consumed by PV MMA)
   };
 
@@ -172,8 +189,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // SFPV shares the same S0/S1 offsets (QK and PV phases are non-overlapping in time).
     SFQK0 = S1 + kSizeP,   // S1+32=160, used with Q1*K -> S0
     SFQK1 = S0 + kSizeP,   // S0+32=32,  used with Q2*K -> S1
-    SFPV0 = S0 + kSizeP2,   // S0+32=32,  same as SFQK1 (PV phase)
-    SFPV1 = S1 + kSizeP2,   // S1+32=160, same as SFQK0 (PV phase)
+    SFPV0 = S0 + kSizeP2,   // S0+64=64,  same as SFQK1 (PV phase)
+    SFPV1 = S1 + kSizeP2,   // S1+64=192, same as SFQK0 (PV phase)
 
 
     kSizeSF = 8,  // 8 columns for (SFQ + SFK) or (SFP + SFV) per half
@@ -247,7 +264,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
     TensorStorage, PipelineQ, PipelineKV, PipelineSFP, Mask, TileShape,
-    SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFP, SmemLayoutSFV
+    SmemLayoutSFQ_Staged, SmemLayoutSFK_Staged, SmemLayoutSFP_Staged, SmemLayoutSFV_Staged
   >;
 
   struct Arguments {
@@ -331,14 +348,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       uint32_t tmem_offset) {
     // Create SMEM SF tensor with full staging layout
     Tensor sSF = make_tensor(make_smem_ptr(smem_ptr), SmemLayoutFull{});
+    auto sSF_compact = make_tensor(sSF.data(), filter_zeros(sSF.layout()));
 
     // Create TMEM SF tensor using the atom layout shape (no staging)
     Tensor tSF = make_tensor<FrgType>(shape(SmemAtomLayout{}));
     tSF.data() = tSF.data().get() + tmem_offset;
-
     // Compact both tensors (remove zero strides, preserves staging in SMEM)
     auto tSF_compact = make_tensor(tSF.data(), filter_zeros(tSF.layout()));
-    auto sSF_compact = make_tensor(sSF.data(), filter_zeros(sSF.layout()));
 
     // Determine UTCCP op based on CTA count (1CTA vs 2CTA)
     using AtomThrID = typename TiledMma::AtomThrID;
@@ -373,9 +389,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
     auto pipeline_sfp_release_state = pipeline_sfp_consumer_state;
     // auto pipeline_o_sf_release_state = pipeline_o_sf_consumer_state;
-
+    if(blockIdx.x==0&&blockIdx.y==0&&threadIdx.x==384){
+        printf("layout SmemLayoutSFQ:");
+        print(SmemLayoutSFQ{});
+        printf("\nlayout SmemLayoutSFQ_Staged:");
+        print(SmemLayoutSFQ_Staged{});
+        printf("\n");
+    }
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);  //problemshape: (2048,2048,128), tileshape: (256,128,128)
-
+    // if (blockIdx.x == 1 && blockIdx.y == 7 && threadIdx.x==384) {
+    //   printf("\ntileshape: ");
+    //   print(TileShape{});
+    //   printf("problem_shape: ");
+    //   print(problem_shape);
+    //   printf("\n");
+    // }
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
@@ -417,19 +445,48 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     uint32_t sfk1_tmem_offset = sf_tmem_base_qk1 + 16;  // 8 columns gap between SFQ and SFK
 
     auto [tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t, thr_tSFQ0_s2t, tCtSFQ0] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfq.data(), sfq0_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ_Staged, typename CollectiveMmaQK::TiledMma>(
+            storage.smem_sfq.begin(), sfq0_tmem_offset);
+    // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //     printf("layout thr_sSFQ_s2t:\n");
+    //     print(thr_sSFQ0_s2t);
+    //     printf("layout thr_tSFQ0_s2t:\n");
+    //     print(thr_tSFQ0_s2t);
+    //     printf("\n");
+    // }
+    // ===== 调试：追踪 thread 0 搬运的数据 =====
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+        // 1. SMEM 侧：这个线程会读 SMEM 的哪些位置？
+        printf("=== SMEM source (thr_sSFQ0_s2t) ===\n");
+        print(thr_sSFQ0_s2t);          // 打印每个坐标对应的 SMEM 偏移
+        printf("ptr: %p\n", thr_sSFQ0_s2t.data());
+        
+        // 2. TMEM 侧：这个线程会写 TMEM 的哪些位置？
+        printf("=== TMEM dest (thr_tSFQ0_s2t) ===\n");
+        print(thr_tSFQ0_s2t);          // 打印每个坐标对应的 TMEM 偏移
+        
+        // 3. SMEM 中 stage=0 的起始偏移量
+        printf("stage 0 addr: %p\n", thr_sSFQ0_s2t(_,_,_,_,0).data());
+        printf("stage 1 addr: %p\n", thr_sSFQ0_s2t(_,_,_,_,1).data());
+    }
 
     auto [tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t, thr_tSFQ1_s2t, tCtSFQ1] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
-          storage.smem_sfq.data(), sfq1_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ_Staged, typename CollectiveMmaQK::TiledMma>(
+            storage.smem_sfq.begin(), sfq1_tmem_offset);
+    // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384){
+    //   printf("layout thr_sSFQ_s2t:\n");
+    //   print(thr_sSFQ0_s2t);
+    //   printf("\nlayout thr_tSFQ_s2t");
+    //   print(thr_tSFQ0_s2t);
+    //   print("\n");
+    // }
     auto [tiled_copy_s2t_SFK0, thr_sSFK0_s2t, thr_tSFK0_s2t, tCtSFK0] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfk.data(), sfk0_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK_Staged, typename CollectiveMmaQK::TiledMma>(
+            storage.smem_sfk.begin(), sfk0_tmem_offset);
 
     auto [tiled_copy_s2t_SFK1, thr_sSFK1_s2t, thr_tSFK1_s2t, tCtSFK1] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfk.data(), sfk1_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK_Staged, typename CollectiveMmaQK::TiledMma>(
+            storage.smem_sfk.begin(), sfk1_tmem_offset);
     // Set up UTCCP copies and TMEM SF tensors for PV MMA (SF placed in S region gap)
     uint32_t sfp0_tmem_offset = sf_tmem_base_pv0;
     uint32_t sfv0_tmem_offset = sf_tmem_base_pv0 + 16;
@@ -438,20 +495,20 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     uint32_t sfv1_tmem_offset = sf_tmem_base_pv1 + 16;
 
     auto [tiled_copy_s2t_SFP0, thr_sSFP0_s2t, thr_tSFP0_s2t, tCtSFP0] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfp.data(), sfp0_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP_Staged, typename CollectiveMmaPV::TiledMma>(
+            storage.smem_sfp.begin(), sfp0_tmem_offset);
 
     auto [tiled_copy_s2t_SFP1, thr_sSFP1_s2t, thr_tSFP1_s2t, tCtSFP1] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfp.data(), sfp1_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP_Staged, typename CollectiveMmaPV::TiledMma>(
+            storage.smem_sfp.begin(), sfp1_tmem_offset);
 
     auto [tiled_copy_s2t_SFV0, thr_sSFV0_s2t, thr_tSFV0_s2t, tCtSFV0] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfv.data(), sfv0_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV_Staged, typename CollectiveMmaPV::TiledMma>(
+            storage.smem_sfv.begin(), sfv0_tmem_offset);
 
       auto [tiled_copy_s2t_SFV1, thr_sSFV1_s2t, thr_tSFV1_s2t, tCtSFV1] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfv.data(), sfv1_tmem_offset);
+        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV_Staged, typename CollectiveMmaPV::TiledMma>(
+            storage.smem_sfv.begin(), sfv1_tmem_offset);
 
     // ============================================================
 
@@ -468,6 +525,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tOtO1 = tOtO;
     tOtO1.data() = tOtO.data().get() + uint32_t(TmemAllocation::O1);
 
+    // Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
+    // Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});
+
+    // Tensor tOrP0 = tOrP;
+    // tOrP0.data() = tOrP0.data() + uint32_t(TmemAllocation::P0);
+    // Tensor tOrP1 = tOrP;
+    // tOrP1.data() = tOrP1.data() + uint32_t(TmemAllocation::P1);
     Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
     Tensor tOrP = thr_mma_pv.make_fragment_A(sP);
 
@@ -488,7 +552,27 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     q_index = pipeline_q_consumer_state.index();
     pipeline_q.consumer_wait(pipeline_q_consumer_state);
     ++pipeline_q_consumer_state;
-
+    
+      // if (blockIdx.x == 0 && blockIdx.y == 0) {
+      //   constexpr int SFQ_size = cute::cosize_v<SmemLayoutSFQ>;
+      //   printf("=== smem_sfq, total elements=%d ===\n", SFQ_size);
+      //   for (int i = 0; i < SFQ_size; ++i) {
+      //     // if ((float)storage.smem_sfv[i] == 0 || (float)storage.smem_sfv[i] >=11111111) {
+      //     if ((float)storage.smem_sfq[i] == 0) {
+      //       printf("  sfq[%d] = %f  |", i, (float)storage.smem_sfq[i]);
+      //     }
+      //   }
+      // }
+      // if (blockIdx.x == 0 && blockIdx.y == 0) {
+      //   constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>;
+      //   printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
+      //   for (int i = 0; i < SFK_size; ++i) {
+      //     // if ((float)storage.smem_sfv[i] == 0 || (float)storage.smem_sfv[i] >=11111111) {
+      //     if ((float)storage.smem_sfk[i] == 0) {
+      //       printf("  sfk[%d] = %f  |", i, (float)storage.smem_sfk[i]);
+      //     }
+      //   }
+      // }
     Tensor tSrQ0 = tSrQ(_,_,_,q_index);
     // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==384){
 
@@ -496,96 +580,25 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     k_index = pipeline_kv_consumer_state.index();
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
-
-        // ===== DEBUG: print raw K + SF_K from SMEM (MMA warp, lane 0) =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // SF_K in SMEM — no swizzle, direct row-major (verified by tQsQ_sf layout)
-      // float* sfk_f = (storage.smem_sfk.data());
-      printf("\n[MMA] smem_sfk[0..7] (row0,g0..g3 then row1,g0..g3): ");
-      for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-
-      // K SMEM has Sw<3,4,3> swizzle. For cross-check, dump raw bytes
-      // of first 2 "rows" of 128 bytes each = first 256 bytes of smem_k.
-      // Sw<3,4,3> on (128,128) FP8: row0 bytes are at offsets 0,1,2,...
-      // but interleaved. We rely on CUTE to decode:
-      // uint8_t* kb = reinterpret_cast<uint8_t*>(storage.smem_k.data());
-      printf("\n[MMA] smem_k raw first 32B (row0 partial): ");
-      for (int i = 0; i < 32; i++) printf("%.6f ", (float)storage.smem_k[i]);
-
-      // Also print via the cute tensor with swizzle
-      auto sK_raw = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-      // SmemLayoutK = unstageSmemLayout(SmemLayoutB{}, 4), so pick stage=k_index
-      // The swizzled layout maps (atom_group, atom_row, atom_col, ...) → byte
-      // Use thr_mma partition to read
-      ThrMMA thr_tmp = mma_qk.get_slice(0);
-      auto tK_smem = thr_tmp.make_fragment_B(sK_raw);
-      // tK_smem(_, _, _, k_index) gives the fragment for this stage
-      // Each thread owns a piece of the tile; lane 0 gets specific elements
-      auto myK = tK_smem(_, _, _, k_index);
-      printf("\n[MMA] K fragment via thr_mma (lane0, stage=%d), size=%d: ",
-          k_index, (int)size(myK));
-      for (int i = 0; i < 8 && i < size(myK); i++) {
-        printf("%.3f ", (float)myK(i));
-      }
-      printf("\n\n");
-    }
-    // =========================================================
-
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-    //     constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-    //     printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-    //     for (int i = 0; i < 32; ++i) {
-    //         printf("  sfk[%d] = %f  |", i, (float)storage.smem_sfk[i]);
+    //  if (blockIdx.x == 0 && blockIdx.y == 0 ) {
+    //     constexpr int K_size = cute::cosize_v<SmemLayoutK>;
+    //     printf("=== smem_K, total elements=%d ===\n", K_size);
+    //     for (int i = 0; i < K_size; ++i) {
+    //       // if ((float)storage.smem_sfv[i] == 0 || (float)storage.smem_sfv[i] >=11111111) {
+    //       if ((float)storage.smem_k[i] == 0) {
+    //         printf("  K[%d] = %f  |", i, (float)storage.smem_k[i]);
+    //       }
     //     }
     //   }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-        constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-        constexpr int K_size = cute::cosize_v<SmemLayoutK>; 
-        printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-        printf("=== smem_k, total elements=%d ===\n", K_size);
-      }
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384){
-
-    //   printf("blockIdx.z=%d, threadIdx.x=%d, threadIdx.y=%d, threadIdx.z=%d\n",blockIdx.z, threadIdx.x,threadIdx.y,threadIdx.z);
-    // }
+    
+    // ============================================================
+    // Copy Q SF and K SF from SMEM to TMEM (UTCCP) for first QK MMA
+    // ============================================================
+    // printf("opy(tiled_copy_s2t_SFQ ");
+    // copy sfqk0 to tmem:O
+    // Acquire both S0 (Q1*K output) and S1 (SFQK0 SF data goes to S1+32)
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
-
-
-
-    // ===== DEBUG: check UTCCP SFK partition vs SMEM SFK =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // Print what UTCCP will copy: the SFK fragment for this stage
-      auto dbg_sfk_src0 = thr_sSFK0_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK0] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src0));
-      for (int i = 0; i < size(dbg_sfk_src0); i++) printf("%.6f ", (float)dbg_sfk_src0(i));
-      printf("\n");
-      // Print raw SMEM SFK for same rows
-      float* sfk_raw = reinterpret_cast<float*>(storage.smem_sfk.data());
-      int sfk_smem_elems = cute::cosize_v<SmemLayoutSFK>;
-      printf("[DEBUG] smem_sfk cosize=%d, raw[0..15]: ", sfk_smem_elems);
-      for (int i = 0; i < 16 && i < sfk_smem_elems; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-      printf("\n");
-    }
-    // =========================================================
-
-    // ===== DEBUG: Print SMEM SF content for all CTAs =====
-    // Temporarily disabled - uncomment for debugging
-    // if (threadIdx.x == 384) {
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfq[0..7]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z);
-    //   for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfq[i]);
-    //
-    //   constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>;
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfk[0..%d]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z, min(SFK_size, 16)-1);
-    //   for (int i = 0; i < min(SFK_size, 16); i++) {
-    //     printf("%.6f ", (float)storage.smem_sfk[i]);
-    //   }
-    //   printf("\n");
-    // }
-    // ======================================================
-
 
     if (cute::elect_one_sync()) {
       copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,q_index), thr_tSFQ0_s2t);  //Q1 * K1 (SFQ0→S1+32, output→S0)
@@ -593,7 +606,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
     cutlass::arch::fence_view_async_tmem_store();
 
-    
     gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0, tCtSFQ0, tCtSFK0);  // Q1*K1→S0, reads SF from S1
     // gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);  //
 
@@ -629,14 +641,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // ============================================================
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);  // wait for softmax to release S0
 
-    // ===== DEBUG: SFK1 UTCCP partition =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      auto dbg_sfk_src1 = thr_sSFK1_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK1] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src1));
-      for (int i = 0; i < size(dbg_sfk_src1); i++) printf("%.6f ", (float)dbg_sfk_src1(i));
-      printf("\n");
-    }
-
     if (cute::elect_one_sync()) {
       copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,q_index), thr_tSFQ1_s2t);  //Q2 * K1 (SFQ1→S0+32, output→S1)
       copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
@@ -659,12 +663,45 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     v_index = pipeline_kv_consumer_state.index();
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
+    
+    // if (blockIdx.x == 0 && blockIdx.y == 0 ) {
+    //     constexpr int SFV_size = cute::cosize_v<SmemLayoutSFV>;
+    //     printf("=== smem_sfv, total elements=%d ===\n", SFV_size);
+    //     for (int i = 0; i < SFV_size; ++i) {
+    //       // if ((float)storage.smem_sfv[i] == 0 || (float)storage.smem_sfv[i] >=11111111) {
+    //       if ((float)storage.smem_sfv[i] == 0) {
+    //         printf("  sfv[%d] = %f  |", i, (float)storage.smem_sfv[i]);
+    //       }
+    //     }
+    //   }
 
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
+    //     constexpr int V_size = cute::cosize_v<SmemLayoutV>;
+    //     printf("=== smem_sfv, total elements=%d ===\n", V_size);
+    //     for (int i = 0; i < V_size; ++i) {
+    //       // if ((float)storage.smem_sfv[i] == 0 || (float)storage.smem_sfv[i] >=11111111) {
+    //       if ((float)storage.smem_v[i] == 0) {
+    //         printf("  v[%d] = %f  |", i, (float)storage.smem_v[i]);
+    //       }
+    //     }
+    //   }
 
     // wait for SFP1
     sp_index = pipeline_sfp_consumer_state.index();
     pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
     ++pipeline_sfp_consumer_state;
+    // gemm P1 * V1 -> O1  (WITH SCALE FACTORS)
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
+    //   printf("=== smem_sfp (sp_index=%d, block=%d,%d) ===\n",
+    //          sp_index, blockIdx.x, blockIdx.y);
+    //   constexpr int sfp_size = cute::cosize_v<SmemLayoutSFP>;
+    //   for (int i = 0; i < sfp_size; ++i) {
+    //     printf("  sfp[%d] = %a (%f)\n", i,
+    //            (float)storage.smem_sfp[i], (float)storage.smem_sfp[i]);
+    //   }
+    // }
+    //打印sfp看看
+
 
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s0.producer_acquire(pipeline_s0_producer_state); //等 Softmax0 消费完上一轮 S0 并释放。
@@ -721,6 +758,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       cutlass::arch::fence_view_async_tmem_store();
 
+      // gemm P2 * V(i-1)(hc_index=1时v1, =2时v2) -> O2  (WITH SCALE FACTORS)
       // gemm P2 * V(i-1) -> O2
       gemm_reset_zero_acc(mma_pv, tOrP1, tOrV(_,_,_,v_index), tOtO1, tCtSFP1, tCtSFV1);
 
@@ -736,12 +774,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
 
+      // pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+      // ++pipeline_sfp_release_state;
 
       // wait for Ki
       k_index = (pipeline_kv_consumer_state.index());
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
       ++pipeline_kv_consumer_state;
 
+
+      // //pipeline_corr_acquire()计算完correction，获取O的区域    这里要等O0correction 消费完，需要acquire?  跟correction中的同步
+      // pipeline_o_sf.consumer_wait(pipeline_o_sf_consumer_state);
+      // ++pipeline_o_sf_consumer_state;
+      
+      // pipeline_o_sf.consumer_wait(pipeline_o_sf_consumer_state);
+      // ++pipeline_o_sf_consumer_state;
+      // Wait for O0 buffer to be free for QK SF reuse  等待上一次correction O1做完，因为QK需要用o1的空间，for i 为1时可以使用O1，因为在算O0
+      // pipeline_o_sf.producer_acquire(pipeline_o_sf_producer_state);
       if (cute::elect_one_sync()) {
           copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,0), thr_tSFQ0_s2t);
           copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);  //都是使用O0
@@ -754,6 +803,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_s0.producer_commit(pipeline_s0_producer_state);  //s0计算完通知后面做softmax
       ++pipeline_s0_producer_state;
 
+      // pipeline_o_sf.consumer_release(pipeline_o_sf_release_state);
+      // ++pipeline_o_sf_release_state;
+      // //pipeline_corr_commit QK计算完，释放O的区域
+
+
+
       if constexpr (get<1>(ThreadShape{}) > 1) {
         pipeline_kv.consumer_release(pipeline_kv_release_state);
         ++pipeline_kv_release_state;
@@ -765,6 +820,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
         ++pipeline_kv_consumer_state;
       }
+
+      // if (cute::elect_one_sync()) {
+      //   copy(tiled_copy_s2t_SFQ, thr_sSFQ_s2t(_,_,_,_,Int<1>{}), thr_tSFQ_s2t);
+      //   copy(tiled_copy_s2t_SFK, thr_sSFK_s2t(_,_,_,_,k_index), thr_tSFK_s2t);
+      // }
 
 
       // SFQK1 goes to S0+32 → must re-acquire S0 (was committed in Q1*K→S0 above)
@@ -781,6 +841,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_s1.producer_commit(pipeline_s1_producer_state);
       ++pipeline_s1_producer_state;
+      
+      // pipeline_o_sf.consumer_release(pipeline_o_sf_release_state);
+      // ++pipeline_o_sf_release_state;
+      // pipeline_o_sf.consumer_release(pipeline_o_sf_release_state);
+      // ++pipeline_o_sf_release_state;
+      // Signal O1 SF consumed
+      // pipeline_o_sf.producer_commit(pipeline_o_sf_producer_state);
+      // ++pipeline_o_sf_producer_state;
 
       // release Ki
       pipeline_kv.consumer_release(pipeline_kv_release_state);
@@ -800,13 +868,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       ++pipeline_sfp_consumer_state;
 
+      // if (blockIdx.x == 0 && blockIdx.y == 0) {
+      //   constexpr int SFP_size = cute::cosize_v<SmemLayoutSFP>;
+      //   printf("=== smem_sfp, total elements=%d ===\n", SFP_size);
+      //   for (int i = 0; i < SFP_size; ++i) {
+      //     if ((float)storage.smem_sfp[i] == 0) {
+      //       printf("threadIdx.x=%d  sfp[%d] = %f  |  ",threadIdx.x, i, (float)storage.smem_sfp[i]);
+      //     }
+      //   }
+      // }
+      // if (blockIdx.x == 0 && blockIdx.y == 0) {
+      //   constexpr int P_size = cute::cosize_v<SmemLayoutP>;
+      //   printf("=== smem_p, total elements=%d ===\n", P_size);
+      //   for (int i = 0; i < P_size; ++i) {
+      //     if ((float)storage.smem_p[i] == 0) {
+      //       printf("p[%d] = %f  |",i, (float)storage.smem_p[i]);
+      //     }
+      //   }
+      // }
 
       // gemm P1 * Vi -> O1  (WITH SCALE FACTORS)
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);  //P1 * Vi -> O1
 
 
-
+      // // Copy P SF and V SF for this V tile
+      // if (cute::elect_one_sync()) {
+      //   copy(tiled_copy_s2t_SFP, thr_sSFP_s2t(_,_,_,_,v_index), thr_tSFP_s2t);
+      //   copy(tiled_copy_s2t_SFV, thr_sSFV_s2t(_,_,_,_,v_index), thr_tSFV_s2t);
+      // }
       if (cute::elect_one_sync()) {  
         copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);  
         copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
@@ -858,7 +948,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // gemm P2 * Vi -> O2  (WITH SCALE FACTORS)
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
-
+    
+    // Copy P SF and V SF for final PV MMA
+    // if (cute::elect_one_sync()) {
+    //   copy(tiled_copy_s2t_SFP, thr_sSFP_s2t(_,_,_,_,v_index), thr_tSFP_s2t);
+    //   copy(tiled_copy_s2t_SFV, thr_sSFV_s2t(_,_,_,_,v_index), thr_tSFV_s2t);
+    // }
     if (cute::elect_one_sync()) {
         copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);    //问题在这
         copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
@@ -877,6 +972,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_release(pipeline_kv_release_state);
     ++pipeline_kv_release_state;
 
+    // pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+    // ++pipeline_sfp_release_state;
 
     pipeline_s0.producer_commit(pipeline_s0_producer_state);
     ++pipeline_s0_producer_state;
@@ -935,13 +1032,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // read all of S from tmem into reg mem
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));  //S计算完再使用S数据
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);  //从TMEM中搬运到寄存器中，tTMEM_LOADtS是从S0而来
-        // ===== DEBUG: print raw S from TMEM (softmax_step, runs on Softmax0/1 warps) =====
-    {
+{
       // Softmax0: threads 0-127 (warp 0), Softmax1: threads 128-255 (warp 4).
       // Print from lane 0 of each softmax warp-group.
       int sm_wg = threadIdx.x / 128;  // 0 for Softmax0, 1 for Softmax1
       int sm_tid = threadIdx.x % 128;
-      if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 0) {
+      if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 1) {
         auto first_coord = tTMEM_LOADcS(_0{});
         int my_row = get<0>(first_coord);
         int base_k = get<1>(first_coord);
@@ -953,8 +1049,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         printf("\n");
       }
     }
-    // =============================================================
-
     if constexpr (need_apply_mask) {
       Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
     }
@@ -978,6 +1072,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         row_max_1 = ::fmax(row_max_1, tTMEM_LOADrS(i+1));
         row_max_2 = ::fmax(row_max_2, tTMEM_LOADrS(i+2));
         row_max_3 = ::fmax(row_max_3, tTMEM_LOADrS(i+3));
+        // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0){
+        //   printf("tTMEM_LOADrS[%d]: %f\n",i,tTMEM_LOADrS(i));
+        //   printf("tTMEM_LOADrS[%d]: %f\n",i+1,tTMEM_LOADrS(i+1));
+        //   printf("tTMEM_LOADrS[%d]: %f\n",i+2,tTMEM_LOADrS(i+2));
+        // }
       }
       row_max = ::fmax(row_max_0, row_max_1);
       row_max = ::fmax(row_max, row_max_2);
@@ -991,7 +1090,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     tTMEM_STOREVrS(kIdxNewRowMax) = row_max_safe;
     copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);   //寄存器->TMEM V，搬运目标：TMEM 的 V0 或 V1 区域
                                                         // - 用途：Correction warp 读这些 stats 来判断是否需要 rescale O
-
+    // cutlass::arch::fence_view_async_tmem_store();
+    //   __syncwarp();
     pipeline_c.producer_commit(pipeline_c_producer_state);  //等待
     ++pipeline_c_producer_state;
 
@@ -1100,7 +1200,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     for (int j = 0; j < size(tTMEM_STORErS_x4); ++j) {
       sP_u32(my_row, j) = tTMEM_STORErS_x4(j);
     }
-
+    // if (threadIdx.x == 0) {
+    //   printf("sP_u32 layout: "); print(sP_u32.layout()); printf("\n");
+    // }
+    
     cutlass::arch::fence_view_async_shared();
 
     
@@ -1148,7 +1251,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
       copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
-
+    //       cutlass::arch::fence_view_async_tmem_store();
+    // __syncwarp();
     }
   }
 
@@ -1277,7 +1381,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       Tensor tTMrO = make_tensor<ElementPV>(shape(tTMEM_LOADcO(_, _0{}, _0{}, i)));
 
       copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO);
-
+      // printf("threadIdx.x:%d \n", threadIdx.x);
+      // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 256) {
+      //   printf("=== O TMEM stage=%d ===\n", int(stage));
+      //   for (int j = 0; j < (int)size(tTMrO) && j < 16; ++j) {
+      //     printf("  O[%d] = %f\n", j, (float)tTMrO(j));
+      //   }
+      // }
 #ifndef ONLY_SOFTMAX
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size(tTMrO); j += 2) {
@@ -1444,18 +1554,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-
+      // printf("123\n");
       pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);  //做完softmax再来这里
-
+      // printf("456\n");
       Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
 
       // read row_wise new global max
       copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
-
+      // cutlass::arch::fence_view_async_tmem_load();
+      // __syncwarp();
+      // e^(scale * (old_max - new_max)
       float scale = (tTMEM_LOADVrS(kIdxOldRowMax) == tTMEM_LOADVrS(kIdxNewRowMax)) ? 1.0f : ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
+      // pipeline_o_sf.producer_acquire(pipeline_o_sf_producer_state);
 
       bool warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
       if (warp_do_correction) {
@@ -1467,18 +1580,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       cutlass::arch::fence_view_async_tmem_store();
 
+      
+      // pipeline_o_sf.producer_commit(pipeline_o_sf_producer_state);  
+      // ++pipeline_o_sf_producer_state;  
+
       pipeline_o.consumer_release(pipeline_o_consumer_state);
       ++pipeline_o_consumer_state;
+
+      
+      
+      // pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);  //在做QK->S0的计算，因为QK要用到O0
+
+      // pipeline_o.consumer_wait(pipeline_o_consumer_state);   //等待另一边MMA的O0用完FOR循环
+      // pipeline_o.consumer_release(pipeline_o_consumer_state);
+      // ++pipeline_o_consumer_state;
+
 
       pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
 
       copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
-
+      // cutlass::arch::fence_view_async_tmem_load();
+      // __syncwarp();
       scale = (tTMEM_LOADVrS(kIdxOldRowMax) == tTMEM_LOADVrS(kIdxNewRowMax)) ? 1.0f : ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
- 
+      //pipeline_o.wait(pipeline_o_consumer_state); //等待QK 的 O01计算完
+      //pipeline_o.consumer_release(pipeline_o_consumer_state);
+      //++pipeline_o_consumer_state;    
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);   //等待另一边MMA的O1
 
+      // pipeline_o_sf.producer_acquire(pipeline_o_sf_producer_state);
 
       warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
       if (warp_do_correction) {
@@ -1490,8 +1620,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       cutlass::arch::fence_view_async_tmem_store();
 
+      
+
       pipeline_o.consumer_release(pipeline_o_consumer_state);
       ++pipeline_o_consumer_state;
+
+      // pipeline_o_sf.producer_commit(pipeline_o_sf_producer_state);  //给另一边QK计算
+      // ++pipeline_o_sf_producer_state;  
+
+      // pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);   //再做QK到O1的搬运
+
+      // pipeline_o.consumer_wait(pipeline_o_consumer_state);   //等待另一边MMA的O1用完FOR循环
+      // pipeline_o.consumer_release(pipeline_o_consumer_state);
+      // ++pipeline_o_consumer_state;
+
+      // pipeline_o_sf.consumer_wait(pipeline_o_sf_consumer_state);
+      // pipeline_o_sf.consumer_release(pipeline_o_sf_consumer_state);
+      // ++pipeline_o_sf_consumer_state;
     }
 
     pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
@@ -1502,6 +1647,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // read from V0
     Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
     copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
+      // cutlass::arch::fence_view_async_tmem_load();
+      // __syncwarp();
     pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
     ++pipeline_s0_c_consumer_state;
 
