@@ -1058,35 +1058,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
 
     // ================================================================
-    // Phase 2.5: Compute P scale factors (SFP) from P (softmax output)
-    // SMEM layout (from print() analysis): 
-    //   offset = (row%32)*16 + g*4 + (row/32) + stage*512
-    // Write via raw byte pointer to prevent compiler from eliding stores
-    // (UTCCP reads SMEM via descriptor, invisible to regular load/store).
+    // Phase 2.5: Compute P scale factors (SFP) for block-scaled UMMA.
+    // Write SFP=127 (scale=1.0) since P ∈ [0,1] fits in E4M3 directly.
     // ================================================================
     {
       constexpr int kSfpSize = cute::cosize_v<SmemLayoutSFP>;
       unsigned char* raw_sfp = reinterpret_cast<unsigned char*>(storage.smem_sfp.data());
-      // Init all to SFP=1.0 (E8M0 byte 127)
       for (int i = threadIdx.x; i < kSfpSize; i += blockDim.x) {
         raw_sfp[i] = 127;
       }
-      // Compute per-group max over P values, convert to E8M0 exponent
-      int stage_offset = (stage == _0{}) ? 0 : kSfpSize/2;
-      for (int g = 0; g < 4; g++) {
-        float group_max = 0.0f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < 32; j++) {
-          group_max = fmaxf(group_max, tTMEM_LOADrS(g * 32 + j));
-        }
-        float log2_max = (group_max > 0.0f) ? log2f(group_max) : -127.0f;
-        int biased = (int)(floorf(log2_max)) + 127;
-        biased = min(max(biased, 0), 254);
-        int sfp_offset = (my_row % 32) * 16 + g * 4 + (my_row / 32) + stage_offset;
-        raw_sfp[sfp_offset] = (unsigned char)biased;
-      }
-      // fence: ensure SFP SMEM stores are visible to MMA warp's UTCCP descriptor reads
-      __threadfence_block();
     }
 
     cutlass::arch::fence_view_async_shared();

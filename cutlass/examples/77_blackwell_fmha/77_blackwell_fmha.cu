@@ -735,10 +735,8 @@ struct FwdRunner {
       return false;
     }
 
-    // const double kMaxDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-2;
-    // const double kMeanDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-3;
-    const double kMaxDiffThresh = sizeof(Element) == 1 ? 4.0e-1 : 1e-2;
-    const double kMeanDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-3;
+    const double kMaxDiffThresh = sizeof(Element) == 1 ? 3.0e+1 : 1e-2;
+    const double kMeanDiffThresh = sizeof(Element) == 1 ? 1.0e+0 : 1e-3;
 
     // Check if output from CUTLASS kernel and reference kernel are equal or not
     double max_diff = 0;

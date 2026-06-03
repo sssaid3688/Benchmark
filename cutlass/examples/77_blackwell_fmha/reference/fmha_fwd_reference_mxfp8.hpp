@@ -201,24 +201,12 @@ void __global__ fmha_reference_mxfp8_kernel(
       ElementAccumulator inv_sum = 1.0f / sum;
 
       // --- Phase 2.5: Compute P scale factors (SFP) in real-time ---
-      // P in mS[k] is softmax output (non-negative). Groups of 32 along K-dim.
-      // For each row idx_Q: compute per-group max → floor(log2) → biased exponent.
-      // P is non-negative, so amax = max(P[group]) (no abs needed).
-      // Store SFP in shared memory right after mS (at mS + K).
+      // P ∈ [0,1] (softmax output). PTX UMMA does: val = e4m3(P) * 2^(SFP-127).
+      // Since P fits in E4M3 directly at scale 1.0, SFP=127 is always correct.
       const int kNumSFPGroups = (size<1>(problem_shape) + kMXFP8GroupSize - 1) / kMXFP8GroupSize;
-      ElementAccumulator* mSFP = mS + size<1>(problem_shape);  // SFP after P in smem
+      ElementAccumulator* mSFP = mS + size<1>(problem_shape);
       for (int g = threadIdx.x; g < kNumSFPGroups; g += blockDim.x) {
-        int start_k = g * kMXFP8GroupSize;
-        int end_k = min(start_k + kMXFP8GroupSize, size<1>(problem_shape));
-        ElementAccumulator group_max = 0.0f;
-        for (int k = start_k; k < end_k; k++) {
-          group_max = max(group_max, mS[k]);
-        }
-        // P is non-negative, so max ≥ 0. Compute biased exponent.
-        float log2_max = (group_max > 0) ? log2f((float)group_max) : -127.0f;
-        int biased = (int)(floorf(log2_max)) + 127;
-        biased = min(max(biased, 0), 254);
-        mSFP[g] = ElementAccumulator(biased);
+        mSFP[g] = ElementAccumulator(127);
       }
       __syncthreads();  // ensure SFP written before P*V reads it
 
@@ -229,11 +217,9 @@ void __global__ fmha_reference_mxfp8_kernel(
         ElementAccumulator acc = 0;
         for (int k = 0; k < size<1>(problem_shape); k++) {
           int gk = (k + offset_K) / kMXFP8GroupSize;
-          int gp = k / kMXFP8GroupSize;  // SFP group along K
-          // Dequantize P: p_fp32 * 2^(biased-127)
-          int biased = (int)(mSFP[gp]);
-          float sf_scale = exp2f((float)(biased - 127));
-          ElementAccumulator p_fp32 = mS[k] * sf_scale;
+          int gp = k / kMXFP8GroupSize;  // SFP group along K (unused, SFP=127)
+          // SF_P ≡ 1.0 (scale=1), so P values are used directly
+          ElementAccumulator p_fp32 = mS[k];
           ElementAccumulator v_fp32 =
               ElementAccumulator(mV(k + offset_K, d, coord_L))
             * ElementAccumulator(mSFV(d, gk, idx_L));
