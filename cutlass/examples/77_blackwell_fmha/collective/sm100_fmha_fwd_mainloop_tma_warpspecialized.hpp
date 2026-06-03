@@ -200,12 +200,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
-  using PipelineSFP = cutlass::PipelineTmaUmmaAsync<
-    StageCountQ,  // /2
-    typename CollectiveMmaQK::AtomThrShapeMNK
-  >;
-
-
   // from mma to softmax0/1 warp, protects S in tmem
   using PipelineS = cutlass::PipelineUmmaAsync<1>;
 
@@ -236,9 +230,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<ElementData>+
       cosize(take<0,3>(SmemLayoutSFV{})) * cute::sizeof_bits_v<ElementScale>);
 
-  static const int TransactionBytesLoadSFP = cutlass::bits_to_bytes(
-      cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementScale>);
-
   // static_assert((TransactionBytesLoadK + cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementScale>)
   // == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
 
@@ -246,7 +237,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Element, StrideQ, StrideK, StrideV,
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
-    TensorStorage, PipelineQ, PipelineKV, PipelineSFP, Mask, TileShape,
+    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape,
     SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFP, SmemLayoutSFV
   >;
 
@@ -308,16 +299,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       Params const& params, ParamsProblemShape const& params_problem_shape,
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
-      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state,
-      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_producer_state) {
+      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
       uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
 
     Load load;
     load.load(blk_coord, problem_shape, params.load, params_problem_shape,
         storage,
         pipeline_q, pipeline_q_producer_state,
-        pipeline_kv, pipeline_kv_producer_state,
-        pipeline_sfp, pipeline_sfp_producer_state);
+        pipeline_kv, pipeline_kv_producer_state);
   }
 
   // Helper: set up SMEM→TMEM UTCCP copy infrastructure for a single SF tensor
@@ -363,7 +352,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_consumer_state,
       PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_consumer_state,
-      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_consumer_state,
       PipelineS& pipeline_s0, typename PipelineS::PipelineState& pipeline_s0_producer_state,  //对应softmax中的pipeline_s_consumer_state
       PipelineS& pipeline_s1, typename PipelineS::PipelineState& pipeline_s1_producer_state,
       PipelineO& pipeline_corr, typename PipelineO::PipelineState& pipeline_corr_producer_state,
@@ -371,7 +359,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
-    auto pipeline_sfp_release_state = pipeline_sfp_consumer_state;
     // auto pipeline_o_sf_release_state = pipeline_o_sf_consumer_state;
 
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);  //problemshape: (2048,2048,128), tileshape: (256,128,128)
@@ -661,16 +648,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_kv_consumer_state;
 
 
-    // wait for SFP1
-    sp_index = pipeline_sfp_consumer_state.index();
-    pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-    ++pipeline_sfp_consumer_state;
-
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s0.producer_acquire(pipeline_s0_producer_state); //等 Softmax0 消费完上一轮 S0 并释放。
 
     if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);    //释放了S0，SFPV使用S0
+      // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
+      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,0), thr_tSFP0_s2t);
       copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -682,9 +665,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     pipeline_corr.producer_commit(pipeline_corr_producer_state);    //计算完O后去矫正
     ++pipeline_corr_producer_state;
-
-    pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-    ++pipeline_sfp_release_state;
 
     if constexpr (get<1>(ThreadShape{}) > 1) {
       pipeline_kv.consumer_release(pipeline_kv_release_state);
@@ -709,14 +689,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_s1.producer_acquire(pipeline_s1_producer_state);
       // printf("im waite\n");
 
-      sp_index = pipeline_sfp_consumer_state.index();       //PV，V用上次的，P需要搬运
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
-
-      if (cute::elect_one_sync()) {  //wait SFP2的搬运
-          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);    //增加一个sfp2的搬运
+      if (cute::elect_one_sync()) {
+          // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
+          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,1), thr_tSFP1_s2t);
           copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
-        // }
       }
 
       cutlass::arch::fence_view_async_tmem_store();
@@ -729,9 +705,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_corr_producer_state;
 
       // release sfp
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
-
       // release V(i-1)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
@@ -791,16 +764,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
       ++pipeline_kv_consumer_state;
 
-      // // v_index = (pipeline_kv_consumer_state.index());
-      // pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      // ++pipeline_sfp_consumer_state;
-      
-      // next P了， wait SFP0
-      sp_index = pipeline_sfp_consumer_state.index();
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
-
-
       // gemm P1 * Vi -> O1  (WITH SCALE FACTORS)
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);  //P1 * Vi -> O1
@@ -808,7 +771,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
 
       if (cute::elect_one_sync()) {  
-        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,sp_index), thr_tSFP0_s2t);  
+        // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
+        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,0), thr_tSFP0_s2t);
         copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
       }
       cutlass::arch::fence_view_async_tmem_store();
@@ -819,9 +783,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
-
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
 
       if constexpr (get<1>(ThreadShape{}) > 1) {
         pipeline_kv.consumer_release(pipeline_kv_release_state);
@@ -850,29 +811,22 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
       ++pipeline_kv_consumer_state;
     }
-    //wait for sfp
-    sp_index = pipeline_sfp_consumer_state.index();
-    pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-    ++pipeline_sfp_consumer_state;
-
     // gemm P2 * Vi -> O2  (WITH SCALE FACTORS)
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
     if (cute::elect_one_sync()) {
-        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,sp_index), thr_tSFP1_s2t);    //问题在这
+        // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
+        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,1), thr_tSFP1_s2t);
         copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
     gemm_reset_zero_acc(mma_pv, tOrP1, tOrV(_,_,_,v_index), tOtO1, tCtSFP1, tCtSFV1);
-    // gemm_reset_zero_acc(mma_pv, tOrP1, tOrV(_,_,_,v_index), tOtO1);
     
 
     pipeline_corr.producer_commit(pipeline_corr_producer_state);
     ++pipeline_corr_producer_state;
 
-    pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-    ++pipeline_sfp_release_state;
     // release Vi
     pipeline_kv.consumer_release(pipeline_kv_release_state);
     ++pipeline_kv_release_state;
@@ -1099,6 +1053,24 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < size(tTMEM_STORErS_x4); ++j) {
       sP_u32(my_row, j) = tTMEM_STORErS_x4(j);
+    }
+
+    // ================================================================
+    // Phase 2.5: Write P scale factors (SFP) to SMEM
+    // SFP computed from P (softmax output) in real-time.
+    // Phase 2: hardcode SFP = 1.0 (biased exponent 127 → scale = 1.0).
+    // Phase 4+: compute real SFP from tTMEM_LOADrS (still has P as float32).
+    // SFP SMEM layout: SmemLayoutSFP with StageCountQ staging.
+    // Each thread writes 4 scale factors for its row (128 FP8 / 32 = 4 groups).
+    // ================================================================
+    {
+      Tensor sSFP = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
+      auto sSFP_stage = (stage == _0{}) ? sSFP(_, _, _, _0{}) : sSFP(_, _, _, _1{});
+      // Phase 2: hardcode SFP = 1.0
+      CUTLASS_PRAGMA_UNROLL
+      for (int g = 0; g < 4; g++) {
+        sSFP_stage(my_row, g) = ElementScale(127);  // biased exponent 127 → scale = 1.0
+      }
     }
 
     cutlass::arch::fence_view_async_shared();

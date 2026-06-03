@@ -1223,7 +1223,6 @@ struct FwdRunner {
         buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
         buffers[buffer_index]->block_K.get(), stride_K,
         buffers[buffer_index]->block_SFK.get(), layout_SFK,
-        buffers[buffer_index]->block_SFP.get(), layout_SFP,
         buffers[buffer_index]->block_V.get(), stride_V,
         buffers[buffer_index]->block_SFV.get(), layout_SFV,},
       { buffers[buffer_index]->block_O.get(), stride_O,

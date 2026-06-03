@@ -56,7 +56,6 @@ template<
   class TensorStorage,
   class PipelineQ,
   class PipelineKV,
-  class PipelineSFP,
   class Mask,
   class TileShape,
   class SmemLayoutSFQ,
@@ -77,7 +76,6 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     const ElementScale* ptr_SFQ; layout_SF lQ;
     const ElementData* ptr_K; StrideK dK;
     const ElementScale* ptr_SFK; layout_SF lK;
-    const ElementScale* ptr_SFP; layout_SF lP;
     const ElementData* ptr_V; StrideV dV;
     const ElementScale* ptr_SFV; layout_SF lV;
   };
@@ -87,7 +85,6 @@ struct Sm100FmhaLoadTmaWarpspecialized {
   using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
   using TMA_SFQ = typename CollectiveMmaQK::Params::TMA_SFA;
   using TMA_SFK = typename CollectiveMmaQK::Params::TMA_SFB;
-  using TMA_SFP = typename CollectiveMmaPV::Params::TMA_SFA;
   using TMA_SFV = typename CollectiveMmaPV::Params::TMA_SFB;
 
   struct Params {
@@ -96,11 +93,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     TMA_V tma_load_v;
     TMA_SFQ tma_load_sfq;
     TMA_SFK tma_load_sfk;
-    TMA_SFP tma_load_sfp;
     TMA_SFV tma_load_sfv;
     layout_SF lQ;
     layout_SF lK;
-    layout_SF lP;
     layout_SF lV;
 
   };
@@ -116,14 +111,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     auto ptr_V = args.ptr_V;
     auto ptr_SFQ = args.ptr_SFQ;
     auto ptr_SFK = args.ptr_SFK;
-    auto ptr_SFP = args.ptr_SFP;
     auto ptr_SFV = args.ptr_SFV;
     auto dQ = args.dQ;
     auto dK = args.dK;
     auto dV = args.dV;
     auto lQ = args.lQ;
     auto lK = args.lK;
-    auto lP = args.lP;
     auto lV = args.lV;
 
     using IntProblemShape = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
@@ -152,12 +145,15 @@ struct Sm100FmhaLoadTmaWarpspecialized {
         }, /*workspace=*/ nullptr);
 
     auto problem_shape_pv = select<0,2,1,3>(problem_shape_qk);
+    // SFP is generated in softmax_step, not loaded from GMEM.
+    // Pass nullptr + dummy layout for the SFP TMA descriptor (still needed for MMA).
+    layout_SF lP_dummy{};
     auto params_pv = CollectiveMmaPV::to_underlying_arguments(
         problem_shape_pv,
         typename CollectiveMmaPV::Arguments {
             ptr_K, dK,  // never used, dummy (P is in TMEM)
             ptr_V, select<1,0,2>(dV),
-            ptr_SFP, lP,
+            nullptr, lP_dummy,  // SFP not loaded from GMEM (generated in softmax_step)
             ptr_SFV, lV,
         }, /*workspace=*/ nullptr);
 
@@ -167,9 +163,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
         params_pv.tma_load_b,
         params_qk.tma_load_sfa,
         params_qk.tma_load_sfb,
-        params_pv.tma_load_sfa,
         params_pv.tma_load_sfb,
-        lQ, lK, lP, lV
+        lQ, lK, lV
     };
   }
 
@@ -182,7 +177,6 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
     cute::prefetch_tma_descriptor(params.tma_load_sfq.get_tma_descriptor());
     cute::prefetch_tma_descriptor(params.tma_load_sfk.get_tma_descriptor());
-    cute::prefetch_tma_descriptor(params.tma_load_sfp.get_tma_descriptor());
     cute::prefetch_tma_descriptor(params.tma_load_sfv.get_tma_descriptor());
   }
 
@@ -193,8 +187,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       Params const& params, ParamsProblemShape const& params_problem_shape,
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
-      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state,
-      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_producer_state) {
+      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
 
     BlkCoord blk_coord_q = blk_coord_in;
     BlkCoord blk_coord_kv = blk_coord_in;
@@ -325,33 +318,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     auto tVgV = tVgV_dkl(_, _0{}, _, get<2>(blk_coord_kv));
     auto tVgV_sf = tVgV_dkl_sf(_, _0{}, _, sf_l_coord(blk_coord_kv));
 
-    // ============================================================
-    // Set up P SF TMA loading
-    // P is the A operand of PV MMA, shape (Q, K)
-    // P SF uses the SFA partition (since P is operand A)
-    // P SF is loaded alongside V using the same KV pipeline staging
-    // ============================================================
-    Tensor mP_sf_p = params.tma_load_sfp.get_tma_tensor(shape(params.lP));
-
-    int p_offs_0 = q_offs_0;  // P rows correspond to Q rows
-    int p_offs_1 = kv_offs_0; // P cols correspond to K cols
-
-    Tensor mP_sf = domain_offset(make_coord(p_offs_0, p_offs_1, make_coord(_0{}, _0{})), mP_sf_p);
-
-    // Tile P SF over (Q_tiles, K_tiles)
-    // P SF uses SFA layout (A operand of PV MMA uses TileShapePV)
-    Tensor gP_sf = local_tile(mP_sf, TileShapePV{}, make_coord(_, _, _), Step<_1, X, _1>{});
-
-    Tensor tSgP_sf = mma_pv.partition_A(gP_sf);
-
-    Tensor sP_sf = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
-
-    auto [tPgP_sf, tPsP_sf] = tma_partition(
-      params.tma_load_sfp, _0{}, make_layout(_1{}),
-      group_modes<0,3>(sP_sf), group_modes<0,3>(tSgP_sf)
-    );
-
-    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, sf_l_coord(blk_coord_kv));
+    // Note: SFP is NOT loaded from GMEM via TMA.
+    // SFP is generated by softmax_step and written directly to SFP SMEM.
+    // See softmax_step() in the mainloop file.
 
     uint32_t lane_predicate = cute::elect_one_sync();
 
@@ -383,7 +352,6 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     // K1
     // ============================================================
     int k_index = 0;
-    int sfp_index = 0;
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -404,42 +372,23 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // ============================================================
-    // V1 + P SF 1
+    // V1 (SFP not loaded from GMEM - generated in softmax_step)
     // ============================================================
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
       copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
       copy(params.tma_load_sfv.with(*tma_barrier, 0), tVgV_sf(_, k_index), tVsV_sf(_, pipeline_kv_producer_state.index()));
-      // P SF loaded alongside V (same KV pipeline stage)
     }
 
     ++pipeline_kv_producer_state;
     k_index += 1;
 
-    pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-    if(lane_predicate){
-      auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-      copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-    }
-
-    ++pipeline_sfp_producer_state;
-    sfp_index += 1; 
-
     // ============================================================
-    // Main load loop: Ki, Vi + P_SF_i
+    // Main load loop: Ki, Vi
     // ============================================================
     mask_tile_count -= 1;
-    // mask_tile_count = 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-
-      pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-      if (lane_predicate) {
-        auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-        copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 1), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-      }
-      ++pipeline_sfp_producer_state;
-      sfp_index += 1;
 
       // Ki + K SF
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
@@ -450,38 +399,16 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       }
       ++pipeline_kv_producer_state;
 
-
-      // Vi + V SF + P SF
+      // Vi + V SF
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
       if (lane_predicate) {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
         copy(params.tma_load_sfv.with(*tma_barrier, 0), tVgV_sf(_, k_index), tVsV_sf(_, pipeline_kv_producer_state.index()));
-        // P SF loaded alongside V (same KV pipeline stage)
       }
       ++pipeline_kv_producer_state;
       k_index += 1;
-      pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-      if (lane_predicate) {
-        auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-        copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-      }
-      ++pipeline_sfp_producer_state;
-      sfp_index += 1;
-
-      // if(blockIdx.x==0 && blockIdx.y==0){
-      //   // printf("K_index: %d\n",k_index);
-      //   printf("sp_index: %d\n",sfp_index);
-      // }
     }
-
-    pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-    if (lane_predicate) {
-      auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-      copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-    }
-    ++pipeline_sfp_producer_state;
-    sfp_index += 1;
   }
 };
 

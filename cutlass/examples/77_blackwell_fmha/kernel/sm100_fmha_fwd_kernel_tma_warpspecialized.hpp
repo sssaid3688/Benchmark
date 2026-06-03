@@ -190,7 +190,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     struct PipelineStorage {
       alignas(16) typename CollectiveMainloop::PipelineQ::SharedStorage load_q;
       alignas(16) typename CollectiveMainloop::PipelineKV::SharedStorage load_kv;
-      alignas(16) typename CollectiveMainloop::PipelineSFP::SharedStorage load_sfp;
       alignas(16) typename CollectiveMainloop::PipelineS::SharedStorage mma_s0;
       alignas(16) typename CollectiveMainloop::PipelineS::SharedStorage mma_s1;
       alignas(16) typename CollectiveMainloop::PipelineC::SharedStorage s0_corr;
@@ -323,20 +322,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       ClusterShape{}, /*barrier init*/ cute::true_type{}, /*mask calc*/cute::false_type{});
 
 
-    typename CollectiveMainloop::PipelineSFP::Params pipeline_load_sfp_params;
-    if (role == WarpRole::Load) {
-      pipeline_load_sfp_params.role = CollectiveMainloop::PipelineSFP::ThreadCategory::Producer;
-    }
-    if (role == WarpRole::MMA) {
-      pipeline_load_sfp_params.role = CollectiveMainloop::PipelineSFP::ThreadCategory::Consumer;
-    }
-    pipeline_load_sfp_params.is_leader = lane_predicate && (role == WarpRole::Load);
-    pipeline_load_sfp_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadSFP;
-    typename CollectiveMainloop::PipelineSFP pipeline_load_sfp(
-      shared_storage.pipelines.load_sfp,
-      pipeline_load_sfp_params,
-      ClusterShape{}, /*barrier init*/ cute::true_type{}, /*mask calc*/cute::false_type{});
-
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s0_params;
     if (role == WarpRole::MMA) {
       pipeline_mma_s0_params.role = CollectiveMainloop::PipelineS::ThreadCategory::Producer;
@@ -444,7 +429,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     pipeline_load_q.init_masks(ClusterShape{});
     pipeline_load_kv.init_masks(ClusterShape{});
-    pipeline_load_sfp.init_masks(ClusterShape{});
     pipeline_mma_s0.init_masks(ClusterShape{});
     pipeline_mma_s1.init_masks(ClusterShape{});
     pipeline_mma_corr.init_masks(ClusterShape{});
@@ -454,9 +438,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     typename CollectiveMainloop::PipelineKV::PipelineState pipeline_load_kv_consumer_state;
     typename CollectiveMainloop::PipelineKV::PipelineState pipeline_load_kv_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineKV>();
-
-    typename CollectiveMainloop::PipelineSFP::PipelineState pipeline_load_sfp_consumer_state;
-    typename CollectiveMainloop::PipelineSFP::PipelineState pipeline_load_sfp_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineSFP>();
 
     typename CollectiveMainloop::PipelineS::PipelineState pipeline_mma_s0_consumer_state;
     typename CollectiveMainloop::PipelineS::PipelineState pipeline_mma_s0_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineS>();
@@ -602,7 +583,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           shared_storage.mainloop_epilogue.mainloop,
           pipeline_load_q, pipeline_load_q_consumer_state,
           pipeline_load_kv, pipeline_load_kv_consumer_state,
-          pipeline_load_sfp, pipeline_load_sfp_consumer_state,
           pipeline_mma_s0, pipeline_mma_s0_producer_state,
           pipeline_mma_s1, pipeline_mma_s1_producer_state,
           pipeline_mma_corr, pipeline_mma_corr_producer_state,
@@ -646,8 +626,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           params.mainloop, params.problem_shape,
           shared_storage.mainloop_epilogue.mainloop,
           pipeline_load_q, pipeline_load_q_producer_state,
-          pipeline_load_kv, pipeline_load_kv_producer_state,
-          pipeline_load_sfp, pipeline_load_sfp_producer_state
+          pipeline_load_kv, pipeline_load_kv_producer_state
         );
 
       }
