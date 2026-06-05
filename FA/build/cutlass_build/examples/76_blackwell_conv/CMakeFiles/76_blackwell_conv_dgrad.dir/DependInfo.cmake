@@ -1,0 +1,19 @@
+
+# Consider dependencies only in project.
+set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)
+
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  )
+
+# The set of dependency files which are needed:
+set(CMAKE_DEPENDS_DEPENDENCY_FILES
+  "/home/ubuntu/workspace/oyhj/cutlass/examples/76_blackwell_conv/76_blackwell_conv_dgrad.cu" "cutlass_build/examples/76_blackwell_conv/CMakeFiles/76_blackwell_conv_dgrad.dir/76_blackwell_conv_dgrad.cu.o" "gcc" "cutlass_build/examples/76_blackwell_conv/CMakeFiles/76_blackwell_conv_dgrad.dir/76_blackwell_conv_dgrad.cu.o.d"
+  )
+
+# Targets to which this target links.
+set(CMAKE_TARGET_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")

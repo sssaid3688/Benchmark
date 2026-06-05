@@ -1,0 +1,2 @@
+# Empty compiler generated dependencies file for cutlass_library_gemm_sm89_s16832fastaccumgemm_e5m2_static.
+# This may be replaced when dependencies are built.

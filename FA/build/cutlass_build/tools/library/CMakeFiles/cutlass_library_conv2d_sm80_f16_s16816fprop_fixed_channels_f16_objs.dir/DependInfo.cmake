@@ -1,0 +1,20 @@
+
+# Consider dependencies only in project.
+set(CMAKE_DEPENDS_IN_PROJECT_ONLY OFF)
+
+# The set of languages for which implicit dependencies are needed:
+set(CMAKE_DEPENDS_LANGUAGES
+  )
+
+# The set of dependency files which are needed:
+set(CMAKE_DEPENDS_DEPENDENCY_FILES
+  "/home/ubuntu/workspace/oyhj/FA/build/cutlass_build/tools/library/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/all_sm80_f16_s16816fprop_fixed_channels_f16_conv2d_operations.cu" "cutlass_build/tools/library/CMakeFiles/cutlass_library_conv2d_sm80_f16_s16816fprop_fixed_channels_f16_objs.dir/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/all_sm80_f16_s16816fprop_fixed_channels_f16_conv2d_operations.cu.o" "gcc" "cutlass_build/tools/library/CMakeFiles/cutlass_library_conv2d_sm80_f16_s16816fprop_fixed_channels_f16_objs.dir/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/all_sm80_f16_s16816fprop_fixed_channels_f16_conv2d_operations.cu.o.d"
+  "/home/ubuntu/workspace/oyhj/FA/build/cutlass_build/tools/library/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/cutlass_tensorop_f16_s16816fprop_fixed_channels_f16_256x128_32x3_nhwc_align4.cu" "cutlass_build/tools/library/CMakeFiles/cutlass_library_conv2d_sm80_f16_s16816fprop_fixed_channels_f16_objs.dir/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/cutlass_tensorop_f16_s16816fprop_fixed_channels_f16_256x128_32x3_nhwc_align4.cu.o" "gcc" "cutlass_build/tools/library/CMakeFiles/cutlass_library_conv2d_sm80_f16_s16816fprop_fixed_channels_f16_objs.dir/generated/conv2d/80/f16_s16816fprop_fixed_channels_f16/cutlass_tensorop_f16_s16816fprop_fixed_channels_f16_256x128_32x3_nhwc_align4.cu.o.d"
+  )
+
+# Targets to which this target links.
+set(CMAKE_TARGET_LINKED_INFO_FILES
+  )
+
+# Fortran module output directory.
+set(CMAKE_Fortran_TARGET_MODULE_DIR "")

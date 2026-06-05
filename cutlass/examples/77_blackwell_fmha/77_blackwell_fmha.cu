@@ -63,8 +63,8 @@
 
 
     Example usage:
-      $ ./examples/77_blackwell_fmha/1177_blackwell_fmha_fp8 \
-            --b=1 --h=40 --d=128 --q=2048 --k=2048
+      $ ./examples/77_blackell_fmha/77_blackell_fmha_fp8 \
+            --b=2048 --h=2048 --d=2048 --q=2048 --k=2048
 */
 
 #include <iostream>
@@ -520,7 +520,7 @@ struct FwdRunner {
     auto problem_shape_ref = cute::make_tuple(Q, K, D, D, HB);
 
     fmha_reference(problem_shape_ref, mQ, mK, mV, mO, mLSE, ActiveMask{});
-    
+
     cudaError_t result = cudaDeviceSynchronize();
     if (result != cudaSuccess) {
       std::cerr << "Reference kernel failed. Last CUDA error: "
@@ -535,7 +535,7 @@ struct FwdRunner {
     double max_diff = 0;
     double mean_diff = 0;
     reference_abs_diff(buffer.block_O, buffer.block_ref_O, max_diff, mean_diff);
-    printf("O Max diff: %f, Mean diff: %f\n", max_diff, mean_diff);
+
     bool passed_O = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if (! passed_O) {
       std::cerr << "failed O: max diff " << max_diff 
@@ -543,7 +543,7 @@ struct FwdRunner {
     }
 
     reference_abs_diff(buffer.block_LSE, buffer.block_ref_LSE, max_diff, mean_diff);
-    printf("LSE Max diff: %f, Mean diff: %f\n", max_diff, mean_diff);
+
     bool passed_LSE = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if ( ! passed_LSE) {
       std::cerr << "failed LSE: max diff " << max_diff 
