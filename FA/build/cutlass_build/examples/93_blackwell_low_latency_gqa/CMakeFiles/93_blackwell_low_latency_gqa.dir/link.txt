@@ -1,1 +1,0 @@
-/usr/bin/g++ CMakeFiles/93_blackwell_low_latency_gqa.dir/tgv_gqa.cu.o -o 93_blackwell_low_latency_gqa  -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,'$$ORIGIN/../lib64' -Wl,-rpath,'$$ORIGIN/../lib' -Wl,-rpath,'/usr/local/cuda/lib64' -Wl,-rpath,'/usr/local/cuda/lib' -ldl -lcuda -lcudadevrt -lcudart  -L"/usr/local/cuda/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda/targets/x86_64-linux/lib"
