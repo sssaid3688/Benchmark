@@ -92,28 +92,18 @@ template<typename Element>
 __global__ void reference_abs_diff_kernel(
     Element* data, Element* data_ref, size_t count,
     double* max_diff, double* sum_diff,
-    bool print_diff) {
+    bool print_diff ) {
 
     double thread_max_diff = 0;
     double thread_sum_diff = 0;
 
     __shared__ double block_max_diff;
     __shared__ double block_sum_diff;
-    // int sum=0;
+
     for (size_t i = threadIdx.x + blockIdx.x * blockDim.x; i < count; i += blockDim.x * gridDim.x) {
       if (data[i] == data_ref[i]) {
-        // if(1){
-          // printf("data[%ld]: %f, data_ref[%ld]: %f，  ",i,(float)data[i],i,(float)data_ref[i]);
-          // printf("row: %d, ",i/128);
-        // }
         continue;
       }
-      // sum++;
-      // if(1){
-      //   double diff = fabs(data[i] - data_ref[i]);
-      //   if (print_diff) if (not isfinite(diff) || diff < 0.001f)printf("row: %d, ",i/128);
-      //   // printf("difference at %lld: %f ... %f vs %f\n", static_cast<long long int>(i), diff, (double)data[i], (double)data_ref[i]);
-      // }
 
       double diff = fabs(data[i] - data_ref[i]);
       if (print_diff) if (not isfinite(diff) || diff > 0.01f) printf("difference at %lld: %f ... %f vs %f\n", static_cast<long long int>(i), diff, (double)data[i], (double)data_ref[i]);
@@ -146,7 +136,6 @@ __global__ void reference_abs_diff_kernel(
        if (found == prev) break;
     }
    }
-  //  return sum;
 }
 
 template<typename Element>
@@ -156,7 +145,6 @@ void reference_abs_diff(
     double& max_diff, double& mean_diff) {
 
   static bool kPrintDiff = getenv("REF_PRINT_DIFF") && atoi(getenv("REF_PRINT_DIFF")) == 1;
-  // static bool kPrintDiff = 1;
 
   DeviceAllocation<double> result;
   result.reset(2);
@@ -172,12 +160,11 @@ void reference_abs_diff(
 
   dim3 block(256, 1, 1);
   dim3 grid(1024, 1, 1);
-  // int sum1=0;
   reference_abs_diff_kernel<<<block, grid>>>(
       data.get(), data_ref.get(), data.size(),
       result.get(), result.get() + 1, kPrintDiff);
+
   err = cudaDeviceSynchronize();
-  // printf("sum: %d\n",sum1);
   if (err != cudaSuccess) {
     std::cerr << "Difference kernel failed. Last CUDA error: "
               << cudaGetErrorString(err) << std::endl;

@@ -30,10 +30,10 @@
 set_property(
   SOURCE
       77_blackwell_fmha.cu
-    #   77_blackwell_fmha_gen.cu
-    #   77_blackwell_mla.cu
-    #   77_blackwell_fmha_bwd.cu
-    #   77_blackwell_mla_fwd.cu
+      77_blackwell_fmha_gen.cu
+      77_blackwell_mla.cu
+      77_blackwell_fmha_bwd.cu
+      77_blackwell_mla_fwd.cu
   PROPERTY
       COMPILE_FLAGS "--use_fast_math -ftemplate-backtrace-limit=0"
 )
@@ -114,11 +114,11 @@ set(TEST_MLA_LARGE_SPLIT_KV --verify --split_kv=20 --page=128)
 
 if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC_ARCHS MATCHES 100a OR CUTLASS_NVCC_ARCHS MATCHES 103a))
 
-  foreach(PREC mxfp8 fp8 fp16)
+  foreach(PREC fp8 fp16)
     string(TOUPPER "${PREC}" PREC_MACRO)
 
     cutlass_example_add_executable(
-        101_blackwell_fmha_${PREC}
+        1177_blackwell_fmha_${PREC}
         77_blackwell_fmha.cu
         TEST_COMMAND_OPTIONS
         TEST_BASIC
@@ -151,131 +151,130 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
         TEST_VARLEN_21
         TEST_VARLEN_22
         )
-    target_include_directories(101_blackwell_fmha_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(101_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
+    target_include_directories(1177_blackwell_fmha_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(1177_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
   
-  #   cutlass_example_add_executable(
-  #       77_blackwell_fmha_gen_${PREC}
-  #       77_blackwell_fmha_gen.cu
-  #       TEST_COMMAND_OPTIONS
-  #       TEST_GEN_BASIC
-  #       TEST_GEN_VARLEN
-  #       # TEST_GEN_HDIM64
-  #       TEST_GEN_GQA
-  #       TEST_GEN_REMAP
-  #       TEST_GEN_CACHEONLY
-  #       )
-  #   target_include_directories(77_blackwell_fmha_gen_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  #   target_compile_definitions(77_blackwell_fmha_gen_${PREC} PRIVATE ${PREC_MACRO})
+    cutlass_example_add_executable(
+        77_blackwell_fmha_gen_${PREC}
+        77_blackwell_fmha_gen.cu
+        TEST_COMMAND_OPTIONS
+        TEST_GEN_BASIC
+        TEST_GEN_VARLEN
+        # TEST_GEN_HDIM64
+        TEST_GEN_GQA
+        TEST_GEN_REMAP
+        TEST_GEN_CACHEONLY
+        )
+    target_include_directories(77_blackwell_fmha_gen_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(77_blackwell_fmha_gen_${PREC} PRIVATE ${PREC_MACRO})
 
-  #   cutlass_example_add_executable(
-  #       77_blackwell_mla_2sm_${PREC}
-  #       77_blackwell_mla.cu
-  #       TEST_COMMAND_OPTIONS
-  #       TEST_MLA_BASIC
-	# TEST_MLA_LARGE_SPLIT_KV
-  #       TEST_MLA_SEP_REDUCTION
-  #       TEST_MLA_FUSE_REDUCTION
-  #       )
-  #   target_include_directories(77_blackwell_mla_2sm_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  #   target_compile_definitions(77_blackwell_mla_2sm_${PREC} PRIVATE ${PREC_MACRO})
-  #   target_compile_options(77_blackwell_mla_2sm_${PREC} PRIVATE -Xptxas -v)
+    cutlass_example_add_executable(
+        77_blackwell_mla_2sm_${PREC}
+        77_blackwell_mla.cu
+        TEST_COMMAND_OPTIONS
+        TEST_MLA_BASIC
+	TEST_MLA_LARGE_SPLIT_KV
+        TEST_MLA_SEP_REDUCTION
+        TEST_MLA_FUSE_REDUCTION
+        )
+    target_include_directories(77_blackwell_mla_2sm_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(77_blackwell_mla_2sm_${PREC} PRIVATE ${PREC_MACRO})
+    target_compile_options(77_blackwell_mla_2sm_${PREC} PRIVATE -Xptxas -v)
 
-  #   cutlass_example_add_executable(
-  #       77_blackwell_mla_2sm_cpasync_${PREC}
-  #       77_blackwell_mla.cu
-  #       TEST_COMMAND_OPTIONS
-  #       TEST_MLA_BASIC
-	# TEST_MLA_LARGE_SPLIT_KV
-  #       TEST_MLA_SEP_REDUCTION
-  #       TEST_MLA_FUSE_REDUCTION
-  #       )
-  #   target_include_directories(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  #   target_compile_definitions(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE ${PREC_MACRO} CPASYNC)
-  #   target_compile_options(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE -Xptxas -v)
+    cutlass_example_add_executable(
+        77_blackwell_mla_2sm_cpasync_${PREC}
+        77_blackwell_mla.cu
+        TEST_COMMAND_OPTIONS
+        TEST_MLA_BASIC
+	TEST_MLA_LARGE_SPLIT_KV
+        TEST_MLA_SEP_REDUCTION
+        TEST_MLA_FUSE_REDUCTION
+        )
+    target_include_directories(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE ${PREC_MACRO} CPASYNC)
+    target_compile_options(77_blackwell_mla_2sm_cpasync_${PREC} PRIVATE -Xptxas -v)
 
-  #   cutlass_example_add_executable(
-  #       77_blackwell_fmha_bwd_${PREC}
-  #       77_blackwell_fmha_bwd.cu
-  #       TEST_COMMAND_OPTIONS
-  #       TEST_BASIC
-  #       TEST_VARLEN
-  #       # NOTE: bwd doesn't support GQA yet, --h_k will just get ignored in these tests
-  #       TEST_VARLEN_00
-  #       TEST_VARLEN_01
-  #       TEST_VARLEN_02
-  #       TEST_VARLEN_03
-  #       TEST_VARLEN_04
-  #       TEST_VARLEN_05
-  #       TEST_VARLEN_06
-  #       TEST_VARLEN_07
-  #       TEST_VARLEN_08
-  #       TEST_VARLEN_09
-  #       TEST_VARLEN_10
-  #       TEST_VARLEN_11
-  #       TEST_VARLEN_12
-  #       TEST_VARLEN_13
-  #       TEST_VARLEN_14
-  #       TEST_BWD_MLA_BASIC
-  #       TEST_BWD_MLA_VARLEN
-  #       )
-  #   target_include_directories(77_blackwell_fmha_bwd_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  #   target_compile_definitions(77_blackwell_fmha_bwd_${PREC} PRIVATE ${PREC_MACRO})
-  #   target_compile_options(77_blackwell_fmha_bwd_${PREC} PRIVATE -Xptxas -v)
+    cutlass_example_add_executable(
+        77_blackwell_fmha_bwd_${PREC}
+        77_blackwell_fmha_bwd.cu
+        TEST_COMMAND_OPTIONS
+        TEST_BASIC
+        TEST_VARLEN
+        # NOTE: bwd doesn't support GQA yet, --h_k will just get ignored in these tests
+        TEST_VARLEN_00
+        TEST_VARLEN_01
+        TEST_VARLEN_02
+        TEST_VARLEN_03
+        TEST_VARLEN_04
+        TEST_VARLEN_05
+        TEST_VARLEN_06
+        TEST_VARLEN_07
+        TEST_VARLEN_08
+        TEST_VARLEN_09
+        TEST_VARLEN_10
+        TEST_VARLEN_11
+        TEST_VARLEN_12
+        TEST_VARLEN_13
+        TEST_VARLEN_14
+        TEST_BWD_MLA_BASIC
+        TEST_BWD_MLA_VARLEN
+        )
+    target_include_directories(77_blackwell_fmha_bwd_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(77_blackwell_fmha_bwd_${PREC} PRIVATE ${PREC_MACRO})
+    target_compile_options(77_blackwell_fmha_bwd_${PREC} PRIVATE -Xptxas -v)
 
-  #   cutlass_example_add_executable(
-  #       77_blackwell_mla_fwd_${PREC}
-  #       77_blackwell_mla_fwd.cu
-  #       TEST_COMMAND_OPTIONS
-  #       TEST_BASIC
-  #       TEST_CAUSAL_00
-  #       TEST_VARLEN
-  #       TEST_HDIM64
-  #       TEST_GQA
-  #       TEST_MLA_FWD_VARLEN_00
-  #       TEST_MLA_FWD_VARLEN_01
-  #       TEST_MLA_FWD_VARLEN_02
-  #       TEST_MLA_FWD_VARLEN_03
-  #       TEST_MLA_FWD_VARLEN_04
-  #       TEST_MLA_FWD_VARLEN_05
-  #       TEST_MLA_FWD_VARLEN_06
-  #       TEST_MLA_FWD_VARLEN_07
-  #       TEST_MLA_FWD_VARLEN_08
-  #       TEST_MLA_FWD_VARLEN_09
-  #       TEST_MLA_FWD_VARLEN_10
-  #       TEST_MLA_FWD_VARLEN_11
-  #       TEST_MLA_FWD_VARLEN_12
-  #       TEST_MLA_FWD_VARLEN_13
-  #       TEST_MLA_FWD_VARLEN_14
-  #       TEST_MLA_FWD_VARLEN_15
-  #       TEST_MLA_FWD_VARLEN_16
-  #       TEST_MLA_FWD_VARLEN_17
-  #       TEST_MLA_FWD_VARLEN_18
-  #       TEST_MLA_FWD_VARLEN_19
-  #       TEST_MLA_FWD_VARLEN_20
-  #       TEST_MLA_FWD_VARLEN_21
-  #       TEST_MLA_FWD_VARLEN_22
-  #       )
-  #   target_include_directories(77_blackwell_mla_fwd_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  #   target_compile_definitions(77_blackwell_mla_fwd_${PREC} PRIVATE ${PREC_MACRO})
-  #   target_compile_options(77_blackwell_mla_fwd_${PREC} PRIVATE -Xptxas -v)
+    cutlass_example_add_executable(
+        77_blackwell_mla_fwd_${PREC}
+        77_blackwell_mla_fwd.cu
+        TEST_COMMAND_OPTIONS
+        TEST_BASIC
+        TEST_CAUSAL_00
+        TEST_VARLEN
+        TEST_HDIM64
+        TEST_GQA
+        TEST_MLA_FWD_VARLEN_00
+        TEST_MLA_FWD_VARLEN_01
+        TEST_MLA_FWD_VARLEN_02
+        TEST_MLA_FWD_VARLEN_03
+        TEST_MLA_FWD_VARLEN_04
+        TEST_MLA_FWD_VARLEN_05
+        TEST_MLA_FWD_VARLEN_06
+        TEST_MLA_FWD_VARLEN_07
+        TEST_MLA_FWD_VARLEN_08
+        TEST_MLA_FWD_VARLEN_09
+        TEST_MLA_FWD_VARLEN_10
+        TEST_MLA_FWD_VARLEN_11
+        TEST_MLA_FWD_VARLEN_12
+        TEST_MLA_FWD_VARLEN_13
+        TEST_MLA_FWD_VARLEN_14
+        TEST_MLA_FWD_VARLEN_15
+        TEST_MLA_FWD_VARLEN_16
+        TEST_MLA_FWD_VARLEN_17
+        TEST_MLA_FWD_VARLEN_18
+        TEST_MLA_FWD_VARLEN_19
+        TEST_MLA_FWD_VARLEN_20
+        TEST_MLA_FWD_VARLEN_21
+        TEST_MLA_FWD_VARLEN_22
+        )
+    target_include_directories(77_blackwell_mla_fwd_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(77_blackwell_mla_fwd_${PREC} PRIVATE ${PREC_MACRO})
+    target_compile_options(77_blackwell_mla_fwd_${PREC} PRIVATE -Xptxas -v)
   endforeach()
 
   # Add a target that builds all examples
   add_custom_target(77_blackwell_fmha_all
     DEPENDS
-      77_blackwell_fmha_mxfp8
-      # 77_blackwell_fmha_fp8
-      # 77_blackwell_fmha_fp16
-      # 77_blackwell_fmha_gen_fp8
-      # 77_blackwell_fmha_gen_fp16
-      # 77_blackwell_mla_2sm_fp8
-      # 77_blackwell_mla_2sm_fp16
-      # 77_blackwell_mla_2sm_cpasync_fp8
-      # 77_blackwell_mla_2sm_cpasync_fp16
-      # 77_blackwell_fmha_bwd_fp8
-      # 77_blackwell_fmha_bwd_fp16
-      # 77_blackwell_mla_fwd_fp8
-      # 77_blackwell_mla_fwd_fp16
+      77_blackwell_fmha_fp8
+      77_blackwell_fmha_fp16
+      77_blackwell_fmha_gen_fp8
+      77_blackwell_fmha_gen_fp16
+      77_blackwell_mla_2sm_fp8
+      77_blackwell_mla_2sm_fp16
+      77_blackwell_mla_2sm_cpasync_fp8
+      77_blackwell_mla_2sm_cpasync_fp16
+      77_blackwell_fmha_bwd_fp8
+      77_blackwell_fmha_bwd_fp16
+      77_blackwell_mla_fwd_fp8
+      77_blackwell_mla_fwd_fp16
   )
 endif()

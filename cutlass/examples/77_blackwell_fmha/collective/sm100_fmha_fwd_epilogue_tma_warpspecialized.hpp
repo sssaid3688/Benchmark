@@ -226,7 +226,6 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
 
     pipeline.consumer_release(pipeline_release_state);
     ++pipeline_release_state;
-    
 
   } 
 

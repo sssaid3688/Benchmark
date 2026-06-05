@@ -33,7 +33,6 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/memory_sm80.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/detail/sm100_tmem_helper.hpp"
 #include "cute/arch/simd_sm100.hpp"
 #include "cute/tensor.hpp"
 #include "cute/layout.hpp"
@@ -42,9 +41,6 @@
 #include "collective/fmha_fusion.hpp"
 #include "collective/sm100_fmha_load_tma_warpspecialized.hpp"
 
-#include "cute/util/print.hpp"
-// #include "cute/util/print_layout.hpp"
-#include "cute/util/print_tensor.hpp"
 namespace cutlass::fmha::collective {
 
 using namespace cute;
@@ -58,7 +54,12 @@ template<
   class StrideK_,
   class StrideV_,
   class Mask_,
+  // shape here is QG K H
+  // and referes to the two softmax warps
+  // (2, 1, 1) means that they are stacked (best for large Q since it loads the least K/V)
+  // (1, 2, 1) means they sit side by side (best for small Q / large K)
   class ThreadShape = Shape<_2, _1, _1>,
+  // Since shared memory is sufficient for FMHA, there is no need to reuse shared memory.
   class OrderLoadEpilogue = cute::false_type
 >
 struct Sm100FmhaFwdMainloopTmaWarpspecialized {
@@ -77,8 +78,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
-  using ElementData = typename Element::DataType;
-  using ElementScale = typename Element::ScaleFactorType;
+
   using ClusterShape = Shape<_1, _1, _1>;
 
   static const int Alignment = 128 / sizeof_bits_v<Element>;
@@ -86,97 +86,50 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using TileShapeQK = decltype(shape_div(TileShape{}, ThreadShape{}));
 
   using TileShapePV = decltype(select<0,2,1>(TileShapeQK{}));
-  // using MmaTileShape        = Shape<_256,_256,_256>;
 
   using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
       Element, StrideQ, Alignment,
       Element, StrideK, Alignment,
       ElementQK,
       TileShapeQK, ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
 
   using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+      // the stride for A does not matter since we do not load from smem at all
       Element, StrideK, Alignment,
       Element, decltype(select<1,0,2>(StrideV{})), Alignment,
       ElementPV,
       TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
 
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
   using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV>{}));
-  using SmemLayoutP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutA{}, Int<StageCountQ>{}));
   using SmemLayoutV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountKV>{}));
 
-  using SmemLayoutSFQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutSFA{}, Int<StageCountQ>{}));
-  using SmemLayoutSFK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutSFB{}, Int<StageCountKV>{}));
-  using SmemLayoutSFP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFA{}, Int<StageCountQ>{}));
-  using SmemLayoutSFV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFB{}, Int<StageCountKV>{}));
-  
-  // SF TMEM fragment types
-  using FrgTypeSFA_QK = typename CollectiveMmaQK::TiledMma::FrgTypeSFA;
-  using FrgTypeSFB_QK = typename CollectiveMmaQK::TiledMma::FrgTypeSFB;
-  using FrgTypeSFA_PV = typename CollectiveMmaPV::TiledMma::FrgTypeSFA;
-  using FrgTypeSFB_PV = typename CollectiveMmaPV::TiledMma::FrgTypeSFB;
-// layout T:tmem_[8b](0x0000.0180) o (((_32,_4,(_4,_4)),_1),_1,_1,_2):(((_262144,_1,(_4,_8388608)),_0),_0,_0,_16) BLOCK_SCALE_ORI
-// layout S:UMMA::DescriptorIterator o (((_32,_1,_1,_4),_1),_1,_1,_2,_1):(((_1,_1,_1,_0),_0),_0,_0,_32,_64)
-
-// layout 1T:tmem_[8b](0x0000.0100) o (((_32,_4,(_4,_4)),_1),_1,_1,_1):(((_262144,_1,(_4,_8388608)),_0),_0,_0,_0)
-// layout 2S:UMMA::DescriptorIterator o (((_32,_1,_1,_4),_1),_1,_1,_1,_2):(((_1,_1,_1,_0),_0),_0,_0,_0,_32)
-
-// layout T:tmem_[8b](0x0000.0002) o (((_32,_4,(_4,_4)),_1),_1,_1,_1):(((_262144,_1,(_4,_8388608)),_0),_0,_0,_0)
-// layout S:UMMA::DescriptorIterator o (((_32,_1,_1,_4),_1),_1,_1,_1,_2):(((_1,_1,_1,_0),_0),_0,_0,_0,_32)
-  // SF SMEM atom layouts (without staging)
-  using SmemLayoutAtomSFA_QK = typename CollectiveMmaQK::SmemLayoutAtomSFA;
-  using SmemLayoutAtomSFB_QK = typename CollectiveMmaQK::SmemLayoutAtomSFB;
-  using SmemLayoutAtomSFA_PV = typename CollectiveMmaPV::SmemLayoutAtomSFA;
-  using SmemLayoutAtomSFB_PV = typename CollectiveMmaPV::SmemLayoutAtomSFB;
-
-  
   // Reuse shared memory for V and O.
   static constexpr bool IsOrderLoadEpilogue = std::is_same_v<OrderLoadEpilogue, cute::true_type>;
   struct TensorStorage {
-    cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     union {
-      cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutK>> smem_k;
-      cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutV>> smem_v;
+      cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+      cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     };
-    cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutP>> smem_p;
-
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFQ>> smem_sfq;
-    union {
-      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFK>> smem_sfk;
-      cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFV>> smem_sfv;
-    };
-    cute::array_aligned<ElementScale, cute::cosize_v<SmemLayoutSFP>> smem_sfp;
-    // P data SMEM (MXFP8 E4M3, written by softmax, consumed by PV MMA)
   };
 
   enum class TmemAllocation : uint32_t {
     kSizeS = 128,
     kSizeO = 128,
     kSizeP = 32,
-    kSizeP1 = 16,
-    kSizeP2 = 64,
     S0 = 0,
     S1 = S0 + kSizeS,
-    V0 = S0,
+    V0 = S0,  // stats storage from softmax to correction
     V1 = S1,
-    // P0 = S0 + kSizeP,
-    // P1 = S1 + kSizeP,
+    P0 = S0 + kSizeP,
+    P1 = S1 + kSizeP,
     O0 = S1 + kSizeS,
     O1 = O0 + kSizeO,
-    // SFQK ping-pong on S0/S1: when QK MMA writes to S0, SFQK must be on S1 (vice versa)
-    // to avoid hardware conflict between accumulator writes and SF reads in same S half.
-    // SFPV shares the same S0/S1 offsets (QK and PV phases are non-overlapping in time).
-    SFQK0 = S1 + kSizeP,   // S1+32=160, used with Q1*K -> S0
-    SFQK1 = S0 + kSizeP,   // S0+32=32,  used with Q2*K -> S1
-    SFPV0 = S0 + kSizeP2,   // S0+32=32,  same as SFQK1 (PV phase)
-    SFPV1 = S1 + kSizeP2,   // S1+32=160, same as SFQK0 (PV phase)
-
-
-    kSizeSF = 8,  // 8 columns for (SFQ + SFK) or (SFP + SFV) per half
     kEnd = O1 + kSizeO
   };
 
@@ -201,6 +154,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   >;
 
   // from mma to softmax0/1 warp, protects S in tmem
+  // (not sure yet about the reverse direction)
+  // there is one pipe per softmax warp, and the mma warp alternates between them
   using PipelineS = cutlass::PipelineUmmaAsync<1>;
 
   // from softmax0/1/ to correction wg
@@ -212,44 +167,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   // from corr to epilogue
   using PipelineE = cutlass::PipelineAsync<2>;
 
-  // from correction to mma: signals that O0/O1 buffer is free for QK SF reuse
-  using PipelineO_SF = cutlass::PipelineAsync<2>;
-
   using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<
     /*stages*/ 1, /*groups*/ 2>;
 
-  static const int TransactionBytesLoadQ = cutlass::bits_to_bytes(
-    cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<ElementData>+
-      cosize(take<0,3>(SmemLayoutSFQ{})) * cute::sizeof_bits_v<ElementScale>);
+  static const int TransactionBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
 
-  static const int TransactionBytesLoadK = cutlass::bits_to_bytes(
-    cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<ElementData>+
-      cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementScale>);
-      
-  static const int TransactionBytesLoadV = cutlass::bits_to_bytes(
-    cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<ElementData>+
-      cosize(take<0,3>(SmemLayoutSFV{})) * cute::sizeof_bits_v<ElementScale>);
+  static const int TransactionBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
+  static const int TransactionBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
 
-  // static_assert((TransactionBytesLoadK + cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementScale>)
-  // == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
+  static_assert(TransactionBytesLoadK == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
 
   using Load = Sm100FmhaLoadTmaWarpspecialized<
     Element, StrideQ, StrideK, StrideV,
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
-    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape,
-    SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFP, SmemLayoutSFV
+    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape
   >;
 
   struct Arguments {
     typename Load::Arguments load;
 
+    // if zero, defaults to 1/sqrt(D)
     float scale_softmax = 0.0f;
 
+    // scaling factors to dequantize QKV
     float scale_q = 1.0f;
     float scale_k = 1.0f;
     float scale_v = 1.0f;
 
+    // scaling factor to quantize O
     float inv_scale_o = 1.0f;
   };
 
@@ -300,7 +246,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
       PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
-      uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
 
     Load load;
     load.load(blk_coord, problem_shape, params.load, params_problem_shape,
@@ -308,41 +253,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         pipeline_q, pipeline_q_producer_state,
         pipeline_kv, pipeline_kv_producer_state);
   }
-
-  // Helper: set up SMEM→TMEM UTCCP copy infrastructure for a single SF tensor
-  // FrgType: TMEM fragment type (e.g., FrgTypeSFA_QK)
-  // SmemAtomLayout: SMEM atom layout without staging (e.g., SmemLayoutAtomSFA_QK)
-  // SmemLayoutFull: SMEM layout with staging (e.g., SmemLayoutSFQ)
-  template<class FrgType, class SmemAtomLayout, class SmemLayoutFull, class TiledMma>
-  CUTLASS_DEVICE auto
-  setup_sf_utccp_copy(
-      ElementScale* smem_ptr,
-      uint32_t tmem_offset) {
-    // Create SMEM SF tensor with full staging layout
-    Tensor sSF = make_tensor(make_smem_ptr(smem_ptr), SmemLayoutFull{});
-
-    // Create TMEM SF tensor using the atom layout shape (no staging)
-    Tensor tSF = make_tensor<FrgType>(shape(SmemAtomLayout{}));
-    tSF.data() = tSF.data().get() + tmem_offset;
-
-    // Compact both tensors (remove zero strides, preserves staging in SMEM)
-    auto tSF_compact = make_tensor(tSF.data(), filter_zeros(tSF.layout()));
-    auto sSF_compact = make_tensor(sSF.data(), filter_zeros(sSF.layout()));
-
-    // Determine UTCCP op based on CTA count (1CTA vs 2CTA)
-    using AtomThrID = typename TiledMma::AtomThrID;
-    using UtccpOp = cute::conditional_t<(decltype(cute::size(AtomThrID{}) == Int<2>{})::value),
-        SM100_UTCCP_4x32dp128bit_2cta, SM100_UTCCP_4x32dp128bit_1cta>;
-
-    auto tiled_copy_s2t = make_utccp_copy(UtccpOp{}, tSF_compact);
-    auto thr_copy_s2t = tiled_copy_s2t.get_slice(0);
-    auto thr_sSF_s2t_ = thr_copy_s2t.partition_S(sSF_compact);
-    auto thr_sSF_s2t = get_utccp_smem_desc_tensor<UtccpOp>(thr_sSF_s2t_);
-    auto thr_tSF_s2t = thr_copy_s2t.partition_D(tSF_compact);
-
-    return cute::make_tuple(tiled_copy_s2t, thr_sSF_s2t, thr_tSF_s2t, tSF);
-  }
-
 
   template<class BlkCoord, class ProblemShape>
   CUTLASS_DEVICE auto
@@ -352,98 +262,36 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_consumer_state,
       PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_consumer_state,
-      PipelineS& pipeline_s0, typename PipelineS::PipelineState& pipeline_s0_producer_state,  //对应softmax中的pipeline_s_consumer_state
+      PipelineS& pipeline_s0, typename PipelineS::PipelineState& pipeline_s0_producer_state,
       PipelineS& pipeline_s1, typename PipelineS::PipelineState& pipeline_s1_producer_state,
-      PipelineO& pipeline_corr, typename PipelineO::PipelineState& pipeline_corr_producer_state,
-      PipelineO_SF& pipeline_o_sf, typename PipelineO_SF::PipelineState& pipeline_o_sf_consumer_state) {//对应softmax中的pipeline_c_producer_state
+      PipelineO& pipeline_corr, typename PipelineO::PipelineState& pipeline_corr_producer_state) {
 
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
-    // auto pipeline_o_sf_release_state = pipeline_o_sf_consumer_state;
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);  //problemshape: (2048,2048,128), tileshape: (256,128,128)
-
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
 
     typename CollectiveMmaPV::TiledMma mma_pv;
-    ThrMMA thr_mma_pv = mma_pv.get_slice(0);
+    TiledMMA mma_pv_ts = to_tiled_mma_sm100_ts(mma_pv);
+    ThrMMA thr_mma_pv = mma_pv_ts.get_slice(0);
 
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
 
-
     Tensor tSrQ = thr_mma_qk.make_fragment_A(sQ);
     Tensor tSrK = thr_mma_qk.make_fragment_B(sK);
     Tensor tOrV = thr_mma_pv.make_fragment_B(sV);
 
-    // ============================================================
-    // -TCCP copies
-    // ============================================================
-    // TMEM layout:
-    //   S0: cols   0-127  (QK MMA accumulator, S tile 0; V stats 0; SFPV0/SFQK1 SF)
-    //   S1: cols 128-255  (QK MMA accumulator, S tile 1; V stats 1; SFPV1/SFQK0 SF)
-    //   O0: cols 256-383  (PV MMA accumulator, O tile 0 — preserved for correction)
-    //   O1: cols 384-511  (PV MMA accumulator, O tile 1 — preserved for correction)
-    //
-    // SFQK ping-pong: when QK writes S0, SFQK placed on S1 (vice versa) to avoid conflict.
-    // SFPV and SFQK share the same S region offsets (QK/PV phases are time-disjoint).
-    uint32_t sf_tmem_base_qk0 = uint32_t(TmemAllocation::SFQK0);   // S1+32=160, used with Q1*K -> S0
-    uint32_t sf_tmem_base_qk1 = uint32_t(TmemAllocation::SFQK1);   // S0+32=32,  used with Q2*K -> S1
-    uint32_t sf_tmem_base_pv0 = uint32_t(TmemAllocation::SFPV0);   // S0+32=32,  same as SFQK1 (PV phase)
-    uint32_t sf_tmem_base_pv1 = uint32_t(TmemAllocation::SFPV1);   // S1+32=160, same as SFQK0 (PV phase)
-
-
-    // Set up UTCCP copies and TMEM SF tensors for QK MMA (SF placed in S region, ping-pong on S0/S1)
-    uint32_t sfq0_tmem_offset = sf_tmem_base_qk0;
-    uint32_t sfk0_tmem_offset = sf_tmem_base_qk0 + 16;  // 8 columns gap between SFQ and SFK
-
-    uint32_t sfq1_tmem_offset = sf_tmem_base_qk1;
-    uint32_t sfk1_tmem_offset = sf_tmem_base_qk1 + 16;  // 8 columns gap between SFQ and SFK
-
-    auto [tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t, thr_tSFQ0_s2t, tCtSFQ0] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfq.data(), sfq0_tmem_offset);
-
-    auto [tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t, thr_tSFQ1_s2t, tCtSFQ1] =
-        setup_sf_utccp_copy<FrgTypeSFA_QK, SmemLayoutAtomSFA_QK, SmemLayoutSFQ, typename CollectiveMmaQK::TiledMma>(
-          storage.smem_sfq.data(), sfq1_tmem_offset);
-    auto [tiled_copy_s2t_SFK0, thr_sSFK0_s2t, thr_tSFK0_s2t, tCtSFK0] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfk.data(), sfk0_tmem_offset);
-
-    auto [tiled_copy_s2t_SFK1, thr_sSFK1_s2t, thr_tSFK1_s2t, tCtSFK1] =
-        setup_sf_utccp_copy<FrgTypeSFB_QK, SmemLayoutAtomSFB_QK, SmemLayoutSFK, typename CollectiveMmaQK::TiledMma>(
-            storage.smem_sfk.data(), sfk1_tmem_offset);
-    // Set up UTCCP copies and TMEM SF tensors for PV MMA (SF placed in S region gap)
-    uint32_t sfp0_tmem_offset = sf_tmem_base_pv0;
-    uint32_t sfv0_tmem_offset = sf_tmem_base_pv0 + 16;
-
-    uint32_t sfp1_tmem_offset = sf_tmem_base_pv1;
-    uint32_t sfv1_tmem_offset = sf_tmem_base_pv1 + 16;
-
-    auto [tiled_copy_s2t_SFP0, thr_sSFP0_s2t, thr_tSFP0_s2t, tCtSFP0] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfp.data(), sfp0_tmem_offset);
-
-    auto [tiled_copy_s2t_SFP1, thr_sSFP1_s2t, thr_tSFP1_s2t, tCtSFP1] =
-        setup_sf_utccp_copy<FrgTypeSFA_PV, SmemLayoutAtomSFA_PV, SmemLayoutSFP, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfp.data(), sfp1_tmem_offset);
-
-    auto [tiled_copy_s2t_SFV0, thr_sSFV0_s2t, thr_tSFV0_s2t, tCtSFV0] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfv.data(), sfv0_tmem_offset);
-
-      auto [tiled_copy_s2t_SFV1, thr_sSFV1_s2t, thr_tSFV1_s2t, tCtSFV1] =
-        setup_sf_utccp_copy<FrgTypeSFB_PV, SmemLayoutAtomSFB_PV, SmemLayoutSFV, typename CollectiveMmaPV::TiledMma>(
-            storage.smem_sfv.data(), sfv1_tmem_offset);
-
-    // ============================================================
+    // tmem layout is
+    // S0 S1`O0 O1
+    // sequential in memory, where S overlaps with P and V
 
     Tensor tStS = partition_fragment_C(mma_qk, select<0,1>(TileShapeQK{}));
-    Tensor tOtO = partition_fragment_C(mma_pv, select<0,1>(TileShapePV{}));
+    Tensor tOtO = partition_fragment_C(mma_pv_ts, select<0,1>(TileShapePV{}));
 
     Tensor tStS0 = tStS;
     tStS0.data() = tStS.data().get() + uint32_t(TmemAllocation::S0);
@@ -455,21 +303,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tOtO1 = tOtO;
     tOtO1.data() = tOtO.data().get() + uint32_t(TmemAllocation::O1);
 
-    Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
-    Tensor tOrP = thr_mma_pv.make_fragment_A(sP);
+    Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
+    Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});  // slice out staging
 
-    // Select stage 0 (P from softmax 0) and stage 1 (P from softmax 1)
-    Tensor tOrP0 = tOrP(_, _, _, _0{});
-    Tensor tOrP1 = tOrP(_, _, _, _1{});
+    Tensor tOrP0 = tOrP;
+    tOrP0.data() = tOrP0.data().get() + uint32_t(TmemAllocation::P0);
+    Tensor tOrP1 = tOrP;
+    tOrP1.data() = tOrP1.data().get() + uint32_t(TmemAllocation::P1);
 
     int k_index = 0;
     int v_index = 0;
     int q_index = 0;
-    int sp_index = 0;
-
-    // ============================================================
-    // Initialization: wait for Q1, K1
-    // ============================================================
 
     // wait for Q1
     q_index = pipeline_q_consumer_state.index();
@@ -477,114 +321,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_q_consumer_state;
 
     Tensor tSrQ0 = tSrQ(_,_,_,q_index);
-    // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==384){
+
 
     // wait for K1
     k_index = pipeline_kv_consumer_state.index();
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-        // ===== DEBUG: print raw K + SF_K from SMEM (MMA warp, lane 0) =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // SF_K in SMEM — no swizzle, direct row-major (verified by tQsQ_sf layout)
-      // float* sfk_f = (storage.smem_sfk.data());
-      printf("\n[MMA] smem_sfk[0..7] (row0,g0..g3 then row1,g0..g3): ");
-      for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-
-      // K SMEM has Sw<3,4,3> swizzle. For cross-check, dump raw bytes
-      // of first 2 "rows" of 128 bytes each = first 256 bytes of smem_k.
-      // Sw<3,4,3> on (128,128) FP8: row0 bytes are at offsets 0,1,2,...
-      // but interleaved. We rely on CUTE to decode:
-      // uint8_t* kb = reinterpret_cast<uint8_t*>(storage.smem_k.data());
-      printf("\n[MMA] smem_k raw first 32B (row0 partial): ");
-      for (int i = 0; i < 32; i++) printf("%.6f ", (float)storage.smem_k[i]);
-
-      // Also print via the cute tensor with swizzle
-      auto sK_raw = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-      // SmemLayoutK = unstageSmemLayout(SmemLayoutB{}, 4), so pick stage=k_index
-      // The swizzled layout maps (atom_group, atom_row, atom_col, ...) → byte
-      // Use thr_mma partition to read
-      ThrMMA thr_tmp = mma_qk.get_slice(0);
-      auto tK_smem = thr_tmp.make_fragment_B(sK_raw);
-      // tK_smem(_, _, _, k_index) gives the fragment for this stage
-      // Each thread owns a piece of the tile; lane 0 gets specific elements
-      auto myK = tK_smem(_, _, _, k_index);
-      printf("\n[MMA] K fragment via thr_mma (lane0, stage=%d), size=%d: ",
-          k_index, (int)size(myK));
-      for (int i = 0; i < 8 && i < size(myK); i++) {
-        printf("%.3f ", (float)myK(i));
-      }
-      printf("\n\n");
-    }
-    // =========================================================
-
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-    //     constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-    //     printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-    //     for (int i = 0; i < 32; ++i) {
-    //         printf("  sfk[%d] = %f  |", i, (float)storage.smem_sfk[i]);
-    //     }
-    //   }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-        constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-        constexpr int K_size = cute::cosize_v<SmemLayoutK>; 
-        printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-        printf("=== smem_k, total elements=%d ===\n", K_size);
-      }
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384){
-
-    //   printf("blockIdx.z=%d, threadIdx.x=%d, threadIdx.y=%d, threadIdx.z=%d\n",blockIdx.z, threadIdx.x,threadIdx.y,threadIdx.z);
-    // }
+    // gemm Q1 * K1 -> S1
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
-    pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
+    gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);
 
-
-    // ===== DEBUG: check UTCCP SFK partition vs SMEM SFK =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // Print what UTCCP will copy: the SFK fragment for this stage
-      auto dbg_sfk_src0 = thr_sSFK0_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK0] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src0));
-      for (int i = 0; i < size(dbg_sfk_src0); i++) printf("%.6f ", (float)dbg_sfk_src0(i));
-      printf("\n");
-      // Print raw SMEM SFK for same rows
-      float* sfk_raw = reinterpret_cast<float*>(storage.smem_sfk.data());
-      int sfk_smem_elems = cute::cosize_v<SmemLayoutSFK>;
-      printf("[DEBUG] smem_sfk cosize=%d, raw[0..15]: ", sfk_smem_elems);
-      for (int i = 0; i < 16 && i < sfk_smem_elems; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-      printf("\n");
-    }
-    // =========================================================
-
-    // ===== DEBUG: Print SMEM SF content for all CTAs =====
-    // Temporarily disabled - uncomment for debugging
-    // if (threadIdx.x == 384) {
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfq[0..7]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z);
-    //   for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfq[i]);
-    //
-    //   constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>;
-    //   printf("\n[MMA][CTA=(%d,%d,%d)] smem_sfk[0..%d]: ",
-    //          blockIdx.x, blockIdx.y, blockIdx.z, min(SFK_size, 16)-1);
-    //   for (int i = 0; i < min(SFK_size, 16); i++) {
-    //     printf("%.6f ", (float)storage.smem_sfk[i]);
-    //   }
-    //   printf("\n");
-    // }
-    // ======================================================
-
-
-    if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,q_index), thr_tSFQ0_s2t);  //Q1 * K1 (SFQ0→S1+32, output→S0)
-      copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);
-    }
-    cutlass::arch::fence_view_async_tmem_store();
-
-    
-    gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0, tCtSFQ0, tCtSFK0);  // Q1*K1→S0, reads SF from S1
-    // gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);  //
-
-    pipeline_s0.producer_commit(pipeline_s0_producer_state);    //commit之后softmax中计算pipeline_s.consumer_wait(pipeline_s_consumer_state);
+    pipeline_s0.producer_commit(pipeline_s0_producer_state);
     ++pipeline_s0_producer_state;
 
     // release K1
@@ -608,32 +357,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_kv_consumer_state;
     }
 
-    // ============================================================
-    // Copy Q SF and K SF for second QK MMA
-    // Q2*K1: SFQK1 goes to S0+32, output goes to S1
-    // Need to re-acquire S0 (was committed above, now owned by softmax)
-    // S1 is still held from the acquire above (never committed yet)
-    // ============================================================
-    pipeline_s0.producer_acquire(pipeline_s0_producer_state);  // wait for softmax to release S0
+    pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
-    // ===== DEBUG: SFK1 UTCCP partition =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      auto dbg_sfk_src1 = thr_sSFK1_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK1] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src1));
-      for (int i = 0; i < size(dbg_sfk_src1); i++) printf("%.6f ", (float)dbg_sfk_src1(i));
-      printf("\n");
-    }
-
-    if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,q_index), thr_tSFQ1_s2t);  //Q2 * K1 (SFQ1→S0+32, output→S1)
-      copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
-    }
-    cutlass::arch::fence_view_async_tmem_store();
-
-    // gemm Q2 * K1 -> S1  (WITH SCALE FACTORS)
-    gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1, tCtSFQ1, tCtSFK1);
-    // gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1);
-
+    // gemm Q2 * K1 -> S2
+    gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1);
 
     pipeline_s1.producer_commit(pipeline_s1_producer_state);
     ++pipeline_s1_producer_state;
@@ -642,45 +369,52 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_release(pipeline_kv_release_state);
     ++pipeline_kv_release_state;
 
-    // wait for V1   V，SFV和SFP一起搬
+    // wait for V1
     v_index = pipeline_kv_consumer_state.index();
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-
+    // this acquire returns the ownership of all of S0 to the mma warp
+    // including the P0 part
+    // acquire corr first to take it out of the critical
+    // path since softmax takes longer
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
-    pipeline_s0.producer_acquire(pipeline_s0_producer_state); //等 Softmax0 消费完上一轮 S0 并释放。
+    pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-    // =========================================================
+    // gemm P1 * V1 -> O1
+    gemm_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index), tOtO0);
 
-    if (cute::elect_one_sync()) {
-      // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
-      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,0), thr_tSFP0_s2t);
-      copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
-    }
-    cutlass::arch::fence_view_async_tmem_store();
-
-    //P1 * V1 -> O1
-    gemm_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0, tCtSFP0, tCtSFV0);  //写O0，此时SFQK的O0已经释放
-    // gemm_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0);
-
-
-    pipeline_corr.producer_commit(pipeline_corr_producer_state);    //计算完O后去矫正
+    pipeline_corr.producer_commit(pipeline_corr_producer_state);
     ++pipeline_corr_producer_state;
 
-    if constexpr (get<1>(ThreadShape{}) > 1) {
+      if constexpr (get<1>(ThreadShape{}) > 1) {
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
     }
 
-    mma_pv.accumulate_ = UMMA::ScaleOut::Zero;
+    mma_pv_ts.accumulate_ = UMMA::ScaleOut::Zero;
 
-
-    // pipeline_o_sf.consumer_release(pipeline_o_sf_release_state);
+    // loop:
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-         // P2计算之前，SFP2要搬运进SMEM
-      // gemm P2 * V(i-1) -> O2    P2*V1
+
+      // wait for Ki
+      k_index = (pipeline_kv_consumer_state.index());
+      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+      ++pipeline_kv_consumer_state;
+
+      // gemm Q1 * Ki -> S1
+      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);
+
+      pipeline_s0.producer_commit(pipeline_s0_producer_state);
+      ++pipeline_s0_producer_state;
+
+      if constexpr (get<1>(ThreadShape{}) > 1) {
+        pipeline_kv.consumer_release(pipeline_kv_release_state);
+        ++pipeline_kv_release_state;
+      }
+
+      // gemm P2 * V(i-1) -> O2
       if constexpr (get<1>(ThreadShape{}) > 1) {
         v_index = pipeline_kv_consumer_state.index();
         pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
@@ -689,51 +423,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s1.producer_acquire(pipeline_s1_producer_state);
-      // printf("im waite\n");
 
-      if (cute::elect_one_sync()) {
-          // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
-          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,1), thr_tSFP1_s2t);
-          copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
-      }
-
-      cutlass::arch::fence_view_async_tmem_store();
-
-      // gemm P2 * V(i-1) -> O2
-      gemm_reset_zero_acc(mma_pv, tOrP1, tOrV(_,_,_,v_index), tOtO1, tCtSFP1, tCtSFV1);
-
+      gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index), tOtO1);
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 
-      // release sfp
       // release V(i-1)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
-
-
-      // wait for Ki
-      k_index = (pipeline_kv_consumer_state.index());
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
-
-      if (cute::elect_one_sync()) {
-          copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,0), thr_tSFQ0_s2t);
-          copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);  //都是使用O0
-      }
-      cutlass::arch::fence_view_async_tmem_store();
-
-      // gemm Q1 * Ki -> S1  (WITH SCALE FACTORS)   这一SFQK会用到O0的位置，所以等待O0 correction做完
-      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0, tCtSFQ0, tCtSFK0);  //K的取数有问题，Q的不用管×
-      
-      pipeline_s0.producer_commit(pipeline_s0_producer_state);  //s0计算完通知后面做softmax
-      ++pipeline_s0_producer_state;
-
-      if constexpr (get<1>(ThreadShape{}) > 1) {
-        pipeline_kv.consumer_release(pipeline_kv_release_state);
-        ++pipeline_kv_release_state;
-      }
-       //************************************************ */
 
       if constexpr (get<1>(ThreadShape{}) > 1) {
         k_index = (pipeline_kv_consumer_state.index());
@@ -741,18 +439,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         ++pipeline_kv_consumer_state;
       }
 
-
-      // SFQK1 goes to S0+32 → must re-acquire S0 (was committed in Q1*K→S0 above)
-      pipeline_s0.producer_acquire(pipeline_s0_producer_state);
-      if (cute::elect_one_sync()) {
-          copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,1), thr_tSFQ1_s2t);  // SFQ1→S0+32
-          copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
-      }
-
-
-      cutlass::arch::fence_view_async_tmem_store();
-      // gemm Q2 * Ki -> S1  (WITH SCALE FACTORS, SFQK1 from S0+32)
-      gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1, tCtSFQ1, tCtSFK1);
+      // gemm Q2 * Ki -> S2
+      gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1);
 
       pipeline_s1.producer_commit(pipeline_s1_producer_state);
       ++pipeline_s1_producer_state;
@@ -761,27 +449,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
 
-      // wait for Vi   //第二个V wait
+      // wait for Vi
       v_index = (pipeline_kv_consumer_state.index());
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
       ++pipeline_kv_consumer_state;
 
-      // gemm P1 * Vi -> O1  (WITH SCALE FACTORS)
+      // gemm P1 * Vi -> O1
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
-      pipeline_s0.producer_acquire(pipeline_s0_producer_state);  //P1 * Vi -> O1
 
+      pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-
-      if (cute::elect_one_sync()) {  
-        // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
-        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,0), thr_tSFP0_s2t);
-        copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
-      }
-      cutlass::arch::fence_view_async_tmem_store();
-      // gemm P1 * Vi -> O1  (WITH SCALE FACTORS)
-      gemm_reset_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0, tCtSFP0, tCtSFV0);
-      // gemm_reset_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0);
-
+      gemm_reset_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index), tOtO0);
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
@@ -789,12 +467,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       if constexpr (get<1>(ThreadShape{}) > 1) {
         pipeline_kv.consumer_release(pipeline_kv_release_state);
         ++pipeline_kv_release_state;
-      }  
+      }
     }
-
-    // ============================================================
-    // Loop epilogue
-    // ============================================================
 
     // release Q1
     pipeline_q.consumer_release(pipeline_q_release_state);
@@ -805,7 +479,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_q.consumer_release(pipeline_q_release_state);
       ++pipeline_q_release_state;
     }
-    
 
     // wait for Vi
     if constexpr (get<1>(ThreadShape{}) > 1) {
@@ -813,18 +486,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
       ++pipeline_kv_consumer_state;
     }
-    // gemm P2 * Vi -> O2  (WITH SCALE FACTORS)
+
+    // gemm P2 * Vi -> O2
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
-    if (cute::elect_one_sync()) {
-        // SFP from SMEM (filled by softmax_step) → TMEM via UTCCP
-        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,1), thr_tSFP1_s2t);
-        copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
-    }
-    cutlass::arch::fence_view_async_tmem_store();
-    gemm_reset_zero_acc(mma_pv, tOrP1, tOrV(_,_,_,v_index), tOtO1, tCtSFP1, tCtSFV1);
-    
+    gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index), tOtO1);
 
     pipeline_corr.producer_commit(pipeline_corr_producer_state);
     ++pipeline_corr_producer_state;
@@ -833,15 +500,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_release(pipeline_kv_release_state);
     ++pipeline_kv_release_state;
 
-
     pipeline_s0.producer_commit(pipeline_s0_producer_state);
     ++pipeline_s0_producer_state;
 
     pipeline_s1.producer_commit(pipeline_s1_producer_state);
     ++pipeline_s1_producer_state;
+
+    // T0 S00 B1, T0 S10 B1, T0 S00 B2, T0 S01 B1, T0 S10 B2, T0 S11 B1, T0 S01 B2, T1 S00 B1, T0 S11 B2, ...
+    // Q1 * K1  , Q2 * K1  , S11 * V1 , Q1 * K2  , S21 * V1  , Q2 * K2 , S12 * V2 , Q1 * K3  , S22 * K2 , ...
   }
 
- 
   template<bool need_apply_mask, class Stage, class BlkCoord, class CoordTensor, class ProblemShape>
   CUTLASS_DEVICE auto
   softmax_step(
@@ -851,8 +519,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       Params const& params, ProblemShape const& problem_shape,
       PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
-      OrderBarrierSoftmax& order_s,
-      TensorStorage& storage) {
+      OrderBarrierSoftmax& order_s) {
 
     Tensor tScS = typename CollectiveMmaQK::TiledMma{}.get_slice(0).partition_C(cS);
 
@@ -863,12 +530,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     tStS_v.data() = uint32_t(stage == _0{} ? TmemAllocation::V0 : TmemAllocation::V1);
     Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
 
+    auto tilePlikeFP32 = size<1>(TileShapeQK{}) / Int<sizeof(float)>{} * Int<sizeof(Element)>{};
+    Tensor tStS_P = tStS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
+    tStS_P.data() = warp_uniform(uint32_t(stage == _0{} ? TmemAllocation::P0 : TmemAllocation::P1));
+    Tensor tScS_P = tScS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
+
     // Each thread owns a single row
     #if defined CUTE_ARCH_TCGEN05_TMEM_STAT_ENABLED
       using TMEM_LOAD = SM100_TMEM_LOAD_STAT_32dp32b32x;
     #else
       using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x; // 4x32 threads with 128 cols of 32b elem
     #endif
+    using TMEM_STORE = SM100_TMEM_STORE_32dp32b32x;  // 4x32 threads with 128 cols of 8b elem
     using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;   // 4x32 threads with 2 cols of 32b elem
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
@@ -885,35 +558,24 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tTMEM_STOREVtS = thr_tmem_storev.partition_D(tStS_v);
     Tensor tTMEM_STOREVcS = thr_tmem_storev.partition_S(tScS_v);
 
-    // wait on tensor core pipe   等待tensorCore中QK->S计算完
+    auto tiled_tmem_store = make_tmem_copy(TMEM_STORE{}, tStS_P);
+    auto thr_tmem_store  = tiled_tmem_store.get_slice(thread_idx);
+
+    Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
+    tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
+    Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
+
+    // wait on tensor core pipe
     pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
     // read all of S from tmem into reg mem
-    Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));  //S计算完再使用S数据
-    copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);  //从TMEM中搬运到寄存器中，tTMEM_LOADtS是从S0而来
-        // ===== DEBUG: print raw S from TMEM (softmax_step, runs on Softmax0/1 warps) =====
-    {
-      // Softmax0: threads 0-127 (warp 0), Softmax1: threads 128-255 (warp 4).
-      // Print from lane 0 of each softmax warp-group.
-      int sm_wg = threadIdx.x / 128;  // 0 for Softmax0, 1 for Softmax1
-      int sm_tid = threadIdx.x % 128;
-      if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 0) {
-        auto first_coord = tTMEM_LOADcS(_0{});
-        int my_row = get<0>(first_coord);
-        int base_k = get<1>(first_coord);
-        printf("[SM%d_S] row=%d K=%d..%d: ",
-            sm_wg, my_row, base_k, base_k + (int)size(tTMEM_LOADrS) - 1);
-        for (int i = 0; i < 8 && i < size(tTMEM_LOADrS); i++) {
-            printf("%.6f ", (float)tTMEM_LOADrS(i));
-        }
-        printf("\n");
-      }
-    }
-    // =============================================================
+    Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+    copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
 
     if constexpr (need_apply_mask) {
       Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
     }
+
     ElementQK old_row_max = row_max;
     #if defined CUTE_ARCH_TCGEN05_TMEM_STAT_ENABLED
       auto pos = tTMEM_LOADcS(0);
@@ -924,13 +586,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       else
     #endif
     {
+      // compute rowmax
       float row_max_0 = row_max;
       float row_max_1 = row_max;
       float row_max_2 = row_max;
       float row_max_3 = row_max;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
-        row_max_0  = ::fmax(row_max_0, tTMEM_LOADrS(i));  //从寄存器中获取值
+        row_max_0  = ::fmax(row_max_0, tTMEM_LOADrS(i));
         row_max_1 = ::fmax(row_max_1, tTMEM_LOADrS(i+1));
         row_max_2 = ::fmax(row_max_2, tTMEM_LOADrS(i+2));
         row_max_3 = ::fmax(row_max_3, tTMEM_LOADrS(i+3));
@@ -942,63 +605,34 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     ElementQK row_max_safe = row_max == -INFINITY ? 0 : row_max;
 
-    Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));  //定义寄存器
+    Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
     tTMEM_STOREVrS(kIdxOldRowMax) = old_row_max;
     tTMEM_STOREVrS(kIdxNewRowMax) = row_max_safe;
-    copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);   //寄存器->TMEM V，搬运目标：TMEM 的 V0 或 V1 区域
-                                                        // - 用途：Correction warp 读这些 stats 来判断是否需要 rescale O
+    copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
 
-    pipeline_c.producer_commit(pipeline_c_producer_state);  //等待
+    pipeline_c.producer_commit(pipeline_c_producer_state);
     ++pipeline_c_producer_state;
 
-    ElementQK scale = params.scale_softmax_log2;   //计算 exp2(scale * (S - row_max)), ElementQK:float
-    // scale_softmax_log2 = scale_q * scale_k * log2(e) / sqrt(d)
+    // notify correction wg that they are ready (might need addtl ordering between S0 and S1 WG's)
+
+    ElementQK scale = params.scale_softmax_log2;
     ElementQK row_max_scale = row_max_safe * scale;
 
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
 
-    // ================================================================
-    // P → SMEM_P via direct row-wise write
-    //
-    // Flow: S from TMEM → reg → softmax → quantize → pack into
-    //       tTMEM_STORErS_x4 (reg buffer, 32×uint32_t per thread)
-    //       → write 32 uint32_t to SMEM row = this thread's row in tile
-    //
-    // We reuse the TMEM_STORE coordinate system (tTMEM_STOREcS) to define
-    // the register packing buffer shape, but skip TMEM store and
-    // write to SMEM directly instead.
-    // ================================================================
-
-    // --- SMEM P tile (swizzled layout, for PV MMA) ---
-    Tensor sP_full = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
-    Tensor sP_tile = (stage == _0{}) ? sP_full(_, _, _, _0{}) : sP_full(_, _, _, _1{});
-
-    // --- Register buffer coordinate system (from TMEM_STORE layout) ---
-    using TMEM_STORE_P = SM100_TMEM_STORE_32dp32b32x;
-
-    auto tilePlikeFP32 = size<1>(TileShapeQK{}) / Int<sizeof(float)>{} * Int<sizeof(Element)>{};
-    Tensor tStS_P = tStS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
-    // TMEM base unused, only need the coordinate shape
-    tStS_P.data() = warp_uniform(0);
-    Tensor tScS_P = tScS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
-
-    auto tiled_tmem_store = make_tmem_copy(TMEM_STORE_P{}, tStS_P);
-    auto thr_tmem_store = tiled_tmem_store.get_slice(thread_idx);
-    Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
+    Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
     constexpr int kConversionsPerStep = 2;
-    Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
-    Tensor tTMEM_STORErS_x4_e = recast<Array<ElementData, kConversionsPerStep>>(tTMEM_STORErS_x4);
 
-    NumericArrayConverter<ElementData, ElementQK, kConversionsPerStep> convert;
+    Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
+
+    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
 
     const int kReleasePipeCount = 10;  // must be multiple of 2
 
     order_s.wait();
 
-    // Phase 1: Compute softmax P = exp2(scale * (S - row_max)),
-    //          quantize FP32 → E4M3, pack into register buffer
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
       float2 in = make_float2(
@@ -1013,7 +647,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       tTMEM_LOADrS(i+0) = ::exp2f(tTMEM_LOADrS(i+0));
       tTMEM_LOADrS(i+1) = ::exp2f(tTMEM_LOADrS(i+1));
 
-      // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < kConversionsPerStep; j++) {
@@ -1021,67 +654,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
       tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
 
+
       if (i == size(tTMEM_LOADrS) - kReleasePipeCount) {
         order_s.arrive();
       }
-    }
 
-    // ================================================================
-    // Phase 2: Write P from registers → SMEM (row-wise, per thread)
-    // ================================================================
-    // Each thread owns exactly one row (128 fp8 = 32 uint32_t) of the
-    // (128, 128) P tile.  Recast the swizzled SMEM tile to uint32_t view
-    // and write the thread's row.
-    //
-    //   sP_tile (8b):  (128, 128)  →  16384 fp8
-    //   sP_u32 (32b):  (128,  32)  →   4096 uint32_t
-    //   thread row:    sP_u32(thread_idx, _)  →  32 uint32_t
-    //
-    // Swizzle (Sw<3,4,3>) is part of the smem_ptr type, so recast
-    // preserves the correct bank-conflict-avoiding addresses.
-    // ================================================================
-    // Tensor sP_u32 = recast<uint32_t>(sP_tile);
-    // auto my_coord = tTMEM_LOADcS(_0{});                      // first coord element
-    // int my_row = get<0>(my_coord);                            // row in [0, 128)
-    // Tensor sP_my_row = sP_u32(my_row, _, _);                     // (32,) uint32_t
-
-
-    int my_row = get<0>(tTMEM_LOADcS(_0{})) % 128;
-
-    // coalesce: flatten swizzled 3-mode layout -> true 2D (128, 128) FP8
-    // then recast to uint32_t: inner 4 FP8 -> 1 uint32_t -> (128, 32)
-    auto sP_tile_flat = coalesce(sP_tile);
-    Tensor sP_u32 = recast<uint32_t>(sP_tile_flat);
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < size(tTMEM_STORErS_x4); ++j) {
-      sP_u32(my_row, j) = tTMEM_STORErS_x4(j);
-    }
-
-    // ================================================================
-    // Phase 2.5: Compute P scale factors (SFP) for block-scaled UMMA.
-    // Write SFP=127 (scale=1.0) since P ∈ [0,1] fits in E4M3 directly.
-    // ================================================================
-    {
-      constexpr int kSfpSize = cute::cosize_v<SmemLayoutSFP>;
-      unsigned char* raw_sfp = reinterpret_cast<unsigned char*>(storage.smem_sfp.data());
-      for (int i = threadIdx.x; i < kSfpSize; i += blockDim.x) {
-        raw_sfp[i] = 127;
+      // this prevents register spills in fp16
+      if constexpr (size<2>(tTMEM_STORErS_x4) == _2{}) {
+        if (i == size(tTMEM_LOADrS) - 6) {
+          copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, 0), tTMEM_STOREtS_x4(_, _, 0));
+        }
       }
     }
 
-    cutlass::arch::fence_view_async_shared();
+    // tmem_store(reg_S8) -> op_P
+    CUTE_STATIC_ASSERT_V(size<2>(tTMEM_STORErS_x4) <= _2{});
+    CUTE_STATIC_ASSERT_V(size<1>(tTMEM_STORErS_x4) == _1{});
+    copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1), tTMEM_STOREtS_x4(_, _, size<2>(tTMEM_STORErS_x4) - 1));
 
-    
+    cutlass::arch::fence_view_async_tmem_store();
+
     // notify tensor core warp that P is ready
-    pipeline_s.consumer_release(pipeline_s_consumer_state);  //执行到这，在等待C释放
+    pipeline_s.consumer_release(pipeline_s_consumer_state);
     ++pipeline_s_consumer_state;
 
-
-
-    pipeline_c.producer_acquire(pipeline_c_producer_state);  //等待O计算完
+    pipeline_c.producer_acquire(pipeline_c_producer_state);
 
     ElementQK acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
     row_sum *= acc_scale;
+    // row_sum = sum(reg_S)
     float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
     float2 local_row_sum_1 = make_float2(0, 0);
     float2 local_row_sum_2 = make_float2(0, 0);
@@ -1089,6 +690,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
+      // row_sum += tTMEM_LOADrS(i);
       float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
       cute::add(local_row_sum_f32x2, local_row_sum_f32x2, in);
 
@@ -1110,18 +712,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     row_sum = local_row_sum;
 
     if (final_call) {
+      // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
       copy(tiled_tmem_storev, tTMEM_STOREVrS, tTMEM_STOREVtS);
-
     }
   }
-
-
-
 
   template<class Stage, class BlkCoord, class ProblemShape>
   CUTLASS_DEVICE auto
@@ -1129,10 +728,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       Stage stage,
       BlkCoord const& blk_coord,
       Params const& params, ProblemShape const& problem_shape,
-      PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,  
+      PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
-      OrderBarrierSoftmax& order_s,
-      TensorStorage& storage) {
+      OrderBarrierSoftmax& order_s) {
 
     int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape);
 
@@ -1148,7 +746,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     pipeline_c.producer_acquire(pipeline_c_producer_state);
 
-    // mask_tile_count = 1;
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       softmax_step<false /* need_apply_mask */>(
@@ -1158,8 +755,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           blk_coord, cS, params, problem_shape,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
-          order_s,
-          storage
+          order_s
       );
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
@@ -1168,7 +764,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // Masked iterations
     mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape);
 
-    // mask_tile_count = 1;
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       softmax_step<true /* need_apply_mask */>(
@@ -1176,8 +771,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           blk_coord, cS, params, problem_shape,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
-          order_s,
-          storage
+          order_s
       );
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
@@ -1192,7 +786,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_s_consumer_state;
   }
 
-
   template<class Stage, class TensorO>
   CUTLASS_DEVICE auto
   correction_epilogue(
@@ -1206,9 +799,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     Tensor sO = sO_01(_,_,stage);
 
+    // As opposed to the softmax, we do not have enough registers here
+    // to load all of the values (for tile kv = 128), so we loop
+    // good values would be either 32 or 64
     const int kCorrectionTileSize = 32 / sizeof(ElementOut);
 
-    using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;
+    using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
 
     typename CollectiveMmaPV::TiledMma mma;
     Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
@@ -1237,6 +833,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     float2 scale_f32x2 = make_float2(scale, scale);
 
+    // loop:
+    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < get<2>(TileShape{}) / kCorrectionTileSize; i++) {
       Tensor tTMEM_LOADtO_i = tTMEM_LOADtO(_, _0{}, _0{}, i);
@@ -1286,10 +884,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
+    // As opposed to the softmax, we do not have enough registers here
+    // to load all of the values (for tile kv = 128), so we loop
+    // good values would be either 32 or 64
     const int kCorrectionTileSize = 16;
 
-    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;
-    using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;
+    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
+    using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
 
     typename CollectiveMmaPV::TiledMma mma;
     Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
@@ -1330,6 +931,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       copy(tiled_tmem_store, tTMrO_i, tTMEM_STOREtO_i);
     };
 
+    // sequence: LLMSLMSLMSS
+
+    // loop:
+    //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
     copy_in(0);
 
     int count = get<2>(TileShape{}) / kCorrectionTileSize;
@@ -1370,7 +975,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       PipelineC& pipeline_s0_c, typename PipelineC::PipelineState& pipeline_s0_c_consumer_state,
       PipelineC& pipeline_s1_c, typename PipelineC::PipelineState& pipeline_s1_c_consumer_state,
       PipelineO& pipeline_o, typename PipelineO::PipelineState& pipeline_o_consumer_state,
-      PipelineO_SF& pipeline_o_sf, typename PipelineO_SF::PipelineState& pipeline_o_sf_producer_state,
       PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
       CollectiveEpilogue& epilogue) {
 
@@ -1386,7 +990,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
     Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
 
-    using TMEM_LOAD_V = SM100_TMEM_LOAD_32dp32b2x;
+    using TMEM_LOAD_V = SM100_TMEM_LOAD_32dp32b2x;   // 4x32 threads with 2 cols of 32b elem
 
     auto tiled_tmem_loadv = make_tmem_copy(TMEM_LOAD_V{}, tStS_v);
     auto thr_tmem_loadv  = tiled_tmem_loadv.get_slice(thread_idx);
@@ -1408,22 +1012,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // handle the last iteration differently (i.e. tmem_load/stsm for epi)
     mask_tile_count -= 1;
-    // mask_tile_count = 1;
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
 
-      pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);  //做完softmax再来这里
+      pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
 
       Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
 
       // read row_wise new global max
       copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
 
+      // e^(scale * (old_max - new_max)
       float scale = (tTMEM_LOADVrS(kIdxOldRowMax) == tTMEM_LOADVrS(kIdxNewRowMax)) ? 1.0f : ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
-
 
       bool warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
       if (warp_do_correction) {
@@ -1443,10 +1046,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
 
       scale = (tTMEM_LOADVrS(kIdxOldRowMax) == tTMEM_LOADVrS(kIdxNewRowMax)) ? 1.0f : ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
- 
 
-      pipeline_o.consumer_wait(pipeline_o_consumer_state);   //等待另一边MMA的O1
-
+      pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
       warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
       if (warp_do_correction) {
@@ -1465,17 +1066,30 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
     ++pipeline_s1_c_consumer_state;
 
+    // do the final correction to O1
+    // better to somehow special-case it in the loop above
+    // doesn't matter for non-persistent code, but if it were
+    // persistent we do not want to release O too early
+
     pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
 
     // read from V0
+    // read row_sum and final row_max here
     Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
     copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
+
     pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
     ++pipeline_s0_c_consumer_state;
 
     pipeline_o.consumer_wait(pipeline_o_consumer_state);
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+    // store to epi smem
 
+    // loop:
+    //    TMEM_LOAD
+    //    FMUL2 scale = 1 / global_sum * out_quant_scale
+    //    F2FP
+    //    store to smem
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()), typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), select<0,3>(problem_shape), epilogue.params.dLSE);
 
@@ -1509,8 +1123,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // load from V1
     copy(tiled_tmem_loadv, tTMEM_LOADVtS1, tTMEM_LOADVrS);
 
-    // cutlass::arch::fence_view_async_tmem_load();
-    // __syncwarp();
     pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
     ++pipeline_s1_c_consumer_state;
 

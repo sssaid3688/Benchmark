@@ -43,9 +43,6 @@
 #include "collective/fmha_fusion.hpp"
 #include "collective/fmha_common.hpp"
 
-
-#include "cute/util/print_tensor.hpp"
-#include "cute/util/print.hpp"
 namespace cutlass::fmha::kernel {
 
 using namespace cute;
@@ -196,7 +193,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       alignas(16) typename CollectiveMainloop::PipelineC::SharedStorage s1_corr;
       alignas(16) typename CollectiveMainloop::PipelineO::SharedStorage mma_corr;
       alignas(16) typename CollectiveMainloop::PipelineE::SharedStorage corr_epi;
-      alignas(16) typename CollectiveMainloop::PipelineO_SF::SharedStorage mma_o_sf;
       alignas(16) typename CollectiveMainloop::OrderBarrierSoftmax::SharedStorage order_s01;
     } pipelines;
 
@@ -265,14 +261,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     int warp_idx = cutlass::canonical_warp_idx_sync();
     auto role = warp_idx_to_WarpRole(warp_idx);
     uint32_t lane_predicate = cute::elect_one_sync();
-    // if(blockIdx.x==3 && blockIdx.y==17 && threadIdx.x==416){
-    //   printf("lane_predicate: ");
-    //   print(lane_predicate);
-    //   printf("\n");
-    //   printf("lane_predicate: ");
-    //   printf("lane_pre: %d", lane_predicate);
-    //   printf("\n");
-    // }
+
     if (role == WarpRole::Load && lane_predicate) {
       CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
     }
@@ -320,7 +309,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       shared_storage.pipelines.load_kv,
       pipeline_load_kv_params,
       ClusterShape{}, /*barrier init*/ cute::true_type{}, /*mask calc*/cute::false_type{});
-
 
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s0_params;
     if (role == WarpRole::MMA) {
@@ -403,20 +391,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       pipeline_corr_epi_params,
       /*barrier init*/ cute::true_type{});
 
-    typename CollectiveMainloop::PipelineO_SF::Params pipeline_mma_o_sf_params;
-    if (role == WarpRole::MMA) {
-      pipeline_mma_o_sf_params.role = CollectiveMainloop::PipelineO_SF::ThreadCategory::Producer;
-    }
-    if (role == WarpRole::Correction) {
-      pipeline_mma_o_sf_params.role = CollectiveMainloop::PipelineO_SF::ThreadCategory::Consumer;
-    }
-    pipeline_mma_o_sf_params.producer_arv_count = NumWarpsCorrection * cutlass::NumThreadsPerWarp;
-    pipeline_mma_o_sf_params.consumer_arv_count = cutlass::NumThreadsPerWarp;
-    typename CollectiveMainloop::PipelineO_SF pipeline_mma_o_sf(
-      shared_storage.pipelines.mma_o_sf,
-      pipeline_mma_o_sf_params,
-      /*barrier init*/ cute::true_type{});
-
     typename CollectiveMainloop::OrderBarrierSoftmax::Params params_order_s01;
     params_order_s01.group_id = role == WarpRole::Softmax1 ? 1 : 0;
     params_order_s01.group_size = NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
@@ -457,9 +431,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_consumer_state;
     typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineO>();
 
-    typename CollectiveMainloop::PipelineO_SF::PipelineState pipeline_mma_o_sf_consumer_state;
-    typename CollectiveMainloop::PipelineO_SF::PipelineState pipeline_mma_o_sf_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineO_SF>();
-
     CollectiveMainloop mainloop;
     CollectiveEpilogue epilogue{params.epilogue};
 
@@ -490,8 +461,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
            is_softmax_0 ? pipeline_mma_s0_consumer_state : pipeline_mma_s1_consumer_state,
            is_softmax_0 ? pipeline_s0_corr : pipeline_s1_corr,
            is_softmax_0 ? pipeline_s0_corr_producer_state : pipeline_s1_corr_producer_state,
-           order_s01,
-           shared_storage.mainloop_epilogue.mainloop
+           order_s01
          );
 
        }
@@ -534,7 +504,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           pipeline_s0_corr, pipeline_s0_corr_consumer_state,
           pipeline_s1_corr, pipeline_s1_corr_consumer_state,
           pipeline_mma_corr, pipeline_mma_corr_consumer_state,
-          pipeline_mma_o_sf, pipeline_mma_o_sf_producer_state,
           pipeline_corr_epi, pipeline_corr_epi_producer_state,
           epilogue
         );
@@ -562,7 +531,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         auto logical_problem_shape = apply_batch(params,
             params.problem_shape, get<2,1>(blk_coord));
-        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
+
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
@@ -585,8 +554,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           pipeline_load_kv, pipeline_load_kv_consumer_state,
           pipeline_mma_s0, pipeline_mma_s0_producer_state,
           pipeline_mma_s1, pipeline_mma_s1_producer_state,
-          pipeline_mma_corr, pipeline_mma_corr_producer_state,
-          pipeline_mma_o_sf, pipeline_mma_o_sf_consumer_state
+          pipeline_mma_corr, pipeline_mma_corr_producer_state
         );
 
       }
@@ -601,15 +569,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-        auto blk_coord = tile_scheduler.get_block_coord();   //(3,_0,(17,0))
-        // if(blockIdx.x==3 && blockIdx.y==17 && threadIdx.x==416){
-        //   printf("im blk\n");
-        //   print(blk_coord);
-        // }
-        // if(blockIdx.x==4 && blockIdx.y==18 && threadIdx.x==416){
-        //   printf("im blk\n");
-        //   print(blk_coord);
-        // }
+        auto blk_coord = tile_scheduler.get_block_coord();
+
         auto logical_problem_shape = apply_batch(params,
             params.problem_shape, get<2,1>(blk_coord));
 
