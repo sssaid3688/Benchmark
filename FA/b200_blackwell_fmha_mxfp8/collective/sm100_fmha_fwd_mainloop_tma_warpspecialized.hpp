@@ -385,12 +385,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
 
-    if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      printf("\nSmemLayoutsqQ: ");
-      print(sQ.layout());
-      printf("\nSmemLayoutSQ: ");
-      print(SmemLayoutQ{});
-    }
+    // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   printf("\nSmemLayoutsqQ: ");
+    //   print(sQ.layout());
+    //   printf("\nSmemLayoutSQ: ");
+    //   print(SmemLayoutQ{});
+    // }
 
     Tensor tSrQ = thr_mma_qk.make_fragment_A(sQ);
     Tensor tSrK = thr_mma_qk.make_fragment_B(sK);
@@ -475,14 +475,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
     Tensor tOrP = thr_mma_pv.make_fragment_A(sP);
 
-    if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      printf("\nSmemLayoutspP: ");
-      print(sP.layout());
-      printf("\nSmemLayoutP: ");
-      print(SmemLayoutP{});
-      printf("\nSmemLayoutSFP: ");
-      print(SmemLayoutSFP{});
-    }
+    // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   printf("\nSmemLayoutspP: ");
+    //   print(sP.layout());
+    //   printf("\nSmemLayoutP: ");
+    //   print(SmemLayoutP{});
+    //   printf("\nSmemLayoutSFP: ");
+    //   print(SmemLayoutSFP{});
+    // }
 
     // Select stage 0 (P from softmax 0) and stage 1 (P from softmax 1)
     Tensor tOrP0 = tOrP(_, _, _, _0{});
@@ -509,39 +509,39 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-        // ===== DEBUG: print raw K + SF_K from SMEM (MMA warp, lane 0) =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // SF_K in SMEM — no swizzle, direct row-major (verified by tQsQ_sf layout)
-      // float* sfk_f = (storage.smem_sfk.data());
-      printf("\n[MMA] smem_sfk[0..7] (row0,g0..g3 then row1,g0..g3): ");
-      for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
+    //     // ===== DEBUG: print raw K + SF_K from SMEM (MMA warp, lane 0) =====
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   // SF_K in SMEM — no swizzle, direct row-major (verified by tQsQ_sf layout)
+    //   // float* sfk_f = (storage.smem_sfk.data());
+    //   printf("\n[MMA] smem_sfk[0..7] (row0,g0..g3 then row1,g0..g3): ");
+    //   for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
 
-      // K SMEM has Sw<3,4,3> swizzle. For cross-check, dump raw bytes
-      // of first 2 "rows" of 128 bytes each = first 256 bytes of smem_k.
-      // Sw<3,4,3> on (128,128) FP8: row0 bytes are at offsets 0,1,2,...
-      // but interleaved. We rely on CUTE to decode:
-      // uint8_t* kb = reinterpret_cast<uint8_t*>(storage.smem_k.data());
-      printf("\n[MMA] smem_k raw first 32B (row0 partial): ");
-      for (int i = 0; i < 32; i++) printf("%.6f ", (float)storage.smem_k[i]);
+    //   // K SMEM has Sw<3,4,3> swizzle. For cross-check, dump raw bytes
+    //   // of first 2 "rows" of 128 bytes each = first 256 bytes of smem_k.
+    //   // Sw<3,4,3> on (128,128) FP8: row0 bytes are at offsets 0,1,2,...
+    //   // but interleaved. We rely on CUTE to decode:
+    //   // uint8_t* kb = reinterpret_cast<uint8_t*>(storage.smem_k.data());
+    //   printf("\n[MMA] smem_k raw first 32B (row0 partial): ");
+    //   for (int i = 0; i < 32; i++) printf("%.6f ", (float)storage.smem_k[i]);
 
-      // Also print via the cute tensor with swizzle
-      auto sK_raw = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-      // SmemLayoutK = unstageSmemLayout(SmemLayoutB{}, 4), so pick stage=k_index
-      // The swizzled layout maps (atom_group, atom_row, atom_col, ...) → byte
-      // Use thr_mma partition to read
-      ThrMMA thr_tmp = mma_qk.get_slice(0);
-      auto tK_smem = thr_tmp.make_fragment_B(sK_raw);
-      // tK_smem(_, _, _, k_index) gives the fragment for this stage
-      // Each thread owns a piece of the tile; lane 0 gets specific elements
-      auto myK = tK_smem(_, _, _, k_index);
-      printf("\n[MMA] K fragment via thr_mma (lane0, stage=%d), size=%d: ",
-          k_index, (int)size(myK));
-      for (int i = 0; i < 8 && i < size(myK); i++) {
-        printf("%.3f ", (float)myK(i));
-      }
-      printf("\n\n");
-    }
-    // =========================================================
+    //   // Also print via the cute tensor with swizzle
+    //   auto sK_raw = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
+    //   // SmemLayoutK = unstageSmemLayout(SmemLayoutB{}, 4), so pick stage=k_index
+    //   // The swizzled layout maps (atom_group, atom_row, atom_col, ...) → byte
+    //   // Use thr_mma partition to read
+    //   ThrMMA thr_tmp = mma_qk.get_slice(0);
+    //   auto tK_smem = thr_tmp.make_fragment_B(sK_raw);
+    //   // tK_smem(_, _, _, k_index) gives the fragment for this stage
+    //   // Each thread owns a piece of the tile; lane 0 gets specific elements
+    //   auto myK = tK_smem(_, _, _, k_index);
+    //   printf("\n[MMA] K fragment via thr_mma (lane0, stage=%d), size=%d: ",
+    //       k_index, (int)size(myK));
+    //   for (int i = 0; i < 8 && i < size(myK); i++) {
+    //     printf("%.3f ", (float)myK(i));
+    //   }
+    //   printf("\n\n");
+    // }
+    // // =========================================================
 
     // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
     //     constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
@@ -550,12 +550,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //         printf("  sfk[%d] = %f  |", i, (float)storage.smem_sfk[i]);
     //     }
     //   }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
-        constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
-        constexpr int K_size = cute::cosize_v<SmemLayoutK>; 
-        printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
-        printf("=== smem_k, total elements=%d ===\n", K_size);
-      }
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384) {
+    //     constexpr int SFK_size = cute::cosize_v<SmemLayoutSFK>; 
+    //     constexpr int K_size = cute::cosize_v<SmemLayoutK>; 
+    //     printf("=== smem_sfk, total elements=%d ===\n", SFK_size);
+    //     printf("=== smem_k, total elements=%d ===\n", K_size);
+    //   }
     // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x==384){
 
     //   printf("blockIdx.z=%d, threadIdx.x=%d, threadIdx.y=%d, threadIdx.z=%d\n",blockIdx.z, threadIdx.x,threadIdx.y,threadIdx.z);
@@ -565,21 +565,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
 
 
-    // ===== DEBUG: check UTCCP SFK partition vs SMEM SFK =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      // Print what UTCCP will copy: the SFK fragment for this stage
-      auto dbg_sfk_src0 = thr_sSFK0_s2t(_,_,_,_,k_index);
-      // printf("[UTCCP_SFK0] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src0));
-      // for (int i = 0; i < size(dbg_sfk_src0); i++) printf("%.6f ", (float)dbg_sfk_src0(i));
-      // printf("\n");
-      // Print raw SMEM SFK for same rows
-      float* sfk_raw = reinterpret_cast<float*>(storage.smem_sfk.data());
-      int sfk_smem_elems = cute::cosize_v<SmemLayoutSFK>;
-      // printf("[DEBUG] smem_sfk cosize=%d, raw[0..15]: ", sfk_smem_elems);
-      // for (int i = 0; i < 16 && i < sfk_smem_elems; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
-      // printf("\n");
-    }
-    // =========================================================
+    // // ===== DEBUG: check UTCCP SFK partition vs SMEM SFK =====
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   // Print what UTCCP will copy: the SFK fragment for this stage
+    //   auto dbg_sfk_src0 = thr_sSFK0_s2t(_,_,_,_,k_index);
+    //   // printf("[UTCCP_SFK0] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src0));
+    //   // for (int i = 0; i < size(dbg_sfk_src0); i++) printf("%.6f ", (float)dbg_sfk_src0(i));
+    //   // printf("\n");
+    //   // Print raw SMEM SFK for same rows
+    //   float* sfk_raw = reinterpret_cast<float*>(storage.smem_sfk.data());
+    //   int sfk_smem_elems = cute::cosize_v<SmemLayoutSFK>;
+    //   // printf("[DEBUG] smem_sfk cosize=%d, raw[0..15]: ", sfk_smem_elems);
+    //   // for (int i = 0; i < 16 && i < sfk_smem_elems; i++) printf("%.6f ", (float)storage.smem_sfk[i]);
+    //   // printf("\n");
+    // }
+    // // =========================================================
 
     // ===== DEBUG: Print SMEM SF content for all CTAs =====
     // Temporarily disabled - uncomment for debugging
@@ -641,13 +641,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // ============================================================
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);  // wait for softmax to release S0
 
-    // ===== DEBUG: SFK1 UTCCP partition =====
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      auto dbg_sfk_src1 = thr_sSFK1_s2t(_,_,_,_,k_index);
-      printf("[UTCCP_SFK1] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src1));
-      for (int i = 0; i < size(dbg_sfk_src1); i++) printf("%.6f ", (float)dbg_sfk_src1(i));
-      printf("\n");
-    }
+    // // ===== DEBUG: SFK1 UTCCP partition =====
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   auto dbg_sfk_src1 = thr_sSFK1_s2t(_,_,_,_,k_index);
+    //   printf("[UTCCP_SFK1] stage=%d size=%d thr fragment: ", k_index, (int)size(dbg_sfk_src1));
+    //   for (int i = 0; i < size(dbg_sfk_src1); i++) printf("%.6f ", (float)dbg_sfk_src1(i));
+    //   printf("\n");
+    // }
 
     if (cute::elect_one_sync()) {
       copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,q_index), thr_tSFQ1_s2t);  //Q2 * K1 (SFQ1→S0+32, output→S1)
@@ -680,10 +680,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
-    if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
-      printf("\n[MMA] smem_sfp[0..7] (row0,g0..g3 then row1,g0..g3): ");
-      for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfp[i]);
-    }
+    // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
+    //   printf("\n[MMA] smem_sfp[0..7] (row0,g0..g3 then row1,g0..g3): ");
+    //   for (int i = 0; i < 8; i++) printf("%.6f ", (float)storage.smem_sfp[i]);
+    // }
     //P1 * V1 -> O1
     gemm_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0, tCtSFP0, tCtSFV0);  //写O0，此时SFQK的O0已经释放
     // gemm_zero_acc(mma_pv, tOrP0, tOrV(_,_,_,v_index), tOtO0);
@@ -899,9 +899,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     using TMEM_STORE_V = SM100_TMEM_STORE_32dp32b2x;   // 4x32 threads with 2 cols of 32b elem
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
-    if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0){
-      printf("threadIdx.x=%d, threadIdx.y=%d, thread_idx=%d\n",threadIdx.x, threadIdx.y, thread_idx);
-    }
+    // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0){
+    //   printf("threadIdx.x=%d, threadIdx.y=%d, thread_idx=%d\n",threadIdx.x, threadIdx.y, thread_idx);
+    // }
 
     auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tStS);
     auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
@@ -921,25 +921,25 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // read all of S from tmem into reg mem
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));  //S计算完再使用S数据
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);  //从TMEM中搬运到寄存器中，tTMEM_LOADtS是从S0而来
-        // ===== DEBUG: print raw S from TMEM (softmax_step, runs on Softmax0/1 warps) =====
-    {
-      // Softmax0: threads 0-127 (warp 0), Softmax1: threads 128-255 (warp 4).
-      // Print from lane 0 of each softmax warp-group.
-      int sm_wg = threadIdx.x / 128;  // 0 for Softmax0, 1 for Softmax1
-      int sm_tid = threadIdx.x % 128;
-      if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 0) {
-        auto first_coord = tTMEM_LOADcS(_0{});
-        int my_row = get<0>(first_coord);
-        int base_k = get<1>(first_coord);
-        printf("[SM%d_S] row=%d K=%d..%d: ",
-            sm_wg, my_row, base_k, base_k + (int)size(tTMEM_LOADrS) - 1);
-        for (int i = 0; i < 8 && i < size(tTMEM_LOADrS); i++) {
-            printf("%.6f ", (float)tTMEM_LOADrS(i));
-        }
-        printf("\n");
-      }
-    }
-    // =============================================================
+    //     // ===== DEBUG: print raw S from TMEM (softmax_step, runs on Softmax0/1 warps) =====
+    // {
+    //   // Softmax0: threads 0-127 (warp 0), Softmax1: threads 128-255 (warp 4).
+    //   // Print from lane 0 of each softmax warp-group.
+    //   int sm_wg = threadIdx.x / 128;  // 0 for Softmax0, 1 for Softmax1
+    //   int sm_tid = threadIdx.x % 128;
+    //   if (blockIdx.x == 0 && blockIdx.y == 0 && sm_tid == 0) {
+    //     auto first_coord = tTMEM_LOADcS(_0{});
+    //     int my_row = get<0>(first_coord);
+    //     int base_k = get<1>(first_coord);
+    //     printf("[SM%d_S] row=%d K=%d..%d: ",
+    //         sm_wg, my_row, base_k, base_k + (int)size(tTMEM_LOADrS) - 1);
+    //     for (int i = 0; i < 8 && i < size(tTMEM_LOADrS); i++) {
+    //         printf("%.6f ", (float)tTMEM_LOADrS(i));
+    //     }
+    //     printf("\n");
+    //   }
+    // }
+    // // =============================================================
 
     if constexpr (need_apply_mask) {
       Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
@@ -1078,31 +1078,31 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
           ? exp2f(floorf(log2f(group_max)))
           : ElementQK(1);
 
-#if defined(DEBUG_FMHA_MXFP8_P_SFP)
-      if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-        printf("[SFP_WRITE] stage=%d row=%d group=%d scale=%f\n",
-               int(stage), my_row, j, float(scale_val));
-      }
-#endif
+// #if defined(DEBUG_FMHA_MXFP8_P_SFP)
+//       if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+//         printf("[SFP_WRITE] stage=%d row=%d group=%d scale=%f\n",
+//                int(stage), my_row, j, float(scale_val));
+//       }
+// #endif
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = j * sf_vector; i < size(tTMEM_LOADrS) && i < (j + 1) * sf_vector; i++) {
         ElementQK val_fp32 = has_nonzero_group ? (tTMEM_LOADrS(i) / scale_val) : ElementQK(0);
         val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
         sP_fp8(my_row, i) = static_cast<ElementData>(val_fp32);
-        if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
-          printf("sP_fp8(%d, %d) = %f, val_fp32 = %f\n", my_row, i, float(sP_fp8(my_row, i)), float(val_fp32));
-        }
+        // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
+        //   printf("sP_fp8(%d, %d) = %f, val_fp32 = %f\n", my_row, i, float(sP_fp8(my_row, i)), float(val_fp32));
+        // }
       }
 
       sSFP_tile(make_coord(
           make_coord(make_coord(make_coord(my_row % 32, my_row / 32), _0{}), make_coord(_0{}, _0{})),
           _0{}, make_coord(j, _0{}))) = static_cast<ElementScale>(scale_val);
-      if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
-        printf("sSFP_tile_sfp = %f\n", float(sSFP_tile(make_coord(
-          make_coord(make_coord(make_coord(my_row % 32, my_row / 32), _0{}), make_coord(_0{}, _0{})),
-          _0{}, make_coord(j, _0{})))));
-      }
+      // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
+      //   printf("sSFP_tile_sfp = %f\n", float(sSFP_tile(make_coord(
+      //     make_coord(make_coord(make_coord(my_row % 32, my_row / 32), _0{}), make_coord(_0{}, _0{})),
+      //     _0{}, make_coord(j, _0{})))));
+      // }
     }
 
     cutlass::arch::fence_view_async_shared();
@@ -1168,9 +1168,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       TensorStorage& storage) {
 
     int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape);
-    if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0){
-      printf("mask_tile_count=%d\n",mask_tile_count);
-    }
+    // if(blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0){
+    //   printf("mask_tile_count=%d\n",mask_tile_count);
+    // }
     ElementQK row_max = -INFINITY;
     ElementQK row_sum = 0;
 

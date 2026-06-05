@@ -183,35 +183,35 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
 
       __syncthreads();
 
-            // ===== DEBUG =====
-      if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-        printf("\n[REF] Q[0][d]  first 8:  ");
-        for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mQ(0, _d, coord_L)));
-        printf("\n[REF] K[0][d]  first 8:  ");
-        for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mK(0, _d, coord_L)));
-        printf("\n[REF] K[1][d]  first 8:  ");
-        for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mK(1, _d, coord_L)));
-        printf("\n[REF] SF_Q[0][g] g=0..3: ");
-        for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFQ(0, _g, 0)));
-        printf("\n[REF] SF_K[0][g] g=0..3: ");
-        for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFK(0, _g, 0)));
-        printf("\n[REF] SF_K[1][g] g=0..3: ");
-        for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFK(1, _g, 0)));
-        printf("\n[REF] S[0][k] k=0..15: ");
-        for (int _k = 0; _k < 32 && _k < size<1>(problem_shape); _k++) {
-          float _sum = 0;
-          for (int _d = 0; _d < head_qk; _d++) {
-            int _g = _d / kMXFP8GroupSize_sfp;
-            _sum += (float)ElementAccumulator(mQ(idx_Q + offset_Q, _d, coord_L))
-                  * (float)ElementAccumulator(mSFQ(idx_Q + offset_Q, _g, idx_L))
-                  * (float)ElementAccumulator(mK(_k, _d, coord_L))
-                  * (float)ElementAccumulator(mSFK(_k + offset_K, _g, idx_L));
-          }
-          printf("%.6f ", _sum);
-        }
-        printf("\n\n");
-      }
-      // ==================
+      //       // ===== DEBUG =====
+      // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+      //   printf("\n[REF] Q[0][d]  first 8:  ");
+      //   for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mQ(0, _d, coord_L)));
+      //   printf("\n[REF] K[0][d]  first 8:  ");
+      //   for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mK(0, _d, coord_L)));
+      //   printf("\n[REF] K[1][d]  first 8:  ");
+      //   for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mK(1, _d, coord_L)));
+      //   printf("\n[REF] SF_Q[0][g] g=0..3: ");
+      //   for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFQ(0, _g, 0)));
+      //   printf("\n[REF] SF_K[0][g] g=0..3: ");
+      //   for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFK(0, _g, 0)));
+      //   printf("\n[REF] SF_K[1][g] g=0..3: ");
+      //   for (int _g = 0; _g < 8; _g++) printf("%.6f ", (float)ElementAccumulator(mSFK(1, _g, 0)));
+      //   printf("\n[REF] S[0][k] k=0..15: ");
+      //   for (int _k = 0; _k < 32 && _k < size<1>(problem_shape); _k++) {
+      //     float _sum = 0;
+      //     for (int _d = 0; _d < head_qk; _d++) {
+      //       int _g = _d / kMXFP8GroupSize_sfp;
+      //       _sum += (float)ElementAccumulator(mQ(idx_Q + offset_Q, _d, coord_L))
+      //             * (float)ElementAccumulator(mSFQ(idx_Q + offset_Q, _g, idx_L))
+      //             * (float)ElementAccumulator(mK(_k, _d, coord_L))
+      //             * (float)ElementAccumulator(mSFK(_k + offset_K, _g, idx_L));
+      //     }
+      //     printf("%.6f ", _sum);
+      //   }
+      //   printf("\n\n");
+      // }
+      // // ==================
 
       // --- Phase 2: Softmax (FP32) ---
       ElementAccumulator maxS = -std::numeric_limits<ElementAccumulator>::infinity();

@@ -68,7 +68,7 @@
         ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 \
             --b=1 --h=40 --d=128 --q=256 --k=128
 
-        ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
+        ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
             
             
 */
@@ -602,7 +602,7 @@ struct FwdRunner {
     int H    = size<0,0>(HB) * H_KV;
     int B    = size<1>(HB);
     int SF_D = D / 32;  // =4 when D=128
-    printf("SQ:%d, SK:%d, H_KV:%d, H:%d, B:%d, SF_D:%d\n",SQ,SK,H_KV,H,B,SF_D);
+    // printf("SQ:%d, SK:%d, H_KV:%d, H:%d, B:%d, SF_D:%d\n",SQ,SK,H_KV,H,B,SF_D);
     // D=128 → D/32=4 → K_tiling=1 → CUTLASS SF layout = simple row-major
     // SF_P treated as 1.0 (P stays in FP32)
     auto sfQ = make_mxfp8_sf_tensor(buffer.block_ref_SFQ.get(), SQ, SF_D, H * B);
@@ -610,92 +610,92 @@ struct FwdRunner {
     int SF_K = (K + 31) / 32;  // ceil(K/32) — SFV groups along K-seqlen
     auto sfV = make_mxfp8_sf_tensor(buffer.block_ref_SFV.get(), D, SF_K, H_KV * B);
     
-        // Dump raw SF_K buffer from device to verify layout
-    {
-      size_t sfk_elems = size(filter_zeros(layout_SFK));
-      std::vector<ElementScale> h_sfk(sfk_elems);
-      cudaMemcpy(h_sfk.data(), buffer.block_SFK.get(),
-                 sfk_elems * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-      printf("[HOST] SF_K ref-style: row0=[%.6f,%.6f,%.6f,%.6f] row1=[%.6f,%.6f,%.6f,%.6f]\n",
-          (float)h_sfk[0], (float)h_sfk[1], (float)h_sfk[2], (float)h_sfk[3],
-          (float)h_sfk[4], (float)h_sfk[5], (float)h_sfk[6], (float)h_sfk[7]);
-    }
+    //     // Dump raw SF_K buffer from device to verify layout
+    // {
+    //   size_t sfk_elems = size(filter_zeros(layout_SFK));
+    //   std::vector<ElementScale> h_sfk(sfk_elems);
+    //   cudaMemcpy(h_sfk.data(), buffer.block_SFK.get(),
+    //              sfk_elems * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+    //   printf("[HOST] SF_K ref-style: row0=[%.6f,%.6f,%.6f,%.6f] row1=[%.6f,%.6f,%.6f,%.6f]\n",
+    //       (float)h_sfk[0], (float)h_sfk[1], (float)h_sfk[2], (float)h_sfk[3],
+    //       (float)h_sfk[4], (float)h_sfk[5], (float)h_sfk[6], (float)h_sfk[7]);
+    // }
 
-    // ===== DEBUG: Compare Raw kernel vs Ref for SFQ, SFK, SFV =====
-    {
-      auto print_compare = [&](const char* name, auto& kernel_buf, auto& ref_buf, auto& layout) {
-        size_t n_k = cosize(layout);
-        size_t n_r = (size_t)size<0>(problem_shape) * (size<2>(problem_shape)/32) * size<3,0>(problem_shape) * size<3,1>(problem_shape);
-        // For SFV, ref size is different: D * (K/32) * H_K * B
-        // Just compare first 16 elements
-        std::vector<ElementScale> h_k(n_k), h_r(n_r > 0 ? n_r : 1);
-        cudaMemcpy(h_k.data(), kernel_buf.get(), n_k * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_r.data(), ref_buf.get(), min(n_r, n_k) * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-        printf("[COMPARE %s] Raw[0..7]=", name);
-        for (int i = 0; i < min(8,(int)n_k); i++) printf("%.4f ", (float)h_k[i]);
-        printf(" Ref[0..7]=");
-        for (int i = 0; i < min(8,(int)n_r); i++) printf("%.4f ", (float)h_r[i]);
-        printf(" (n_kernel=%ld n_ref=%ld)\n", (long)n_k, (long)n_r);
-      };
-      print_compare("SFQ", buffer.block_SFQ, buffer.block_ref_SFQ, layout_SFQ);
-      print_compare("SFK", buffer.block_SFK, buffer.block_ref_SFK, layout_SFK);
-      print_compare("SFV", buffer.block_SFV, buffer.block_ref_SFV, layout_SFV);
-      printf("=== END COMPARE ===\n");
-    }
+    // // ===== DEBUG: Compare Raw kernel vs Ref for SFQ, SFK, SFV =====
+    // {
+    //   auto print_compare = [&](const char* name, auto& kernel_buf, auto& ref_buf, auto& layout) {
+    //     size_t n_k = cosize(layout);
+    //     size_t n_r = (size_t)size<0>(problem_shape) * (size<2>(problem_shape)/32) * size<3,0>(problem_shape) * size<3,1>(problem_shape);
+    //     // For SFV, ref size is different: D * (K/32) * H_K * B
+    //     // Just compare first 16 elements
+    //     std::vector<ElementScale> h_k(n_k), h_r(n_r > 0 ? n_r : 1);
+    //     cudaMemcpy(h_k.data(), kernel_buf.get(), n_k * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(h_r.data(), ref_buf.get(), min(n_r, n_k) * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+    //     printf("[COMPARE %s] Raw[0..7]=", name);
+    //     for (int i = 0; i < min(8,(int)n_k); i++) printf("%.4f ", (float)h_k[i]);
+    //     printf(" Ref[0..7]=");
+    //     for (int i = 0; i < min(8,(int)n_r); i++) printf("%.4f ", (float)h_r[i]);
+    //     printf(" (n_kernel=%ld n_ref=%ld)\n", (long)n_k, (long)n_r);
+    //   };
+    //   print_compare("SFQ", buffer.block_SFQ, buffer.block_ref_SFQ, layout_SFQ);
+    //   print_compare("SFK", buffer.block_SFK, buffer.block_ref_SFK, layout_SFK);
+    //   print_compare("SFV", buffer.block_SFV, buffer.block_ref_SFV, layout_SFV);
+    //   printf("=== END COMPARE ===\n");
+    // }
 
-    // ===== DEBUG: Compare CUTLASS SF layout vs reference row-major layout =====
-    {
-      int SQ = size<0>(problem_shape);
-      int SK = size<1>(problem_shape);
-      int D_shape = size<2>(problem_shape);
-      int H  = size<3,0>(problem_shape);
-      int H_K = size<3,0,1>(problem_shape);
-      int B  = size<3,1>(problem_shape);
-      int SF_D = D_shape / 32;
+    // // ===== DEBUG: Compare CUTLASS SF layout vs reference row-major layout =====
+    // {
+    //   int SQ = size<0>(problem_shape);
+    //   int SK = size<1>(problem_shape);
+    //   int D_shape = size<2>(problem_shape);
+    //   int H  = size<3,0>(problem_shape);
+    //   int H_K = size<3,0,1>(problem_shape);
+    //   int B  = size<3,1>(problem_shape);
+    //   int SF_D = D_shape / 32;
 
-      printf("\n=== SF LAYOUT DEBUG ===\n");
-      printf("Problem: SQ=%d SK=%d D=%d H=%d H_K=%d B=%d SF_D=%d\n", SQ, SK, D_shape, H, H_K, B, SF_D);
+    //   printf("\n=== SF LAYOUT DEBUG ===\n");
+    //   printf("Problem: SQ=%d SK=%d D=%d H=%d H_K=%d B=%d SF_D=%d\n", SQ, SK, D_shape, H, H_K, B, SF_D);
 
-      printf("CUTLASS layout_SFQ shape: "); print(shape(layout_SFQ)); printf("\n");
-      printf("CUTLASS layout_SFQ stride: "); print(stride(layout_SFQ)); printf("\n");
-      printf("CUTLASS layout_SFQ cosize: %ld\n", (long)cute::cosize(layout_SFQ));
-      printf("CUTLASS layout_SFQ size (filter_zeros): %ld\n", (long)size(filter_zeros(layout_SFQ)));
+    //   printf("CUTLASS layout_SFQ shape: "); print(shape(layout_SFQ)); printf("\n");
+    //   printf("CUTLASS layout_SFQ stride: "); print(stride(layout_SFQ)); printf("\n");
+    //   printf("CUTLASS layout_SFQ cosize: %ld\n", (long)cute::cosize(layout_SFQ));
+    //   printf("CUTLASS layout_SFQ size (filter_zeros): %ld\n", (long)size(filter_zeros(layout_SFQ)));
 
-      printf("CUTLASS layout_SFK shape: "); print(shape(layout_SFK)); printf("\n");
-      printf("CUTLASS layout_SFK stride: "); print(stride(layout_SFK)); printf("\n");
-      printf("CUTLASS layout_SFK cosize: %ld\n", (long)cute::cosize(layout_SFK));
-      printf("CUTLASS layout_SFK size (filter_zeros): %ld\n", (long)size(filter_zeros(layout_SFK)));
+    //   printf("CUTLASS layout_SFK shape: "); print(shape(layout_SFK)); printf("\n");
+    //   printf("CUTLASS layout_SFK stride: "); print(stride(layout_SFK)); printf("\n");
+    //   printf("CUTLASS layout_SFK cosize: %ld\n", (long)cute::cosize(layout_SFK));
+    //   printf("CUTLASS layout_SFK size (filter_zeros): %ld\n", (long)size(filter_zeros(layout_SFK)));
 
-      int ref_sfq_size = SQ * SF_D * H * B;
-      int ref_sfk_size = SK * SF_D * H_K * B;
-      printf("Reference row-major SFQ size: %d (SQ=%d * SF_D=%d * H=%d * B=%d)\n",
-             ref_sfq_size, SQ, SF_D, H, B);
-      printf("Reference row-major SFK size: %d (SK=%d * SF_D=%d * H_K=%d * B=%d)\n",
-             ref_sfk_size, SK, SF_D, H_K, B);
+    //   int ref_sfq_size = SQ * SF_D * H * B;
+    //   int ref_sfk_size = SK * SF_D * H_K * B;
+    //   printf("Reference row-major SFQ size: %d (SQ=%d * SF_D=%d * H=%d * B=%d)\n",
+    //          ref_sfq_size, SQ, SF_D, H, B);
+    //   printf("Reference row-major SFK size: %d (SK=%d * SF_D=%d * H_K=%d * B=%d)\n",
+    //          ref_sfk_size, SK, SF_D, H_K, B);
 
-      long cutlass_sfq = (long)size(filter_zeros(layout_SFQ));
-      long cutlass_sfk = (long)size(filter_zeros(layout_SFK));
-      if (cutlass_sfq != ref_sfq_size) {
-        printf("*** WARNING: CUTLASS SFQ size (%ld) != reference (%d) ***\n", cutlass_sfq, ref_sfq_size);
-      }
-      if (cutlass_sfk != ref_sfk_size) {
-        printf("*** WARNING: CUTLASS SFK size (%ld) != reference (%d) ***\n", cutlass_sfk, ref_sfk_size);
-      }
+    //   long cutlass_sfq = (long)size(filter_zeros(layout_SFQ));
+    //   long cutlass_sfk = (long)size(filter_zeros(layout_SFK));
+    //   if (cutlass_sfq != ref_sfq_size) {
+    //     printf("*** WARNING: CUTLASS SFQ size (%ld) != reference (%d) ***\n", cutlass_sfq, ref_sfq_size);
+    //   }
+    //   if (cutlass_sfk != ref_sfk_size) {
+    //     printf("*** WARNING: CUTLASS SFK size (%ld) != reference (%d) ***\n", cutlass_sfk, ref_sfk_size);
+    //   }
 
-      printf("\n--- SFQ logical->linear index comparison ---\n");
-      for (int hb = 0; hb < min(H*B, 2); hb++) {
-        for (int row = 0; row < min(SQ, 4); row++) {
-          printf("SFQ[row=%d][g=0..3][hb=%d]: ", row, hb);
-          for (int g = 0; g < SF_D; g++) {
-            auto cutlass_idx = layout_SFQ(make_coord(row, g, make_coord(_0{}, hb)));
-            auto ref_idx = row * SF_D + g + hb * SQ * SF_D;
-            printf("c=%ld/r=%ld ", (long)cutlass_idx, (long)ref_idx);
-          }
-          printf("\n");
-        }
-      }
-      printf("=== END SF LAYOUT DEBUG ===\n\n");
-    }
+    //   printf("\n--- SFQ logical->linear index comparison ---\n");
+    //   for (int hb = 0; hb < min(H*B, 2); hb++) {
+    //     for (int row = 0; row < min(SQ, 4); row++) {
+    //       printf("SFQ[row=%d][g=0..3][hb=%d]: ", row, hb);
+    //       for (int g = 0; g < SF_D; g++) {
+    //         auto cutlass_idx = layout_SFQ(make_coord(row, g, make_coord(_0{}, hb)));
+    //         auto ref_idx = row * SF_D + g + hb * SQ * SF_D;
+    //         printf("c=%ld/r=%ld ", (long)cutlass_idx, (long)ref_idx);
+    //       }
+    //       printf("\n");
+    //     }
+    //   }
+    //   printf("=== END SF LAYOUT DEBUG ===\n\n");
+    // }
     // ===== HOST-SIDE manual S computation (FP64 for reference accuracy) =====
     {
       size_t q_elems = size(select<0,2,3>(problem_shape));
@@ -707,33 +707,33 @@ struct FwdRunner {
       cudaMemcpy(h_K.data(), buffer.block_K.get(), k_elems * sizeof(ElementData), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_sfq.data(), buffer.block_ref_SFQ.get(), h_sfq.size() * sizeof(ElementScale), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_sfk.data(), buffer.block_ref_SFK.get(), h_sfk.size() * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-      
-      for(int i=0;i<12;i++){
-        printf("SFQ[%d]: %f, ",i, float(h_sfq[i]));
-      }
-
-      // ===== HOST-SIDE manual S computation (FP64) - enhanced =====
-      {
-        int D_val = D;
-        int SF_D = D / 32;
-        printf("\n[HOST] Manual S for Q=0..%d (FP64, host-side):\n", min(3, SQ-1));
-        for (int q_check = 0; q_check < min(4, SQ); q_check++) {
-          printf("--- Q[%d] ---\n", q_check);
-          for (int k_check = 0; k_check < min(4, SK); k_check++) {
-            double sum = 0.0;
-            for (int d = 0; d < D_val; d++) {
-              int g = d / 32;
-              double q_val = double(h_Q[q_check * D_val + d]) * double(h_sfq[q_check * SF_D + g]);
-              double kv_val = double(h_K[k_check * D_val + d]) * double(h_sfk[k_check * SF_D + g]);
-              sum += q_val * kv_val;
-            }
-            printf("  S[%d][%d] = %.10f\n", q_check, k_check, sum);
-          }
-        }
-        printf("\n");
-      }
     }
-    // ====================================================================
+      // for(int i=0;i<12;i++){
+      //   printf("SFQ[%d]: %f, ",i, float(h_sfq[i]));
+      // }
+
+    //   // ===== HOST-SIDE manual S computation (FP64) - enhanced =====
+    //   {
+    //     int D_val = D;
+    //     int SF_D = D / 32;
+    //     printf("\n[HOST] Manual S for Q=0..%d (FP64, host-side):\n", min(3, SQ-1));
+    //     for (int q_check = 0; q_check < min(4, SQ); q_check++) {
+    //       printf("--- Q[%d] ---\n", q_check);
+    //       for (int k_check = 0; k_check < min(4, SK); k_check++) {
+    //         double sum = 0.0;
+    //         for (int d = 0; d < D_val; d++) {
+    //           int g = d / 32;
+    //           double q_val = double(h_Q[q_check * D_val + d]) * double(h_sfq[q_check * SF_D + g]);
+    //           double kv_val = double(h_K[k_check * D_val + d]) * double(h_sfk[k_check * SF_D + g]);
+    //           sum += q_val * kv_val;
+    //         }
+    //         printf("  S[%d][%d] = %.10f\n", q_check, k_check, sum);
+    //       }
+    //     }
+    //     printf("\n");
+    //   }
+    // }
+    // // ====================================================================
 
     fmha_reference_mxfp8_sfp(problem_shape_ref,
         mQ, sfQ, mK, sfK, mV, sfV, mO, mLSE, ActiveMask{});
@@ -828,8 +828,8 @@ struct FwdRunner {
       cumulative_seqlen_q.push_back(cumulative_seqlen_q.back() + seqlen_q);
       cumulative_seqlen_kv.push_back(cumulative_seqlen_kv.back() + seqlen_kv);
     }
-    std::cout << "Q max: " << max_seqlen_q << " total: " << total_seqlen_q << " vs even " << num_batches * get<0>(problem_size) << std::endl;
-    std::cout << "KV max: " << max_seqlen_kv << " total: " << total_seqlen_kv << " vs even " << num_batches * get<1>(problem_size) << std::endl;
+    // std::cout << "Q max: " << max_seqlen_q << " total: " << total_seqlen_q << " vs even " << num_batches * get<0>(problem_size) << std::endl;
+    // std::cout << "KV max: " << max_seqlen_kv << " total: " << total_seqlen_kv << " vs even " << num_batches * get<1>(problem_size) << std::endl;
 
     ProblemShape problem_size_for_init = problem_size;
     get<3,1>(problem_size_for_init) = 1;
@@ -1073,34 +1073,34 @@ struct FwdRunner {
                  total_sfq * sizeof(ElementScale), cudaMemcpyDeviceToHost);
 
       // int D_val = get<2>(problem_size);
-      int D_val = 4;
-      int print_rows = 128;
-      int print_cols = 4;
+      // int D_val = 4;
+      // int print_rows = 128;
+      // int print_cols = 4;
 
-      int start_rows = 0;
-      int start_cols = 0;
-      printf("size of sfQ: %d\n", total_sfq);
-      printf("=== Q (E4M3) first %d x %d ===\n", print_rows, print_cols);
-      for (int r = start_rows; r < start_rows+print_rows; r++) {
-          for (int c = start_cols; c < start_cols+print_cols; c++) {
-              printf("h_sfQ[%d]: %f, ", r * D_val + c, (float)h_sfQ[r * D_val + c]);
-          }
-          printf("\n");
-      }
+      // int start_rows = 0;
+      // int start_cols = 0;
+      // printf("size of sfQ: %d\n", total_sfq);
+      // printf("=== Q (E4M3) first %d x %d ===\n", print_rows, print_cols);
+      // for (int r = start_rows; r < start_rows+print_rows; r++) {
+      //     for (int c = start_cols; c < start_cols+print_cols; c++) {
+      //         printf("h_sfQ[%d]: %f, ", r * D_val + c, (float)h_sfQ[r * D_val + c]);
+      //     }
+      //     printf("\n");
+      // }
 
-      printf("shapeQ: ");
-      print(shape_QO);
-      printf("shape SFQ:: ");
-      print(layout_SFQ);
-      printf("shape KV:: ");
-      print(shape_KV);
-      printf("shape SFK:: ");
-      print(layout_SFK);
+      // printf("shapeQ: ");
+      // print(shape_QO);
+      // printf("shape SFQ:: ");
+      // print(layout_SFQ);
+      // printf("shape KV:: ");
+      // print(shape_KV);
+      // printf("shape SFK:: ");
+      // print(layout_SFK);
       // printf("shape P:: ");
       // print(layout_P);
-      printf("shape SFP:: ");
-      print(layout_SFP);
-      printf("\n");
+      // printf("shape SFP:: ");
+      // print(layout_SFP);
+      // printf("\n");
       // int total_k = size(filter_zeros(layout_SFK));
       // std::vector<ElementScale> h_sfK(total_k);
       // cudaMemcpy(h_sfK.data(), buffer.block_SFK.get(),
@@ -1118,39 +1118,39 @@ struct FwdRunner {
       //         printf("h_sfv[%d]: %f\n, ", r, (float)h_sfv[r]);
       // }
 
-      int total_q = size((shape_QO));
-      std::vector<ElementData> h_q(total_q);
-      cudaMemcpy(h_q.data(), buffer.block_Q.get(),
-                 total_q * sizeof(ElementData), cudaMemcpyDeviceToHost);
-      for (int r = 0; r < 0+32; r++) {
-              printf("h_q[%d]: %f\n, ", r, (float)h_q[r]);
-      }
+      // int total_q = size((shape_QO));
+      // std::vector<ElementData> h_q(total_q);
+      // cudaMemcpy(h_q.data(), buffer.block_Q.get(),
+      //            total_q * sizeof(ElementData), cudaMemcpyDeviceToHost);
+      // for (int r = 0; r < 0+32; r++) {
+      //         printf("h_q[%d]: %f\n, ", r, (float)h_q[r]);
+      // }
 
       
-      int total_kv = size((shape_KV));
-      std::vector<ElementData> h_kv(total_kv);
-      cudaMemcpy(h_kv.data(), buffer.block_K.get(),
-                 total_kv * sizeof(ElementData), cudaMemcpyDeviceToHost);
-      for (int r = 0; r < 0+32; r++) {
-              printf("h_kv[%d]: %f\n, ", r, (float)h_kv[r]);
-      }
+      // int total_kv = size((shape_KV));
+      // std::vector<ElementData> h_kv(total_kv);
+      // cudaMemcpy(h_kv.data(), buffer.block_K.get(),
+      //            total_kv * sizeof(ElementData), cudaMemcpyDeviceToHost);
+      // for (int r = 0; r < 0+32; r++) {
+      //         printf("h_kv[%d]: %f\n, ", r, (float)h_kv[r]);
+      // }
       
 
-      total_q = size(filter_zeros(layout_SFQ));
-      std::vector<ElementScale> h_sfQ2(total_q);
-      cudaMemcpy(h_sfQ2.data(), buffer.block_SFQ.get(),
-                 total_q * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-      for (int r = 0; r < 0+32; r++) {
-              printf("h_sfQ2[%d]: %f\n, ", r, (float)h_sfQ2[r]);
-      }
+      // total_q = size(filter_zeros(layout_SFQ));
+      // std::vector<ElementScale> h_sfQ2(total_q);
+      // cudaMemcpy(h_sfQ2.data(), buffer.block_SFQ.get(),
+      //            total_q * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+      // for (int r = 0; r < 0+32; r++) {
+      //         printf("h_sfQ2[%d]: %f\n, ", r, (float)h_sfQ2[r]);
+      // }
 
-      total_q = size(filter_zeros(layout_SFK));
-      std::vector<ElementScale> h_sfK(total_q);
-      cudaMemcpy(h_sfK.data(), buffer.block_SFK.get(),
-                 total_q * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-      for (int r = 0; r < 0+32; r++) {
-              printf("h_sfK[%d]: %f\n, ", r, (float)h_sfK[r]);
-      }
+      // total_q = size(filter_zeros(layout_SFK));
+      // std::vector<ElementScale> h_sfK(total_q);
+      // cudaMemcpy(h_sfK.data(), buffer.block_SFK.get(),
+      //            total_q * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+      // for (int r = 0; r < 0+32; r++) {
+      //         printf("h_sfK[%d]: %f\n, ", r, (float)h_sfK[r]);
+      // }
 
       // D_val = get<2>(problem_size);
       // print_rows = 2;
@@ -1274,7 +1274,7 @@ struct FwdRunner {
 
     cutlass::Status status = cutlass::Status::kSuccess;
     status = op.can_implement(arguments);
-    std::cout << "status: " << to_string(status) << std::endl;
+    // std::cout << "status: " << to_string(status) << std::endl;
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "This kernel is not supported. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
@@ -1282,7 +1282,7 @@ struct FwdRunner {
     }
 
     status = op.initialize(arguments, workspace.get());
-    std::cout << "status_initialize: " << to_string(status) << std::endl;
+    // std::cout << "status_initialize: " << to_string(status) << std::endl;
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to initialize the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
@@ -1413,26 +1413,26 @@ struct FwdRunner {
     bool passed = true;
     if (options.verify) {
       passed = verify(problem_shape, *buffers[0]);
-      if (passed) {
-        example_result.verified = true;
-        // ===== Save config when specific test passes =====
-        // Condition: h=1, QK=random, SFQ=random, SFK=1
-        if (options.h == 1 &&
-            options.init_style_q == InitStyle::kRandom &&
-            options.init_style_k == InitStyle::kRandom &&
-            options.init_style_sfq == InitStyle::kRandom &&
-            options.init_style_sfk == InitStyle::kOne) {
-          printf("\n*** PASSED: h=1, QK=random, SFQ=random, SFK=1 ***\n");
-          printf("*** Saving working config to passed_config.txt ***\n");
-          FILE* f = fopen("passed_config_mxfp8.txt", "a");
-          if (f) {
-            fprintf(f, "PASS: b=%d h=%d q=%d k=%d d=%d persistent=%d\n",
-                    options.b, options.h, options.q, options.k, options.d,
-                    (int)options.persistent);
-            fclose(f);
-          }
-        }
-      }
+      // if (passed) {
+      //   example_result.verified = true;
+      //   // ===== Save config when specific test passes =====
+      //   // Condition: h=1, QK=random, SFQ=random, SFK=1
+      //   if (options.h == 1 &&
+      //       options.init_style_q == InitStyle::kRandom &&
+      //       options.init_style_k == InitStyle::kRandom &&
+      //       options.init_style_sfq == InitStyle::kRandom &&
+      //       options.init_style_sfk == InitStyle::kOne) {
+      //     printf("\n*** PASSED: h=1, QK=random, SFQ=random, SFK=1 ***\n");
+      //     printf("*** Saving working config to passed_config.txt ***\n");
+      //     FILE* f = fopen("passed_config_mxfp8.txt", "a");
+      //     if (f) {
+      //       fprintf(f, "PASS: b=%d h=%d q=%d k=%d d=%d persistent=%d\n",
+      //               options.b, options.h, options.q, options.k, options.d,
+      //               (int)options.persistent);
+      //       fclose(f);
+      //     }
+      //   }
+      // }
     }
 
     if (!passed) {

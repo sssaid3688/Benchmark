@@ -150,8 +150,8 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     # 设置精度宏 (MXFP8)
     target_compile_definitions(b200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
 
-    # 可选: 打印寄存器/共享内存使用情况
-    target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
+    # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
+    # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
 
   endforeach()
 
@@ -164,7 +164,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
   # 打印使用说明
   message(STATUS "========================================")
   message(STATUS "构建完成! 运行方式:")
-  message(STATUS "  ./b200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
   message(STATUS "========================================")
 
 endif()
