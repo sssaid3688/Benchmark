@@ -156,7 +156,8 @@ void __global__ fmha_reference_mxfp8_kernel(
 
       __syncthreads();
 
-            // ===== DEBUG =====
+      // ===== DEBUG =====
+#if defined(REF_DEBUG_MXFP8)
       if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
         printf("\n[REF] Q[0][d]  first 8:  ");
         for (int _d = 0; _d < 16; _d++) printf("%.3f ", (float)ElementAccumulator(mQ(0, _d, coord_L)));
@@ -184,6 +185,7 @@ void __global__ fmha_reference_mxfp8_kernel(
         }
         printf("\n\n");
       }
+#endif
       // ==================
 
       // --- Phase 2: Softmax (FP32) ---

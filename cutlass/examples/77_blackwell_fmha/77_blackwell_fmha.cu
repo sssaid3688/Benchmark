@@ -63,8 +63,8 @@
 
 
     Example usage:
-      $ ./examples/77_blackell_fmha/77_blackell_fmha_fp8 \
-            --b=2048 --h=2048 --d=2048 --q=2048 --k=2048
+      $ ./examples/77_blackwell_fmha/a77_blackwell_fmha_fp8 \
+            --b=1 --h=40 --d=128 --q=16384 --k=2048
 */
 
 #include <iostream>
@@ -534,8 +534,11 @@ struct FwdRunner {
     // Check if output from CUTLASS kernel and reference kernel are equal or not
     double max_diff = 0;
     double mean_diff = 0;
+    double max_rel_diff = 0;
+    double mean_rel_diff = 0;
     reference_abs_diff(buffer.block_O, buffer.block_ref_O, max_diff, mean_diff);
-
+    reference_rel_diff(buffer.block_O, buffer.block_ref_O, max_rel_diff, mean_rel_diff);
+    printf("O max_rel_diff: %e, mean_rel_diff: %e\n", max_rel_diff, mean_rel_diff);
     bool passed_O = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if (! passed_O) {
       std::cerr << "failed O: max diff " << max_diff 
@@ -543,6 +546,8 @@ struct FwdRunner {
     }
 
     reference_abs_diff(buffer.block_LSE, buffer.block_ref_LSE, max_diff, mean_diff);
+    reference_rel_diff(buffer.block_LSE, buffer.block_ref_LSE, max_rel_diff, mean_rel_diff);
+    printf("LSE max_rel_diff: %e, mean_rel_diff: %e\n", max_rel_diff, mean_rel_diff);
 
     bool passed_LSE = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if ( ! passed_LSE) {

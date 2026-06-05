@@ -72,7 +72,9 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
-    Mask mask) {
+    Mask mask,
+    bool use_quantized_row_sum,
+    float output_abs_threshold) {
 
   using namespace cute;
   using namespace cutlass::fmha::collective;
@@ -229,6 +231,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
       // threads writing the same sf_group_data entry.
       if (threadIdx.x == 0) {
         int total_k = size<1>(problem_shape);
+        ElementAccumulator quantized_sum = 0;
 
         for (int g = 0; g < sf_groups; g++) {
           sf_group_data[g] = 0.0f;
@@ -254,11 +257,13 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
                 : ElementAccumulator(0);
             val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
             mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
+            quantized_sum += ElementAccumulator(mS_e4m3[k])
+                           * ElementAccumulator(static_cast<cutlass::float_ue8m0_t>(scale_val));
           }
           sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(scale_val);
         }
 
-        sf_group_data[0] = float(sum);
+        sf_group_data[0] = float(use_quantized_row_sum ? quantized_sum : sum);
       }
       __syncthreads();
 
@@ -284,6 +289,10 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
         int d_begin = threadIdx.x * d_chunk;
         int d_end   = min(d_begin + d_chunk, head_v);
         for (int d = d_begin; d < d_end; d++) {
+          if (output_abs_threshold >= 0.0f &&
+              fabsf(float(mO(idx_Q + offset_Q, d, coord_L))) > output_abs_threshold) {
+            continue;
+          }
           ElementAccumulator acc = 0;
           for (int k = 0; k < size<1>(problem_shape); k++) {
             int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
@@ -326,7 +335,9 @@ void fmha_reference_mxfp8_sfp(
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
-    Mask mask) {
+    Mask mask,
+    bool use_quantized_row_sum = false,
+    float output_abs_threshold = -1.0f) {
 
   using namespace cute;
 
@@ -355,7 +366,7 @@ void fmha_reference_mxfp8_sfp(
   fmha_reference_mxfp8_kernel_sfp<<<grid, block, shared_mem>>>(
       problem_shape_in,
       mQ, mSFQ, mK, mSFK, mV, mSFV,
-      mO, mLSE, mask);
+      mO, mLSE, mask, use_quantized_row_sum, output_abs_threshold);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

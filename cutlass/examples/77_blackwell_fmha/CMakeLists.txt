@@ -118,7 +118,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     string(TOUPPER "${PREC}" PREC_MACRO)
 
     cutlass_example_add_executable(
-        77_blackwell_fmha_${PREC}
+        a77_blackwell_fmha_${PREC}
         77_blackwell_fmha.cu
         TEST_COMMAND_OPTIONS
         TEST_BASIC
@@ -151,8 +151,8 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
         TEST_VARLEN_21
         TEST_VARLEN_22
         )
-    target_include_directories(77_blackwell_fmha_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(77_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
+    target_include_directories(a77_blackwell_fmha_${PREC} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(a77_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
   
     cutlass_example_add_executable(
         77_blackwell_fmha_gen_${PREC}

@@ -33,7 +33,14 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
 #include <math.h>
+#include <iostream>
+#include <limits>
+#include <vector>
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -292,4 +299,174 @@ void reference_rel_diff(
 
   max_diff = result_host[0];
   mean_diff = result_host[1] / static_cast<double>(data.size());
+}
+
+template<typename Element>
+void reference_rel_diff_diagnostics(
+    DeviceAllocation<Element> const& data,
+    DeviceAllocation<Element> const& data_ref,
+    char const* name,
+    int top_k = 16) {
+
+  bool enabled = getenv("REF_REL_DIAG") && atoi(getenv("REF_REL_DIAG")) == 1;
+  if (!enabled) {
+    return;
+  }
+
+  assert(data.size() == data_ref.size());
+  std::vector<Element> host_data(data.size());
+  std::vector<Element> host_ref(data_ref.size());
+
+  cudaError_t err = cudaMemcpy(
+      host_data.data(), data.get(), data.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    std::cerr << "Diagnostic copy failed for " << name << ": "
+              << cudaGetErrorString(err) << std::endl;
+    return;
+  }
+  err = cudaMemcpy(
+      host_ref.data(), data_ref.get(), data_ref.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    std::cerr << "Diagnostic ref copy failed for " << name << ": "
+              << cudaGetErrorString(err) << std::endl;
+    return;
+  }
+
+  struct WorstEntry {
+    size_t index = 0;
+    double value = 0;
+    double ref = 0;
+    double abs_diff = 0;
+    double rel_diff = 0;
+  };
+
+  std::vector<double> rel_values;
+  rel_values.reserve(data.size());
+  std::vector<WorstEntry> worst;
+  worst.reserve(static_cast<size_t>(top_k + 1));
+
+  size_t ref_lt_1e4 = 0;
+  size_t ref_lt_1e3 = 0;
+  size_t ref_lt_1e2 = 0;
+  size_t ref_eq_zero = 0;
+  double min_abs_ref = std::numeric_limits<double>::infinity();
+
+  constexpr int kBucketCount = 8;
+  const double bucket_limits[kBucketCount] = {
+      1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, std::numeric_limits<double>::infinity()};
+  size_t bucket_count[kBucketCount] = {};
+  double bucket_max_rel[kBucketCount] = {};
+  double bucket_sum_rel[kBucketCount] = {};
+
+  double max_rel = 0;
+  double sum_rel = 0;
+  size_t finite_rel_count = 0;
+  size_t nonfinite_rel_count = 0;
+
+  for (size_t i = 0; i < data.size(); ++i) {
+    double value = static_cast<double>(host_data[i]);
+    double ref = static_cast<double>(host_ref[i]);
+    double abs_ref = std::abs(ref);
+    double abs_diff = std::abs(value - ref);
+    double rel_diff = abs_diff / abs_ref;
+
+    if (abs_ref == 0.0) {
+      ++ref_eq_zero;
+    }
+    if (abs_ref < 1e-4) {
+      ++ref_lt_1e4;
+    }
+    if (abs_ref < 1e-3) {
+      ++ref_lt_1e3;
+    }
+    if (abs_ref < 1e-2) {
+      ++ref_lt_1e2;
+    }
+    min_abs_ref = std::min(min_abs_ref, abs_ref);
+
+    int bucket = 0;
+    while (bucket + 1 < kBucketCount && abs_ref >= bucket_limits[bucket]) {
+      ++bucket;
+    }
+    ++bucket_count[bucket];
+
+    if (std::isfinite(rel_diff)) {
+      max_rel = std::max(max_rel, rel_diff);
+      sum_rel += rel_diff;
+      rel_values.push_back(rel_diff);
+      ++finite_rel_count;
+      bucket_max_rel[bucket] = std::max(bucket_max_rel[bucket], rel_diff);
+      bucket_sum_rel[bucket] += rel_diff;
+    }
+    else {
+      ++nonfinite_rel_count;
+    }
+
+    WorstEntry entry{i, value, ref, abs_diff, rel_diff};
+    if (static_cast<int>(worst.size()) < top_k) {
+      worst.push_back(entry);
+      std::push_heap(worst.begin(), worst.end(), [](WorstEntry const& a, WorstEntry const& b) {
+        return a.rel_diff > b.rel_diff;
+      });
+    }
+    else if (!worst.empty() && rel_diff > worst.front().rel_diff) {
+      std::pop_heap(worst.begin(), worst.end(), [](WorstEntry const& a, WorstEntry const& b) {
+        return a.rel_diff > b.rel_diff;
+      });
+      worst.back() = entry;
+      std::push_heap(worst.begin(), worst.end(), [](WorstEntry const& a, WorstEntry const& b) {
+        return a.rel_diff > b.rel_diff;
+      });
+    }
+  }
+
+  std::sort(worst.begin(), worst.end(), [](WorstEntry const& a, WorstEntry const& b) {
+    return a.rel_diff > b.rel_diff;
+  });
+  std::sort(rel_values.begin(), rel_values.end());
+
+  auto percentile = [&](double p) {
+    if (rel_values.empty()) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    size_t idx = static_cast<size_t>(std::ceil(p * static_cast<double>(rel_values.size()))) - 1;
+    idx = std::min(idx, rel_values.size() - 1);
+    return rel_values[idx];
+  };
+
+  std::cout << "\n[REL_DIAG " << name << "] count=" << data.size()
+            << " finite=" << finite_rel_count
+            << " nonfinite=" << nonfinite_rel_count
+            << " max=" << max_rel
+            << " mean=" << (finite_rel_count ? sum_rel / static_cast<double>(finite_rel_count) : 0.0)
+            << " p99=" << percentile(0.99)
+            << " p999=" << percentile(0.999)
+            << " min_abs_ref=" << min_abs_ref
+            << "\n";
+  std::cout << "[REL_DIAG " << name << "] ref_abs_counts: ==0=" << ref_eq_zero
+            << " <1e-4=" << ref_lt_1e4
+            << " <1e-3=" << ref_lt_1e3
+            << " <1e-2=" << ref_lt_1e2
+            << "\n";
+  std::cout << "[REL_DIAG " << name << "] buckets by |ref|: ";
+  for (int b = 0; b < kBucketCount; ++b) {
+    double mean = bucket_count[b] ? bucket_sum_rel[b] / static_cast<double>(bucket_count[b]) : 0.0;
+    std::cout << "<" << bucket_limits[b]
+              << "(n=" << bucket_count[b]
+              << ",max=" << bucket_max_rel[b]
+              << ",mean=" << mean << ") ";
+  }
+  std::cout << "\n";
+
+  std::cout << "[REL_DIAG " << name << "] top" << top_k
+            << " idx value ref abs rel\n";
+  std::cout << std::setprecision(10);
+  for (auto const& entry : worst) {
+    std::cout << "  " << entry.index
+              << " " << entry.value
+              << " " << entry.ref
+              << " " << entry.abs_diff
+              << " " << entry.rel_diff
+              << "\n";
+  }
 }
