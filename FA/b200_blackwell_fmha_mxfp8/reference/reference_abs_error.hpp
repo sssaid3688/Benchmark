@@ -108,6 +108,7 @@ __global__ void reference_abs_diff_kernel(
     __shared__ double block_sum_diff;
     // int sum=0;
     for (size_t i = threadIdx.x + blockIdx.x * blockDim.x; i < count; i += blockDim.x * gridDim.x) {
+      // if(data[i] > 0.1){printf("data[%ld]: %f, data_ref[i]: %f\n", i, (float)data[i], (float)data_ref[i]);}
       if (data[i] == data_ref[i]) {
         // if(1){
           // printf("data[%ld]: %f, data_ref[%ld]: %f，  ",i,(float)data[i],i,(float)data_ref[i]);
@@ -222,7 +223,7 @@ __global__ void reference_rel_diff_kernel(
         continue;
       }
       double diff = fabs(data[i] - data_ref[i]) / fabs(data_ref[i]);
-      if (print_diff) if (not isfinite(diff) || diff > 0.01f) printf("difference at %lld: %f ... %f vs %f\n", static_cast<long long int>(i), diff, (double)data[i], (double)data_ref[i]);
+      if (print_diff) if (not isfinite(diff) || diff < 0.01f) printf("difference at %lld: %f ... %f vs %f\n", static_cast<long long int>(i), diff, (double)data[i], (double)data_ref[i]);
       thread_max_diff = fmax(diff, thread_max_diff);
       thread_sum_diff += diff;
     }
