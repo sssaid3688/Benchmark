@@ -68,7 +68,7 @@
         ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 \
             --b=1 --h=40 --d=128 --q=256 --k=128
 
-        ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
+        ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=40 --d=128 --q=256 --k=256 --verify=1
             
             
 */
@@ -144,6 +144,7 @@ struct Options {
   bool persistent = false;
   int sm_count = 0;
   std::string kernel_filter;
+  int p_scale_bias = -1;
 
   InitStyle init_style_q = InitStyle::kRandom;
   InitStyle init_style_k = InitStyle::kRandom;
@@ -317,6 +318,7 @@ struct Options {
     get_init_style_argument(cmd, "init-style-sfp", init_style_sfp, init_style_sfp);
     get_init_style_argument(cmd, "init-style-sfv", init_style_sfv, init_style_sfv);
 
+    cmd.get_cmd_line_argument("p-scale-bias", p_scale_bias, defaults.p_scale_bias);
     cmd.get_cmd_line_argument("kernel-filter", kernel_filter, defaults.kernel_filter);
   }
 
@@ -343,6 +345,7 @@ struct Options {
       << "  --verbose                   Print smem and execution time per kernel\n"
       << "  --mask=<no|residual|causal> Enables masking\n"
       << "  --causal-type=<qbegin|qend> Causal mask type\n"
+      << "  --p-scale-bias=<int>        Bias for MXFP8 P scale exponent. -1 is the default finer P quantization, 0 restores the old behavior\n"
       << "  --persistent                Enables persistent scheduler\n"
       << "  --varlen                    Enables variable sequence length\n"
       << "                              B*Q and B*K become the total sequence length\n"
@@ -525,6 +528,7 @@ struct FwdRunner {
   typename Sm1xxBlkScaledConfigPV::LayoutSF layout_SFP;
   typename Sm1xxBlkScaledConfigPV::LayoutSF layout_SFV;
   uint64_t seed = 0;
+  int p_scale_bias = -1;
 
   struct DeviceBuffer {
     DeviceAllocation<ElementData> block_Q;
@@ -736,7 +740,7 @@ struct FwdRunner {
     // // ====================================================================
 
     fmha_reference_mxfp8_sfp(problem_shape_ref,
-        mQ, sfQ, mK, sfK, mV, sfV, mO, mLSE, ActiveMask{});
+        mQ, sfQ, mK, sfK, mV, sfV, mO, mLSE, ActiveMask{}, p_scale_bias);
 
 #else
     fmha_reference(problem_shape_ref, mQ, mK, mV, mO, mLSE, ActiveMask{});
@@ -757,8 +761,13 @@ struct FwdRunner {
     // Check if output from CUTLASS kernel and reference kernel are equal or not
     double max_diff = 0;
     double mean_diff = 0;
+    double max_rel_diff = 0;
+    double mean_rel_diff = 0;
     reference_abs_diff(buffer.block_O, buffer.block_ref_O, max_diff, mean_diff);
+    reference_rel_diff(buffer.block_O, buffer.block_ref_O, max_rel_diff, mean_rel_diff);
     printf("O max_diff:%f, mean_diff:%f\n", max_diff, mean_diff);
+    printf("O max_rel_diff:%f, mean_rel_diff:%f\n", max_rel_diff, mean_rel_diff);
+    reference_rel_diff_diagnostics(buffer.block_O, buffer.block_ref_O, SQ, D, H, B);
 
     bool passed_O = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     printf("passed_O: %d\n", passed_O);
@@ -850,6 +859,7 @@ struct FwdRunner {
   /// Initialize operands to be used in the GEMM and reference GEMM
 
   ProblemShapeType initialize(const Options& options) {
+    p_scale_bias = options.p_scale_bias;
     int h_r = options.h / options.h_k;
     assert(options.h % options.h_k == 0);
     auto problem_shape_in = cute::make_tuple(options.q, options.k, options.d, cute::make_tuple(cute::make_tuple(h_r, options.h_k), options.b));
@@ -987,15 +997,16 @@ struct FwdRunner {
         int SF_K_loc = (SK_loc + 31) / 32;  // ceil(K/32) — SFV groups along K-seqlen
         size_t ref_sfq_sz = (size_t)SQ_loc * SF_D_loc * H_loc * B_loc;
         size_t ref_sfk_sz = (size_t)SK_loc * SF_D_loc * H_K_loc * B_loc;
+        size_t ref_sfp_sz = (size_t)SQ_loc * SF_K_loc * H_loc * B_loc;
         buffer.block_ref_SFQ.reset(ref_sfq_sz);
         buffer.block_ref_SFK.reset(ref_sfk_sz);
-        buffer.block_ref_SFP.reset(ref_sfq_sz);
+        buffer.block_ref_SFP.reset(ref_sfp_sz);
         buffer.block_ref_SFV.reset((size_t)D_loc * SF_K_loc * H_K_loc * B_loc);
         
-        auto fill_ref = [&](auto& kernel_buf, auto& ref_buf, int rows, int hb, auto& layout_sf) {
-          if (hb == 0 || SF_D_loc == 0) return;
+        auto fill_ref = [&](auto& kernel_buf, auto& ref_buf, int rows, int groups, int hb, auto& layout_sf) {
+          if (hb == 0 || groups == 0) return;
           size_t n_kernel = cosize(layout_sf);
-          size_t n_ref = (size_t)rows * SF_D_loc * hb;
+          size_t n_ref = (size_t)rows * groups * hb;
           std::vector<ElementScale> host_kernel(n_kernel);
           std::vector<ElementScale> host_ref(n_ref, ElementScale(0));
           cudaMemcpy(host_kernel.data(), kernel_buf.get(), n_kernel * sizeof(ElementScale), cudaMemcpyDeviceToHost);
@@ -1004,16 +1015,18 @@ struct FwdRunner {
           // where 512 = 128 rows * 4 groups (SF_D_loc=4).
           // Using rows * SF_D_loc (= rows*4) is WRONG for non-aligned rows.
           int num_128row_tiles = (rows + 127) / 128;
-          int head_stride = 512 * num_128row_tiles;
+          int group_tiles = (groups + 3) / 4;
+          int head_stride = 512 * num_128row_tiles * group_tiles;
           for (int r = 0; r < rows; r++) {
-            for (int g = 0; g < SF_D_loc; g++) {
+            for (int g = 0; g < groups; g++) {
               for (int h = 0; h < hb; h++) {
                 // CUTLASS mode0 offset (row): (r%32)*16 + ((r/32)%4)*4 + (r/128)*512
                 // CUTLASS mode1 (K-element index): g*32 → group g gives offset = g (stride 1)
                 // CUTLASS mode2 (head): h * head_stride (padded to 128-row tiles)
                 int mode0 = (r % 32) * 16 + ((r / 32) % 4) * 4 + (r / 128) * 512;
-                int cutlass_idx = mode0 + g + h * head_stride;
-                int rm_idx = r * SF_D_loc + g + h * rows * SF_D_loc;
+                int group_offset = (g % 4) + (g / 4) * 512 * num_128row_tiles;
+                int cutlass_idx = mode0 + group_offset + h * head_stride;
+                int rm_idx = r * groups + g + h * rows * groups;
                 if (cutlass_idx < (int)n_kernel && rm_idx < (int)n_ref) {
                   host_ref[rm_idx] = host_kernel[cutlass_idx];
                 }
@@ -1023,9 +1036,9 @@ struct FwdRunner {
           cudaMemcpy(ref_buf.get(), host_ref.data(), n_ref * sizeof(ElementScale), cudaMemcpyHostToDevice);
         };
         
-        fill_ref(buffer.block_SFQ, buffer.block_ref_SFQ, SQ_loc, H_loc * B_loc, layout_SFQ);
-        fill_ref(buffer.block_SFK, buffer.block_ref_SFK, SK_loc, H_K_loc * B_loc, layout_SFK);
-        fill_ref(buffer.block_SFP, buffer.block_ref_SFP, SQ_loc, H_loc * B_loc, layout_SFP);
+        fill_ref(buffer.block_SFQ, buffer.block_ref_SFQ, SQ_loc, SF_D_loc, H_loc * B_loc, layout_SFQ);
+        fill_ref(buffer.block_SFK, buffer.block_ref_SFK, SK_loc, SF_D_loc, H_K_loc * B_loc, layout_SFK);
+        fill_ref(buffer.block_SFP, buffer.block_ref_SFP, SQ_loc, SF_K_loc, H_loc * B_loc, layout_SFP);
         // SFV: CUTLASS layout has shape (D=128, K/32, H_K*B), groups along K-seqlen
         // Reference buffer is row-major (D, K/32, H_K*B) with stride (K/32, 1, D*K/32)
         // CUTLASS SfAtom: mode0=(d%32)*16+(d/32)*4 for 128 rows, mode1=kg (flat offset),
@@ -1241,13 +1254,19 @@ struct FwdRunner {
     }
     typename Operation::Arguments arguments{
       problem_shape_,
-      { buffers[buffer_index]->block_Q.get(), stride_Q,
+      {{ buffers[buffer_index]->block_Q.get(), stride_Q,
         buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
         buffers[buffer_index]->block_K.get(), stride_K,
         buffers[buffer_index]->block_SFK.get(), layout_SFK,
         buffers[buffer_index]->block_SFP.get(), layout_SFP,
         buffers[buffer_index]->block_V.get(), stride_V,
         buffers[buffer_index]->block_SFV.get(), layout_SFV,},
+        0.0f,
+        1.0f,
+        1.0f,
+        1.0f,
+        1.0f,
+        p_scale_bias},
       { buffers[buffer_index]->block_O.get(), stride_O,
         buffers[buffer_index]->block_LSE.get(), stride_LSE },
       hw_info

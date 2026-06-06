@@ -204,8 +204,17 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
     using X = Underscore;
 
-    auto sf_l_coord = [&](auto const& bc) {
+    auto sf_q_l_coord = [&](auto const& bc) {
       return make_coord(_0{}, crd2idx(get<2>(bc), get<3>(problem_shape)));
+    };
+
+    auto sf_kv_l_coord = [&](auto const& bc) {
+      int h_linear = int(get<2,0>(bc));
+      int b = int(get<2,1>(bc));
+      int h_r = int(size<3,0,0>(problem_shape));
+      int h_k = int(size<3,0,1>(problem_shape));
+      int h_kv = h_r == 0 ? 0 : h_linear / h_r;
+      return make_coord(_0{}, h_kv + b * h_k);
     };
     // using ClusterShape = Shape<_1, _1, _1>;
     // uint32_t block_rank_in_cluster_ = cute::block_rank_in_cluster();
@@ -255,9 +264,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     );
 
     Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord_q));
-    Tensor tQgQ_sf = tQgQ_qdl_sf(_, _, _0{}, sf_l_coord(blk_coord_q));
+    Tensor tQgQ_sf = tQgQ_qdl_sf(_, _, _0{}, sf_q_l_coord(blk_coord_q));
     
-    // Tensor tQgQ_sf = tQgQ_qdl_sf(_, _, _0{}, sf_l_coord(blk_coord_q));
+    // Tensor tQgQ_sf = tQgQ_qdl_sf(_, _, _0{}, sf_q_l_coord(blk_coord_q));
 
     // compute gK, sK
     Tensor mK_kdl_p = params.tma_load_k.get_tma_tensor(select<1,2,3>(problem_shape));
@@ -294,8 +303,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       group_modes<0,3>(sK_sf), group_modes<0,3>(tSgK_kdl_sf)
     );
     Tensor tKgK = tKgK_kdl(_, _, _0{}, get<2>(blk_coord_kv));
-    Tensor tKgK_sf = tKgK_kdl_sf(_, _, _0{}, sf_l_coord(blk_coord_kv));
-    // Tensor tKgK_sf = tKgK_kdl_sf(_, _, _0{},sf_l_coord(blk_coord_kv));
+    Tensor tKgK_sf = tKgK_kdl_sf(_, _, _0{}, sf_kv_l_coord(blk_coord_kv));
+    // Tensor tKgK_sf = tKgK_kdl_sf(_, _, _0{},sf_kv_l_coord(blk_coord_kv));
 
     // compute gV, sV
     ThrMMA mma_pv = typename CollectiveMmaPV::TiledMma{}.get_slice(0);
@@ -324,7 +333,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     );
 
     auto tVgV = tVgV_dkl(_, _0{}, _, get<2>(blk_coord_kv));
-    auto tVgV_sf = tVgV_dkl_sf(_, _0{}, _, sf_l_coord(blk_coord_kv));
+    auto tVgV_sf = tVgV_dkl_sf(_, _0{}, _, sf_kv_l_coord(blk_coord_kv));
 
     // ============================================================
     // Set up P SF TMA loading
@@ -352,7 +361,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       group_modes<0,3>(sP_sf), group_modes<0,3>(tSgP_sf)
     );
 
-    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, sf_l_coord(blk_coord_kv));
+    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, sf_q_l_coord(blk_coord_kv));
 
     uint32_t lane_predicate = cute::elect_one_sync();
 

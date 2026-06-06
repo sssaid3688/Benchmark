@@ -260,6 +260,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_v = 1.0f;
 
     float inv_scale_o = 1.0f;
+
+    int p_scale_bias = -1;
   };
 
   struct Params {
@@ -269,6 +271,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    int p_scale_bias;
   };
 
   template<class ProblemShape>
@@ -292,7 +296,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         Load::to_underlying_arguments(problem_shape, args.load, workspace),
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
-        args.scale_v * args.inv_scale_o
+        args.scale_v * args.inv_scale_o,
+        args.p_scale_bias
     };
   }
 
@@ -1073,9 +1078,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < sfnum_row; j++) {
       ElementQK group_max = row_max_32[j];
-      bool has_nonzero_group = group_max > ElementQK(0);
+      bool has_nonzero_group = group_max > ElementQK(1e-12);
       ElementQK scale_val = has_nonzero_group
-          ? exp2f(floorf(log2f(group_max)))
+          ? exp2f(floorf(log2f(group_max + 1e-12f)) + float(params.p_scale_bias))
           : ElementQK(1);
 
 // #if defined(DEBUG_FMHA_MXFP8_P_SFP)
@@ -1087,7 +1092,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = j * sf_vector; i < size(tTMEM_LOADrS) && i < (j + 1) * sf_vector; i++) {
-        ElementQK val_fp32 = has_nonzero_group ? (tTMEM_LOADrS(i) / scale_val) : ElementQK(0);
+        ElementQK val_fp32 = has_nonzero_group ? (tTMEM_LOADrS(i) / scale_val) : ElementQK(1e-12);
         val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
         sP_fp8(my_row, i) = static_cast<ElementData>(val_fp32);
         // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){

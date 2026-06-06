@@ -33,7 +33,14 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
 #include <math.h>
+#include <vector>
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -292,4 +299,148 @@ void reference_rel_diff(
 
   max_diff = result_host[0];
   mean_diff = result_host[1] / static_cast<double>(data.size());
+}
+
+template<typename Element>
+void reference_rel_diff_diagnostics(
+    DeviceAllocation<Element> const& data,
+    DeviceAllocation<Element> const& data_ref,
+    int q_extent,
+    int d_extent,
+    int h_extent,
+    int b_extent,
+    int top_k = 8) {
+
+  assert(data.size() == data_ref.size());
+
+  std::vector<Element> host_data(data.size());
+  std::vector<Element> host_ref(data_ref.size());
+
+  cudaError_t err = cudaMemcpy(
+      host_data.data(), data.get(), data.size() * sizeof(Element), cudaMemcpyDefault);
+  if (err != cudaSuccess) {
+    std::cerr << "Diagnostic copy for output failed. Last CUDA error: "
+              << cudaGetErrorString(err) << std::endl;
+    return;
+  }
+
+  err = cudaMemcpy(
+      host_ref.data(), data_ref.get(), data_ref.size() * sizeof(Element), cudaMemcpyDefault);
+  if (err != cudaSuccess) {
+    std::cerr << "Diagnostic copy for reference failed. Last CUDA error: "
+              << cudaGetErrorString(err) << std::endl;
+    return;
+  }
+
+  struct Bucket {
+    const char* name;
+    double max_rel = 0.0;
+    double sum_rel = 0.0;
+    double max_abs = 0.0;
+    size_t count = 0;
+    size_t nonfinite = 0;
+  };
+
+  std::array<Bucket, 3> buckets{{
+      {"|ref| < 1e-3"},
+      {"1e-3 <= |ref| < 1e-2"},
+      {"|ref| >= 1e-2"}}};
+
+  struct TopEntry {
+    double rel = -1.0;
+    double abs = 0.0;
+    double out = 0.0;
+    double ref = 0.0;
+    size_t index = 0;
+  };
+
+  std::vector<TopEntry> top;
+  top.reserve(std::max(top_k, 0));
+
+  auto push_top = [&](TopEntry entry) {
+    if (top_k <= 0) {
+      return;
+    }
+    if (int(top.size()) < top_k) {
+      top.push_back(entry);
+      std::push_heap(top.begin(), top.end(), [](TopEntry const& a, TopEntry const& b) {
+        return a.rel > b.rel;
+      });
+    }
+    else if (entry.rel > top.front().rel) {
+      std::pop_heap(top.begin(), top.end(), [](TopEntry const& a, TopEntry const& b) {
+        return a.rel > b.rel;
+      });
+      top.back() = entry;
+      std::push_heap(top.begin(), top.end(), [](TopEntry const& a, TopEntry const& b) {
+        return a.rel > b.rel;
+      });
+    }
+  };
+
+  for (size_t i = 0; i < host_data.size(); ++i) {
+    double out = static_cast<double>(host_data[i]);
+    double ref = static_cast<double>(host_ref[i]);
+    double abs_diff = fabs(out - ref);
+    double ref_abs = fabs(ref);
+    double rel = ref_abs == 0.0
+        ? (abs_diff == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+        : abs_diff / ref_abs;
+
+    int bucket_idx = ref_abs < 1e-3 ? 0 : (ref_abs < 1e-2 ? 1 : 2);
+    auto& bucket = buckets[bucket_idx];
+    bucket.count += 1;
+    bucket.max_abs = std::max(bucket.max_abs, abs_diff);
+    if (std::isfinite(rel)) {
+      bucket.max_rel = std::max(bucket.max_rel, rel);
+      bucket.sum_rel += rel;
+    }
+    else {
+      bucket.nonfinite += 1;
+      bucket.max_rel = std::numeric_limits<double>::infinity();
+    }
+
+    push_top(TopEntry{rel, abs_diff, out, ref, i});
+  }
+
+  std::sort(top.begin(), top.end(), [](TopEntry const& a, TopEntry const& b) {
+    return a.rel > b.rel;
+  });
+
+  std::cout << "O relative error buckets:\n";
+  for (auto const& bucket : buckets) {
+    double mean_rel = bucket.count == 0 ? 0.0 : bucket.sum_rel / double(bucket.count);
+    std::cout << "  " << bucket.name
+              << " count=" << bucket.count
+              << " max_rel=" << bucket.max_rel
+              << " mean_rel=" << mean_rel
+              << " max_abs=" << bucket.max_abs
+              << " nonfinite=" << bucket.nonfinite
+              << "\n";
+  }
+
+  int hb_extent = h_extent * b_extent;
+  int row_stride = std::max(d_extent * h_extent, 1);
+  int batch_stride = std::max(q_extent * row_stride, 1);
+
+  std::cout << "Top relative O differences:\n";
+  for (auto const& entry : top) {
+    size_t rem = entry.index;
+    int b = hb_extent == 0 ? 0 : int(rem / batch_stride);
+    rem = hb_extent == 0 ? rem : rem % batch_stride;
+    int q = row_stride == 0 ? 0 : int(rem / row_stride);
+    rem = row_stride == 0 ? rem : rem % row_stride;
+    int h = d_extent == 0 ? 0 : int(rem / d_extent);
+    int d = d_extent == 0 ? 0 : int(rem % d_extent);
+    std::cout << "  idx=" << entry.index
+              << " q=" << q
+              << " d=" << d
+              << " h=" << h
+              << " b=" << b
+              << " rel=" << entry.rel
+              << " abs=" << entry.abs
+              << " out=" << entry.out
+              << " ref=" << entry.ref
+              << "\n";
+  }
 }

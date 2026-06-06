@@ -41,6 +41,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 static constexpr int kMXFP8GroupSize_sfp = 32;
+static constexpr int kMXFP8TileK_sfp = 128;
 
 /// Create a simple 3-mode SF tensor: (rows, sf_groups, hb).
 /// D=128 → D/32=4 → CUTLASS layout ≡ simple row-major.
@@ -72,7 +73,8 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
-    Mask mask) {
+    Mask mask,
+    int p_scale_bias) {
 
   using namespace cute;
   using namespace cutlass::fmha::collective;
@@ -86,12 +88,6 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
   int total_k = size<0>(mK);
   int sf_groups = (total_k + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp;
   float* sf_group_data = reinterpret_cast<float*>(mS_mem + total_k * sizeof(ElementAccumulator));
-  // sf_group_data 之后：E4M3 类型数组，与 mS 等大小
-  cutlass::float_e4m3_t* mS_e4m3 = reinterpret_cast<cutlass::float_e4m3_t*>(
-      reinterpret_cast<char*>(sf_group_data) + sf_groups * sizeof(float));
-  // mS_e4m3 之后：UE8M0 类型数组，每组一个 scale
-  cutlass::float_ue8m0_t* sf_ue8m0 = reinterpret_cast<cutlass::float_ue8m0_t*>(
-      reinterpret_cast<char*>(mS_e4m3) + total_k * sizeof(cutlass::float_e4m3_t));
 
   ElementAccumulator softmax_scale =
       static_cast<ElementAccumulator>(1.0 / sqrt(1.0 * size<1>(mQ)));
@@ -102,6 +98,10 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
     for (int idx_Q = blockIdx.x; idx_Q < size<0>(problem_shape_in); idx_Q += gridDim.x) {
 
       auto coord_L = idx2crd(idx_L, shape<4>(problem_shape_in));
+      int idx_L_kv = idx_L;
+      if constexpr (rank_v<decltype(get<0>(coord_L))> == 2) {
+        idx_L_kv = int(get<0,1>(coord_L)) + int(get<1>(coord_L)) * int(size<0,1>(shape<4>(problem_shape_in)));
+      }
       auto get_coord_in = [&]() {
         if constexpr (rank_v<decltype(get<2>(ProblemShapeIn{}))> == 2) {
           return cute::make_tuple(idx_Q, _0{}, cute::make_tuple(_0{}, _0{}),
@@ -169,7 +169,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
             ElementAccumulator q = ElementAccumulator(mQ(idx_Q + offset_Q, d, coord_L))
                                  * ElementAccumulator(mSFQ(idx_Q + offset_Q, g, idx_L));
             ElementAccumulator kv = ElementAccumulator(mK(k + offset_K, d, coord_L))
-                                  * ElementAccumulator(mSFK(k + offset_K, g, idx_L));
+                                  * ElementAccumulator(mSFK(k + offset_K, g, idx_L_kv));
             acc += q * kv;
           }
           auto frag = make_tensor<ElementAccumulator>(Shape<_1, _1>{});
@@ -223,39 +223,14 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
 
       ElementAccumulator sum = 0;
 
-      // Reference correctness matters more than parallelism here.  Keep the
-      // softmax and MXFP8 P quantization serial so each 32-wide scale group has
-      // a deterministic max; the previous parallel max update raced between
-      // threads writing the same sf_group_data entry.
+      // Keep the LSE sum serial for deterministic verification.  Do not
+      // overwrite mS here; O verification below intentionally replays the
+      // kernel's online, per-128K-tile MXFP8 P quantization.
       if (threadIdx.x == 0) {
         int total_k = size<1>(problem_shape);
 
-        for (int g = 0; g < sf_groups; g++) {
-          sf_group_data[g] = 0.0f;
-        }
-
         for (int k = 0; k < total_k; k++) {
-          mS[k] = expf(softmax_scale * (mS[k] - maxS));
-          sum += mS[k];
-          int g = k / kMXFP8GroupSize_sfp;
-          sf_group_data[g] = max(sf_group_data[g], float(mS[k]));
-        }
-
-        for (int g = 0; g < sf_groups; g++) {
-          ElementAccumulator max_32 = sf_group_data[g];
-          ElementAccumulator scale_val = max_32 > ElementAccumulator(0)
-              ? exp2f(floorf(log2f(max_32)))
-              : ElementAccumulator(1);
-          int k_begin = g * kMXFP8GroupSize_sfp;
-          int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
-          for (int k = k_begin; k < k_end; k++) {
-            ElementAccumulator val_fp32 = max_32 > ElementAccumulator(0)
-                ? mS[k] / scale_val
-                : ElementAccumulator(0);
-            val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
-            mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
-          }
-          sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(scale_val);
+          sum += expf(softmax_scale * (mS[k] - maxS));
         }
 
         sf_group_data[0] = float(sum);
@@ -277,27 +252,76 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
       //   printf("\n");
       // }
       // // ===============================================
-      // --- Phase 3: P * V (P=fp32, V=MXFP8 dequantized) ---
-      // SFV groups along K-seqlen, matching MMA hardware layout
+      // --- Phase 3: P * V with online MXFP8 P quantization ---
+      // The kernel quantizes P tile-by-tile before the final row max is known,
+      // then rescales accumulated O when a later tile raises the row max.
+      // Replay that timing here instead of quantizing P once after full softmax.
       {
         int d_chunk = (head_v + blockDim.x - 1) / blockDim.x;
         int d_begin = threadIdx.x * d_chunk;
         int d_end   = min(d_begin + d_chunk, head_v);
         for (int d = d_begin; d < d_end; d++) {
           ElementAccumulator acc = 0;
-          for (int k = 0; k < size<1>(problem_shape); k++) {
-            int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
-            ElementAccumulator p_fp32 = 
-                ElementAccumulator(mS_e4m3[k])
-              * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
+          ElementAccumulator row_max_online = -std::numeric_limits<ElementAccumulator>::infinity();
+          ElementAccumulator row_sum_online = 0;
 
-            ElementAccumulator v_fp32 =
-                ElementAccumulator(mV(k + offset_K, d, coord_L))
-              * ElementAccumulator(mSFV(d, gk, idx_L));
-            acc += p_fp32 * v_fp32;
+          for (int tile_begin = 0; tile_begin < size<1>(problem_shape); tile_begin += kMXFP8TileK_sfp) {
+            int tile_end = min(tile_begin + kMXFP8TileK_sfp, size<1>(problem_shape));
+            ElementAccumulator old_row_max = row_max_online;
+
+            for (int k = tile_begin; k < tile_end; k++) {
+              row_max_online = std::max<ElementAccumulator>(row_max_online, mS[k]);
+            }
+            ElementAccumulator row_max_safe =
+                row_max_online == -std::numeric_limits<ElementAccumulator>::infinity()
+                    ? ElementAccumulator(0)
+                    : row_max_online;
+            ElementAccumulator adjustment =
+                old_row_max == -std::numeric_limits<ElementAccumulator>::infinity()
+                    ? ElementAccumulator(0)
+                    : expf(softmax_scale * (old_row_max - row_max_safe));
+
+            acc *= adjustment;
+            row_sum_online *= adjustment;
+
+            for (int group_begin = tile_begin; group_begin < tile_end; group_begin += kMXFP8GroupSize_sfp) {
+              int group_end = min(group_begin + kMXFP8GroupSize_sfp, tile_end);
+              ElementAccumulator group_max = 0;
+
+              for (int k = group_begin; k < group_end; k++) {
+                ElementAccumulator p = expf(softmax_scale * (mS[k] - row_max_safe));
+                group_max = std::max<ElementAccumulator>(group_max, p);
+              }
+
+              ElementAccumulator scale_val = group_max > ElementAccumulator(0)
+                  ? exp2f(floorf(log2f(group_max + 1e-12)) + float(p_scale_bias))
+                  : ElementAccumulator(1);
+
+              for (int k = group_begin; k < group_end; k++) {
+                ElementAccumulator p = expf(softmax_scale * (mS[k] - row_max_safe));
+                row_sum_online += p;
+
+                ElementAccumulator p_scaled = group_max > ElementAccumulator(0)
+                    ? p / scale_val
+                    : ElementAccumulator(1e-12);
+                p_scaled = fminf(448.0f, fmaxf(-448.0f, p_scaled));
+
+                cutlass::float_e4m3_t p_e4m3 = static_cast<cutlass::float_e4m3_t>(p_scaled);
+                cutlass::float_ue8m0_t p_sf = static_cast<cutlass::float_ue8m0_t>(scale_val);
+                ElementAccumulator p_fp32 =
+                    ElementAccumulator(p_e4m3) * ElementAccumulator(p_sf);
+
+                int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
+                ElementAccumulator v_fp32 =
+                    ElementAccumulator(mV(k + offset_K, d, coord_L))
+                  * ElementAccumulator(mSFV(d, gk, idx_L_kv));
+                acc += p_fp32 * v_fp32;
+              }
+            }
           }
+
           mO(idx_Q + offset_Q, d, coord_L) =
-              static_cast<typename TensorO::value_type>(acc * inv_sum);
+              static_cast<typename TensorO::value_type>(acc / row_sum_online);
         }
       }
 
@@ -326,16 +350,15 @@ void fmha_reference_mxfp8_sfp(
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
-    Mask mask) {
+    Mask mask,
+    int p_scale_bias = -1) {
 
   using namespace cute;
 
   dim3 grid(size<0>(mO), size<2>(mO), 1);
   dim3 block(256);
   int shared_mem = size<0>(mK) * int(sizeof(typename TensorLSE::value_type))       // mS (float)
-                 + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(float)  // sf_group_data
-                 + size<0>(mK) * sizeof(cutlass::float_e4m3_t)                              // mS_e4m3
-                 + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(cutlass::float_ue8m0_t); // sf_ue8m0
+                 + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(float);  // sf_group_data
   cudaError_t result;
   if (shared_mem >= (48 << 10)) {
     result = cudaFuncSetAttribute(
@@ -355,7 +378,7 @@ void fmha_reference_mxfp8_sfp(
   fmha_reference_mxfp8_kernel_sfp<<<grid, block, shared_mem>>>(
       problem_shape_in,
       mQ, mSFQ, mK, mSFK, mV, mSFV,
-      mO, mLSE, mask);
+      mO, mLSE, mask, p_scale_bias);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
