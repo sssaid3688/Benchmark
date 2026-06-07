@@ -681,7 +681,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s0.producer_acquire(pipeline_s0_producer_state); //等 Softmax0 消费完上一轮 S0 并释放。
 
     if (cute::elect_one_sync()) {
-      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,_0{}), thr_tSFP0_s2t);    //释放了S0，SFPV使用S0
+      copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,_0{}), thr_tSFP0_s2t);
       copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -723,7 +723,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
 
       if (cute::elect_one_sync()) {  //wait SFP2的搬运
-          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,_1{}), thr_tSFP1_s2t);    //增加一个sfp2的搬运
+          copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,_1{}), thr_tSFP1_s2t);
           copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
         // }
       }
@@ -804,7 +804,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
 
       if (cute::elect_one_sync()) {  
-        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,_0{}), thr_tSFP0_s2t);  
+        copy(tiled_copy_s2t_SFP0, thr_sSFP0_s2t(_,_,_,_,_0{}), thr_tSFP0_s2t);
         copy(tiled_copy_s2t_SFV0, thr_sSFV0_s2t(_,_,_,_,v_index), thr_tSFV0_s2t);
       }
       cutlass::arch::fence_view_async_tmem_store();
@@ -849,7 +849,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
     if (cute::elect_one_sync()) {
-        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,_1{}), thr_tSFP1_s2t);    //问题在这
+        copy(tiled_copy_s2t_SFP1, thr_sSFP1_s2t(_,_,_,_,_1{}), thr_tSFP1_s2t);
         copy(tiled_copy_s2t_SFV1, thr_sSFV1_s2t(_,_,_,_,v_index), thr_tSFV1_s2t);
     }
     cutlass::arch::fence_view_async_tmem_store();
@@ -1008,10 +1008,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // --- SMEM P tile (swizzled layout, for PV MMA) ---
     Tensor sP_full = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
     Tensor sP_tile = (stage == _0{}) ? sP_full(_, _, _, _0{}) : sP_full(_, _, _, _1{});
-    
     Tensor sSFP = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
     Tensor sSFP_tile = (stage == _0{}) ? sSFP(_, _, _, _0{}) : sSFP(_, _, _, _1{});
-
+    
     // --- Register buffer coordinate system (from TMEM_STORE layout) ---
     using TMEM_STORE_P = SM100_TMEM_STORE_32dp32b32x;
 
@@ -1024,12 +1023,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     auto tiled_tmem_store = make_tmem_copy(TMEM_STORE_P{}, tStS_P);
     auto thr_tmem_store = tiled_tmem_store.get_slice(thread_idx);
     Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
-
-    constexpr int kConversionsPerStep = 2;
-    Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
-    Tensor tTMEM_STORErS_x4_e = recast<Array<ElementData, kConversionsPerStep>>(tTMEM_STORErS_x4);
-
-    NumericArrayConverter<ElementData, ElementQK, kConversionsPerStep> convert;
 
     const int kReleasePipeCount = 10;  // must be multiple of 2
 
@@ -1056,14 +1049,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       row_max_32[i/32] = ::fmax(row_max_32[i/32], ::fmax(tTMEM_LOADrS(i+0), tTMEM_LOADrS(i+1)));
 
-      // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
-      Array<ElementQK, kConversionsPerStep> in_conv;
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < kConversionsPerStep; j++) {
-        in_conv[j] = tTMEM_LOADrS(i + j);
-      }
-      tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
-
       if (i == size(tTMEM_LOADrS) - kReleasePipeCount) {
         order_s.arrive();
       }
@@ -1073,7 +1058,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // P data uses the coalesced PV A-operand view used by the original swizzled
     // SMEM layout. SFP is still written through its explicit logical SF layout.
-    auto sP_fp8 = coalesce(sP_tile);
+    auto sP_u32 = recast<uint32_t>(sP_tile);
+    NumericArrayConverter<ElementData, ElementQK, 4> convert_p;
+    ElementScale sf_row[4];
 
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < sfnum_row; j++) {
@@ -1082,6 +1069,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ElementQK scale_val = has_nonzero_group
           ? exp2f(floorf(log2f(group_max + 1e-12f)) + float(params.p_scale_bias))
           : ElementQK(1);
+      sf_row[j] = static_cast<ElementScale>(scale_val);
 
 // #if defined(DEBUG_FMHA_MXFP8_P_SFP)
 //       if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
@@ -1091,28 +1079,30 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 // #endif
 
       CUTLASS_PRAGMA_UNROLL
-      for (int i = j * sf_vector; i < size(tTMEM_LOADrS) && i < (j + 1) * sf_vector; i++) {
-        ElementQK val_fp32 = has_nonzero_group ? (tTMEM_LOADrS(i) / scale_val) : ElementQK(1e-12);
-        val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
-        sP_fp8(my_row, i) = static_cast<ElementData>(val_fp32);
-        // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
-        //   printf("sP_fp8(%d, %d) = %f, val_fp32 = %f\n", my_row, i, float(sP_fp8(my_row, i)), float(val_fp32));
-        // }
+      for (int i = j * sf_vector; i < size(tTMEM_LOADrS) && i < (j + 1) * sf_vector; i += 4) {
+        Array<ElementQK, 4> in_conv;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < 4; k++) {
+          ElementQK val_fp32 = has_nonzero_group ? (tTMEM_LOADrS(i + k) / scale_val) : ElementQK(1e-12);
+          in_conv[k] = fminf(448.0f, fmaxf(-448.0f, val_fp32));
+        }
+        Array<ElementData, 4> out_conv = convert_p(in_conv);
+        union {
+          Array<ElementData, 4> fp8;
+          uint32_t u32;
+        } packed;
+        packed.fp8 = out_conv;
+        int p_col_u32 = i / 4;
+        sP_u32(make_coord(make_coord(my_row, p_col_u32 % 8), _0{}, p_col_u32 / 8)) = packed.u32;
       }
 
       sSFP_tile(make_coord(
           make_coord(make_coord(make_coord(my_row % 32, my_row / 32), _0{}), make_coord(_0{}, _0{})),
-          _0{}, make_coord(j, _0{}))) = static_cast<ElementScale>(scale_val);
-      // if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0){
-      //   printf("sSFP_tile_sfp = %f\n", float(sSFP_tile(make_coord(
-      //     make_coord(make_coord(make_coord(my_row % 32, my_row / 32), _0{}), make_coord(_0{}, _0{})),
-      //     _0{}, make_coord(j, _0{})))));
-      // }
+          _0{}, make_coord(j, _0{}))) = sf_row[j];
     }
 
     cutlass::arch::fence_view_async_shared();
 
-    // notify tensor core warp that P is ready
     pipeline_s.consumer_release(pipeline_s_consumer_state);  //执行到这，在等待C释放
     ++pipeline_s_consumer_state;
 

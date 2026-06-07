@@ -41,7 +41,7 @@ set_property(
   SOURCE
       b200_blackwell_fmha.cu
   PROPERTY
-      COMPILE_FLAGS "--use_fast_math -ftemplate-backtrace-limit=0"
+      COMPILE_FLAGS "--use_fast_math -lineinfo -ftemplate-backtrace-limit=0"
 )
 
 # --- 测试参数 (供手动运行参考) --------------------------------
@@ -152,6 +152,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
 
     # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
     # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
+    target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
   endforeach()
 
