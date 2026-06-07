@@ -170,13 +170,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // SFQK ping-pong on S0/S1: when QK MMA writes to S0, SFQK must be on S1 (vice versa)
     // to avoid hardware conflict between accumulator writes and SF reads in same S half.
     // SFPV shares the same S0/S1 offsets (QK and PV phases are non-overlapping in time).
-    SFQK0 = S1 + kSizeP,   // S1+32=160, used with Q1*K -> S0
-    SFQK1 = S0 + kSizeP,   // S0+32=32,  used with Q2*K -> S1
-    SFPV0 = S0 + kSizeP2,   // S0+32=32,  same as SFQK1 (PV phase)
-    SFPV1 = S1 + kSizeP2,   // S1+32=160, same as SFQK0 (PV phase)
-
-
-    kSizeSF = 8,  // 8 columns for (SFQ + SFK) or (SFP + SFV) per half
+    SFQK0 = S1 + kSizeP,
+    SFQK1 = S0 + kSizeP,
+    SFPV0 = S0 + kSizeP2,
+    SFPV1 = S1 + kSizeP2,
+    kSizeSF = 8,
     kEnd = O1 + kSizeO
   };
 
@@ -407,15 +405,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // TMEM layout:
     //   S0: cols   0-127  (QK MMA accumulator, S tile 0; V stats 0; SFPV0/SFQK1 SF)
     //   S1: cols 128-255  (QK MMA accumulator, S tile 1; V stats 1; SFPV1/SFQK0 SF)
-    //   O0: cols 256-383  (PV MMA accumulator, O tile 0 — preserved for correction)
-    //   O1: cols 384-511  (PV MMA accumulator, O tile 1 — preserved for correction)
-    //
-    // SFQK ping-pong: when QK writes S0, SFQK placed on S1 (vice versa) to avoid conflict.
-    // SFPV and SFQK share the same S region offsets (QK/PV phases are time-disjoint).
-    uint32_t sf_tmem_base_qk0 = uint32_t(TmemAllocation::SFQK0);   // S1+32=160, used with Q1*K -> S0
-    uint32_t sf_tmem_base_qk1 = uint32_t(TmemAllocation::SFQK1);   // S0+32=32,  used with Q2*K -> S1
-    uint32_t sf_tmem_base_pv0 = uint32_t(TmemAllocation::SFPV0);   // S0+32=32,  same as SFQK1 (PV phase)
-    uint32_t sf_tmem_base_pv1 = uint32_t(TmemAllocation::SFPV1);   // S1+32=160, same as SFQK0 (PV phase)
+    //   O0: cols 256-383  (PV MMA accumulator, O tile 0)
+    //   O1: cols 384-511  (PV MMA accumulator, O tile 1)
+    uint32_t sf_tmem_base_qk0 = uint32_t(TmemAllocation::SFQK0);
+    uint32_t sf_tmem_base_qk1 = uint32_t(TmemAllocation::SFQK1);
+    uint32_t sf_tmem_base_pv0 = uint32_t(TmemAllocation::SFPV0);
+    uint32_t sf_tmem_base_pv1 = uint32_t(TmemAllocation::SFPV1);
 
 
     // Set up UTCCP copies and TMEM SF tensors for QK MMA (SF placed in S region, ping-pong on S0/S1)
@@ -640,11 +635,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // ============================================================
     // Copy Q SF and K SF for second QK MMA
-    // Q2*K1: SFQK1 goes to S0+32, output goes to S1
-    // Need to re-acquire S0 (was committed above, now owned by softmax)
-    // S1 is still held from the acquire above (never committed yet)
+    // Q2*K1: SFQK1 goes to S0+32, output goes to S1.
+    // Need to re-acquire S0 because Q1*K committed S0 to softmax.
+    // S1 is still held from the acquire above (never committed yet).
     // ============================================================
-    pipeline_s0.producer_acquire(pipeline_s0_producer_state);  // wait for softmax to release S0
+    pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
     // // ===== DEBUG: SFK1 UTCCP partition =====
     // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 384) {
@@ -709,7 +704,25 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // pipeline_o_sf.consumer_release(pipeline_o_sf_release_state);
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-         // P2计算之前，SFP2要搬运进SMEM
+      // Advance S0 before PV1. This ordering was validated for correctness and
+      // avoids one producer-side wait in the steady-state loop.
+      // wait for Ki
+      k_index = (pipeline_kv_consumer_state.index());
+      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+      ++pipeline_kv_consumer_state;
+
+      if (cute::elect_one_sync()) {
+          copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,0), thr_tSFQ0_s2t);
+          copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);
+      }
+      cutlass::arch::fence_view_async_tmem_store();
+
+      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0, tCtSFQ0, tCtSFK0);
+      
+      pipeline_s0.producer_commit(pipeline_s0_producer_state);
+      ++pipeline_s0_producer_state;
+
+      // P2计算之前，SFP2要搬运进SMEM
       // gemm P2 * V(i-1) -> O2    P2*V1
       if constexpr (get<1>(ThreadShape{}) > 1) {
         v_index = pipeline_kv_consumer_state.index();
@@ -741,24 +754,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
 
-
-      // wait for Ki
-      k_index = (pipeline_kv_consumer_state.index());
-      pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
-      ++pipeline_kv_consumer_state;
-
-      if (cute::elect_one_sync()) {
-          copy(tiled_copy_s2t_SFQ0, thr_sSFQ0_s2t(_,_,_,_,0), thr_tSFQ0_s2t);
-          copy(tiled_copy_s2t_SFK0, thr_sSFK0_s2t(_,_,_,_,k_index), thr_tSFK0_s2t);  //都是使用O0
-      }
-      cutlass::arch::fence_view_async_tmem_store();
-
-      // gemm Q1 * Ki -> S1  (WITH SCALE FACTORS)   这一SFQK会用到O0的位置，所以等待O0 correction做完
-      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0, tCtSFQ0, tCtSFK0);  //K的取数有问题，Q的不用管×
-      
-      pipeline_s0.producer_commit(pipeline_s0_producer_state);  //s0计算完通知后面做softmax
-      ++pipeline_s0_producer_state;
-
       if constexpr (get<1>(ThreadShape{}) > 1) {
         pipeline_kv.consumer_release(pipeline_kv_release_state);
         ++pipeline_kv_release_state;
@@ -772,10 +767,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
 
 
-      // SFQK1 goes to S0+32 → must re-acquire S0 (was committed in Q1*K→S0 above)
+      // SFQK1 goes to S0+32, so re-acquire S0 before loading SFQK1.
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
       if (cute::elect_one_sync()) {
-          copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,1), thr_tSFQ1_s2t);  // SFQ1→S0+32
+          copy(tiled_copy_s2t_SFQ1, thr_sSFQ1_s2t(_,_,_,_,1), thr_tSFQ1_s2t);
           copy(tiled_copy_s2t_SFK1, thr_sSFK1_s2t(_,_,_,_,k_index), thr_tSFK1_s2t);
       }
 
@@ -844,6 +839,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_kv_consumer_state;
     }
 
+    // Flush final S0 before the final stage-1 PV/correction handoff.
+    pipeline_s0.producer_commit(pipeline_s0_producer_state);
+    ++pipeline_s0_producer_state;
+
     // gemm P2 * Vi -> O2  (WITH SCALE FACTORS)
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
@@ -865,9 +864,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_kv.consumer_release(pipeline_kv_release_state);
     ++pipeline_kv_release_state;
 
-
-    pipeline_s0.producer_commit(pipeline_s0_producer_state);
-    ++pipeline_s0_producer_state;
 
     pipeline_s1.producer_commit(pipeline_s1_producer_state);
     ++pipeline_s1_producer_state;
@@ -1475,7 +1471,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       scale = (tTMEM_LOADVrS(kIdxOldRowMax) == tTMEM_LOADVrS(kIdxNewRowMax)) ? 1.0f : ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
  
 
-      pipeline_o.consumer_wait(pipeline_o_consumer_state);   //等待另一边MMA的O1
+      pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
 
       warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);

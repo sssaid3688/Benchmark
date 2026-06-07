@@ -148,7 +148,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     )
 
     # 设置精度宏 (MXFP8)
-    target_compile_definitions(b200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO})
+    target_compile_definitions(b200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO} MXFP8_N128)
 
     # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
     # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)

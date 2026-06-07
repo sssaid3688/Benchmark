@@ -93,11 +93,18 @@
 
 #include "device/fmha.hpp"
 #include "collective/fmha_fusion.hpp"
+#if defined(MXFP8_N128)
+#include "collective/sm100_fmha_fwd_mainloop_mxfp8_n128_pvmx.hpp"
+#include "collective/sm100_fmha_fwd_epilogue_mxfp8_n128.hpp"
+#include "kernel/fmha_mxfp8_n128_schedule.hpp"
+#include "kernel/sm100_fmha_fwd_kernel_mxfp8_pvmx.hpp"
+#else
 #include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
+#include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+#endif
 #include "kernel/fmha_options.hpp"
 #include "kernel/fmha_tile_scheduler.hpp"
-#include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
 #include <cute/util/debug.hpp>
 #include <cute/util/print.hpp>
@@ -131,8 +138,8 @@ struct Options {
   std::vector<int> varlen_q;
   std::vector<int> varlen_k;
   int d = 128;
-  int warmup_iterations = 0;
-  int iterations = 1;
+  int warmup_iterations = 1;
+  int iterations = 3;
   int tensor_ring_buffers = 1;
   bool verify = false;
   bool verbose = false;
@@ -487,14 +494,32 @@ struct FwdRunner {
   static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, true_type, KernelOptions...>::value;
   using TileScheduler = std::conditional_t<kIsPersistent, cutlass::fmha::kernel::PersistentTileScheduler, cutlass::fmha::kernel::IndividualTileScheduler>;
 
+#if defined(MXFP8_N128)
+  using Mainloop =
+    cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8<
+      ElementData, ElementAccumulatorQK, ElementAccumulatorPV,
+      TileShape, StrideQ, StrideK, StrideV,
+      ActiveMask
+    >;
+  using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+      ProblemShapeType,
+      Mainloop,
+      cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+        ElementOut, ElementAccumulatorPV,
+        typename Mainloop::TileShapePV,
+        StrideO, StrideLSE
+      >,
+      TileScheduler,
+      cutlass::fmha::kernel::Sm100FmhaCtxKernelWarpspecializedScheduleSingleStage
+    >;
+#else
   using Mainloop = 
     cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV,
       TileShape, StrideQ, StrideK, StrideV,
       ActiveMask
     >;
-  using Operation = cutlass::fmha::device::FMHA<
-    cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+  using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
       ProblemShapeType,
       Mainloop,
       cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
@@ -503,7 +528,9 @@ struct FwdRunner {
         StrideO, StrideLSE
       >,
       TileScheduler
-    >>;
+    >;
+#endif
+  using Operation = cutlass::fmha::device::FMHA<Kernel>;
 
   //
   // Data members
@@ -1261,6 +1288,15 @@ struct FwdRunner {
     }
     typename Operation::Arguments arguments{
       problem_shape_,
+#if defined(MXFP8_N128)
+      { buffers[buffer_index]->block_Q.get(), stride_Q,
+        buffers[buffer_index]->block_K.get(), stride_K,
+        buffers[buffer_index]->block_V.get(), stride_V,
+        buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
+        buffers[buffer_index]->block_SFK.get(), layout_SFK,
+        buffers[buffer_index]->block_SFP.get(), layout_SFP,
+        buffers[buffer_index]->block_SFV.get(), layout_SFV },
+#else
       { buffers[buffer_index]->block_Q.get(), stride_Q,
         buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
         buffers[buffer_index]->block_K.get(), stride_K,
@@ -1268,6 +1304,7 @@ struct FwdRunner {
         buffers[buffer_index]->block_SFP.get(), layout_SFP,
         buffers[buffer_index]->block_V.get(), stride_V,
         buffers[buffer_index]->block_SFV.get(), layout_SFV,},
+#endif
       { buffers[buffer_index]->block_O.get(), stride_O,
         buffers[buffer_index]->block_LSE.get(), stride_LSE },
       hw_info
@@ -1512,14 +1549,19 @@ void run_fwd_128(Mask fusion, Options const & options, cutlass::KernelHardwareIn
   };
 
   using HeadDim = _128;
+#if defined(MXFP8_N128)
+  using CtaM = _128;
+#else
+  using CtaM = _256;
+#endif
 
   if (options.persistent) {
     // Persistent Tile Scheduler
-    run(Shape<_256, _128, HeadDim>{}, "tma ws 256x128 acc fp32 persistent", Option<Tag::kIsPersistent, true_type>{});
+    run(Shape<CtaM, _128, HeadDim>{}, "tma ws n128 acc fp32 persistent", Option<Tag::kIsPersistent, true_type>{});
   }
   else {
     // Individual Tile Scheduler
-    run(Shape<_256, _128, HeadDim>{}, "tma ws 256x128 acc fp32 individual", Option<Tag::kIsPersistent, false_type>{});
+    run(Shape<CtaM, _128, HeadDim>{}, "tma ws n128 acc fp32 individual", Option<Tag::kIsPersistent, false_type>{});
   }
 }
 
