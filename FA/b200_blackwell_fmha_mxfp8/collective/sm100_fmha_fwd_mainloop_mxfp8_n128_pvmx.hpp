@@ -652,6 +652,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_sfp_consumer_state;
 
       load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
+
+      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+      ++pipeline_sfp_release_state;
+
       do_pv(v_index_prev, pv_buf, first_pv);
       first_pv = false;
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
@@ -686,6 +690,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       do_pv(v_index_prev, pv_buf, first_pv);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
+      
+      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+      ++pipeline_sfp_release_state;
 
       // release V(n-1)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
