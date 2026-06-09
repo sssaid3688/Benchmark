@@ -259,6 +259,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
+  using PipelineSFP = cutlass::PipelineTmaUmmaAsync<
+    StageCountQ,  // /2
+    typename CollectiveMmaQK::AtomThrShapeMNK
+  >;
+
   // from mma to softmax0/1 warp, protects S in tmem
   // [MXFP8 N128 M2] depth 2 — double-buffered S. The single softmax warp group
   // consumes ONE pipeline (pipeline_mma_s0); depth 2 maps its two stages onto
@@ -296,6 +301,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   static const int TransactionBytesLoadK_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
   static const int TransactionBytesLoadV_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
   static const int TransactionBytesLoadSFK   = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
+  static const int TransactionBytesLoadSFP = cutlass::bits_to_bytes(
+      cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
   static const int TransactionBytesLoadK     = TransactionBytesLoadK_data + TransactionBytesLoadSFK;
   static const int TransactionBytesLoadV     = TransactionBytesLoadV_data + TransactionBytesLoadSFK;
 
@@ -306,8 +313,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Element, ElementSF, StrideQ, StrideK, StrideV,
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
-    SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFV,
-    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape
+    SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFP, SmemLayoutSFV,
+    TensorStorage, PipelineQ, PipelineKV, PipelineSFP, Mask, TileShape
   >;
 
   struct Arguments {
@@ -371,13 +378,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       Params const& params, ParamsProblemShape const& params_problem_shape,
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
-      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
+      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state,
+      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_producer_state) {
 
     Load load;
     load.load(blk_coord, problem_shape, params.load, params_problem_shape,
         storage,
         pipeline_q, pipeline_q_producer_state,
-        pipeline_kv, pipeline_kv_producer_state);
+        pipeline_kv, pipeline_kv_producer_state,
+        pipeline_sfp, pipeline_sfp_producer_state);
   }
 
   template<class BlkCoord, class ProblemShape>
@@ -388,12 +397,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_consumer_state,
       PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_consumer_state,
+      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_consumer_state,
       PipelineS& pipeline_s0, typename PipelineS::PipelineState& pipeline_s0_producer_state,
       PipelineS& pipeline_s1, typename PipelineS::PipelineState& pipeline_s1_producer_state,
       PipelineO& pipeline_corr, typename PipelineO::PipelineState& pipeline_corr_producer_state) {
 
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
+    auto pipeline_sfp_release_state = pipeline_sfp_consumer_state;
 
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
@@ -515,6 +526,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     int k_index = 0;
     int v_index = 0;
     int q_index = 0;
+    int sp_index = 0;
 
     // wait for Q
     q_index = pipeline_q_consumer_state.index();
@@ -634,6 +646,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       load_sfv(v_index_prev, pv_buf);
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // acquire #(k+1): P[(k-1)%2] ready
+      
+      sp_index = pipeline_sfp_consumer_state.index();
+      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      ++pipeline_sfp_consumer_state;
+
       load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
       do_pv(v_index_prev, pv_buf, first_pv);
       first_pv = false;
@@ -659,6 +676,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
       ++pipeline_s0_producer_state;
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+
+      sp_index = pipeline_sfp_consumer_state.index();
+      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      ++pipeline_sfp_consumer_state;
+
       load_sfp(pv_buf);                // [PVMX 2b] tail: stage P-SF[pv_buf] -> SFP[pv_buf]
       load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] tail: stage V-SF[v_index_prev] -> SFV[pv_buf]
       do_pv(v_index_prev, pv_buf, first_pv);
@@ -784,7 +806,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
     tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
     Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
-
+    const int kReleasePipeCount = 10;
     // wait on tensor core pipe — only group 0 holds the mma->softmax pipeline;
     // it waits for QK(k) to land in TMEM, then B_SREADY lets group 1 (which
     // holds no mma pipeline) safely read its score half. Both groups arrive.
@@ -871,6 +893,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
+    
+    Tensor sP_full = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
+    Tensor sP_tile = (stage == _0{}) ? sP_full(_, _, _, _0{}) : sP_full(_, _, _, _1{});
 
     Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
@@ -890,83 +915,43 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // old fabsf() was redundant; and the separate amax pass over 64 regs is folded in.
     // Thread owns its row's 64 cols (group half) = 2 SF blocks (size=64; 64/32=2).
     // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
-    constexpr int kSFVec   = 32;
-    constexpr int kNSFBlk  = 2;
-    float amax_b[kNSFBlk] = {0.0f, 0.0f};
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
-      float2 in = make_float2(tTMEM_LOADrS(i+0), tTMEM_LOADrS(i+1));
+      float2 in = make_float2(
+        tTMEM_LOADrS(i + 0),
+        tTMEM_LOADrS(i + 1)
+      );
       float2 out;
       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-      float p0 = fast_exp2f(out.x);
-      float p1 = fast_exp2f(out.y);
-      tTMEM_LOADrS(i+0) = p0;
-      tTMEM_LOADrS(i+1) = p1;
-      const int b = i / kSFVec;
-      amax_b[b] = ::fmaxf(amax_b[b], ::fmaxf(p0, p1));
-    }
-    // Phase 3: per-block e8m0 = ceil(log2(amax/E4M3_MAX)) + 127, clamped.
-    constexpr float E4M3_MAX_F = 448.0f;
-    int   exp_b[kNSFBlk];
-    float scale_inv_b[kNSFBlk];
-    CUTLASS_PRAGMA_UNROLL
-    for (int b = 0; b < kNSFBlk; ++b) {
-      float a = amax_b[b];
-      // [opt] ceil(log2(a/448)) via float exponent bits (no SFU log2/ceil)
-      uint32_t _xb = __float_as_uint(a * (1.0f/E4M3_MAX_F));
-      int e = (a == 0.0f) ? -127
-              : ((int)((_xb >> 23) & 0xFFu) - 127 + (((_xb & 0x7FFFFFu) != 0u) ? 1 : 0));
-      if (e < -127) e = -127;
-      if (e >  127) e =  127;
-      exp_b[b] = e;
-      scale_inv_b[b] = __uint_as_float((uint32_t)(127 - e) << 23); // [opt] 2^-e, no SFU exp2
-    }
-    // Phase 4: scale P by 2^-exp_b, convert to e4m3. IMPORTANT: don't mutate
-    // tTMEM_LOADrS — the row_sum loop downstream sums it (the unscaled exp P).
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
-      int b = i / kSFVec;
+      tTMEM_LOADrS(i + 0) = out.x;
+      tTMEM_LOADrS(i + 1) = out.y;
+
+      tTMEM_LOADrS(i+0) = ::exp2f(tTMEM_LOADrS(i+0));
+      tTMEM_LOADrS(i+1) = ::exp2f(tTMEM_LOADrS(i+1));
+
+      // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
       Array<ElementQK, kConversionsPerStep> in_conv;
-      in_conv[0] = tTMEM_LOADrS(i+0) * scale_inv_b[b];
-      in_conv[1] = tTMEM_LOADrS(i+1) * scale_inv_b[b];
-      tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
-    }
-    // Phase 5: write e8m0 P-SF to smem_sfp[sbuf]. Group g owns kblocks [g*2, g*2+1].
-    // Derived from SmemLayoutAtomSFP probe ((((_32,_4),_1),(_32,_1)),_1,(_4,_1)) with
-    // strides (((16,4),512),(0,1)),_0,(1,512):
-    //   byte_offset(row, kblock) = (row%32)*16 + (row/32)*4 + kblock; per stage = +sbuf*512.
-    {
-      uint8_t* sf_buf = reinterpret_cast<uint8_t*>(storage.smem_sfp.data());
-      const int stage_off = sbuf * int(cute::cosize_v<SmemLayoutAtomSFP>);
-      const int kblk_base = int(stage) * kNSFBlk;
-      const int row = thread_idx;
-      const int row_off = (row & 31) * 16 + (row >> 5) * 4;
       CUTLASS_PRAGMA_UNROLL
-      for (int b = 0; b < kNSFBlk; ++b) {
-        uint8_t e8m0 = (uint8_t)(exp_b[b] + 127);
-        sf_buf[stage_off + row_off + (kblk_base + b)] = e8m0;
+      for (int j = 0; j < kConversionsPerStep; j++) {
+        in_conv[j] = tTMEM_LOADrS(i + j);
+      }
+      tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
+
+      if (i == size(tTMEM_LOADrS) - kReleasePipeCount) {
+        order_s.arrive();
       }
     }
 
-    // [PVMX 2a.0/perf] write P (e4m3) to smem_p[sbuf]; vectorize 4 bytes / store.
-    // SmemLayoutP = Sw<3,4,3> o ((M=128,32),1,4,STAGE). For each thread/row, 4
-    // consecutive e4m3 (k=4e..4e+3) lie in the same 16-byte swizzle group, so
-    // the swizzle applies the same XOR — they map to 4 contiguous bytes; one
-    // uint32 store replaces 4 byte stores. kbase = stage*64 is 4-aligned.
-    {
-      Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
-      const int row   = thread_idx;        // each softmax thread owns exactly one row (0..127)
-      const int kbase = int(nHalf);        // this group's e4m3 col offset (stage*64)
-      static_assert(size(tTMEM_STORErS_x4) % 4 == 0);
-      CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < size(tTMEM_STORErS_x4); e += 4) {
-        int k0 = kbase + 4 * e;            // 4-aligned global e4m3 col
-        Element& dst_byte0 = sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32);
-        uint4 words = make_uint4(
-            tTMEM_STORErS_x4(e + 0), tTMEM_STORErS_x4(e + 1),
-            tTMEM_STORErS_x4(e + 2), tTMEM_STORErS_x4(e + 3));
-        *reinterpret_cast<uint4*>(&dst_byte0) = words;
-      }
+    int my_row = get<0>(tTMEM_LOADcS(_0{})) % 128;
+
+    // coalesce: flatten swizzled 3-mode layout -> true 2D (128, 128) FP8
+    // then recast to uint32_t: inner 4 FP8 -> 1 uint32_t -> (128, 32)
+    auto sP_tile_flat = coalesce(sP_tile);
+    Tensor sP_u32 = recast<uint32_t>(sP_tile_flat);
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < size(tTMEM_STORErS_x4); ++j) {
+      sP_u32(my_row, j) = tTMEM_STORErS_x4(j);
     }
 
     cutlass::arch::fence_view_async_shared();

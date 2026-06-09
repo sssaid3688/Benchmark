@@ -287,9 +287,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
           ElementAccumulator acc = 0;
           for (int k = 0; k < size<1>(problem_shape); k++) {
             int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
-            ElementAccumulator p_fp32 = 
-                ElementAccumulator(mS_e4m3[k])
-              * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
+            ElementAccumulator p_fp32 = mS[k];
 
             ElementAccumulator v_fp32 =
                 ElementAccumulator(mV(k + offset_K, d, coord_L))

@@ -44,10 +44,12 @@ template<
   class SmemLayoutV,
   class SmemLayoutSFQ,             // [MXFP8] SF smem layout, staged on Q pipeline
   class SmemLayoutSFK,             // [MXFP8] SF smem layout, staged on KV pipeline
+  class SmemLayoutSFP,
   class SmemLayoutSFV,             // [PVMX 2a.1b] V-SF smem layout, staged on KV pipeline
   class TensorStorage,
   class PipelineQ,
   class PipelineKV,
+  class PipelineSFP,
   class Mask,
   class TileShape
 >
@@ -87,6 +89,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
   using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
   using TMA_SFA = typename CollectiveMmaQK::Params::TMA_SFA;   // [MXFP8]
   using TMA_SFB = typename CollectiveMmaQK::Params::TMA_SFB;   // [MXFP8]
+  using TMA_SFP = typename CollectiveMmaPV::Params::TMA_SFA;   // [MXFP8]
   using TMA_SFV = typename CollectiveMmaPV::Params::TMA_SFB;   // [PVMX 2a.1] V-SF TMA (PV SFB)
 
   struct Params {
@@ -97,6 +100,8 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     TMA_SFB tma_load_sfb;          // [MXFP8]
     LayoutSFA layout_SFA;          // [MXFP8] needed for get_tma_tensor(shape(...))
     LayoutSFB layout_SFB;          // [MXFP8]
+    TMA_SFP tma_load_sfp;          
+    LayoutSFP layout_SFP;          
     TMA_SFV tma_load_sfv;          // [PVMX 2a.1] V-SF
     LayoutSFV layout_SFV;          // [PVMX 2a.1]
   };
@@ -159,6 +164,8 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         params_qk.tma_load_sfb,
         args.layout_SFA,
         args.layout_SFB,
+        params_pv.tma_load_sfa,          // [PVMX 2a.1] V-SF TMA (PV SFB)
+        args.layout_SFP,
         params_pv.tma_load_sfb,          // [PVMX 2a.1] V-SF TMA (PV SFB)
         args.layout_SFV
     };
@@ -182,7 +189,8 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       Params const& params, ParamsProblemShape const& params_problem_shape,
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
-      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
+      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state,
+      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_producer_state) {
 
     BlkCoord blk_coord_q = blk_coord_in;
     BlkCoord blk_coord_kv = blk_coord_in;
@@ -321,6 +329,28 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     );
     Tensor tVgSFV = tVgSFV_kdl(_, _0{}, _, sf_l_coord(blk_coord_kv));
 
+    Tensor mP_sf_p = params.tma_load_sfp.get_tma_tensor(shape(params.layout_SFP));
+
+    int p_offs_0 = q_offs_0;  // P rows correspond to Q rows
+    int p_offs_1 = kv_offs_0; // P cols correspond to K cols
+
+    Tensor mP_sf = domain_offset(make_coord(p_offs_0, p_offs_1, make_coord(_0{}, _0{})), mP_sf_p);
+
+    // Tile P SF over (Q_tiles, K_tiles)
+    // P SF uses SFA layout (A operand of PV MMA uses TileShapePV)
+    Tensor gP_sf = local_tile(mP_sf, TileShapePV{}, make_coord(_, _, _), Step<_1, X, _1>{});
+
+    Tensor tSgP_sf = mma_pv.partition_A(gP_sf);
+
+    Tensor sP_sf = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
+
+    auto [tPgP_sf, tPsP_sf] = tma_partition(
+      params.tma_load_sfp, _0{}, make_layout(_1{}),
+      group_modes<0,3>(sP_sf), group_modes<0,3>(tSgP_sf)
+    );
+
+    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, sf_l_coord(blk_coord_kv));
+
     uint32_t lane_predicate = cute::elect_one_sync();
 
     // [MXFP8 N128] single-stage: the CTA loads ONE Q tile (M=128). The dual-
@@ -336,6 +366,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
 
     // K1 (+ SFB1)
     int k_index = 0;
+    int sfp_index = 0;
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -356,9 +387,20 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     ++pipeline_kv_producer_state;
     k_index += 1;
 
+    // pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
+    // if(lane_predicate){
+    //   auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
+    //   copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
+    // }
+
+    // ++pipeline_sfp_producer_state;
+    // sfp_index += 1; 
+
     // loop:
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+
+      
 
       // Ki (+ SFBi)
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
@@ -384,7 +426,22 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       }
       ++pipeline_kv_producer_state;
       k_index += 1;
+
+      pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
+      if (lane_predicate) {
+        auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
+        copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
+      }
+      ++pipeline_sfp_producer_state;
+      sfp_index += 1;
     }
+    pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
+      if (lane_predicate) {
+        auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
+        copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
+      }
+      ++pipeline_sfp_producer_state;
+      sfp_index += 1;
   }
 };
 

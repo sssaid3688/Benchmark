@@ -68,7 +68,7 @@
         ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 \
             --b=1 --h=40 --d=128 --q=256 --k=128
 
-        ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
+        ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
             
             
 */
@@ -158,7 +158,7 @@ struct Options {
   
   InitStyle init_style_sfq = InitStyle::kRandom;
   InitStyle init_style_sfk = InitStyle::kRandom;
-  InitStyle init_style_sfp = InitStyle::kRandom;
+  InitStyle init_style_sfp = InitStyle::kOne;
   InitStyle init_style_sfv = InitStyle::kRandom;
 
   static void get_init_style_argument(cutlass::CommandLine& cmd, const char* name, InitStyle& dst, InitStyle const& src) {
@@ -995,7 +995,7 @@ struct FwdRunner {
 
       buffer.block_SFQ.reset(size(filter_zeros(layout_SFQ)));
       buffer.block_SFK.reset(size(filter_zeros(layout_SFK)));
-      buffer.block_SFP.reset(1);
+      buffer.block_SFP.reset(size(filter_zeros(layout_SFP)));
       buffer.block_SFV.reset(size(filter_zeros(layout_SFV)));
 
 
