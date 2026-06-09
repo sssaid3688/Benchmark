@@ -1708,7 +1708,7 @@ int main_single(int argc, char const **args) {
         fn(CausalMask<false>{});
       }
     }
-    else if (options.residual) {
+    else if (options.residual || (options.k % 128 != 0)) {
       fn(ResidualMask{});
     }
     else {
