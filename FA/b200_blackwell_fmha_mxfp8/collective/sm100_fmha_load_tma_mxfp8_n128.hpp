@@ -366,6 +366,11 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_k.with(*tma_barrier, 0), tKgK(_, k_index), tKsK(_, pipeline_kv_producer_state.index()));
         copy(params.tma_load_sfb.with(*tma_barrier, 0), tKgSFB(_, k_index), tKsSFK(_, pipeline_kv_producer_state.index()));  // [MXFP8]
+
+        // Match the Blackwell MLA load pipeline: warm the current V tile while
+        // K is in flight so the following V TMA does not pay the full L2
+        // lookup/request latency on its critical path.
+        cute::prefetch(params.tma_load_v, tVgV(_, k_index));
       }
       ++pipeline_kv_producer_state;
 
@@ -375,6 +380,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
         copy(params.tma_load_sfv.with(*tma_barrier, 0), tVgSFV(_, k_index), tVsSFV(_, pipeline_kv_producer_state.index()));  // [PVMX 2a.1b]
+
       }
       ++pipeline_kv_producer_state;
       k_index += 1;

@@ -129,30 +129,30 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     # 使用 cutlass 提供的函数创建可执行文件
     # （会自动设置 CUDA 编译选项和 gencode 标志）
     cutlass_add_executable(
-        b200_blackwell_fmha_${PREC}
+        hb200_blackwell_fmha_${PREC}
         b200_blackwell_fmha.cu
     )
 
     # [重要] 链接 CUTLASS (header-only)、工具库和 CUDA 运行时
     # cutlass_add_executable 只创建 target, 需要手动链接
     # cutlass_tools_util_includes 提供 cutlass/util/command_line.h 等工具头文件
-    target_link_libraries(b200_blackwell_fmha_${PREC} PRIVATE
+    target_link_libraries(hb200_blackwell_fmha_${PREC} PRIVATE
       CUTLASS
       cutlass_tools_util_includes
       cuda
     )
 
     # 添加自己的头文件路径 (collective/, kernel/, reference/, ...)
-    target_include_directories(b200_blackwell_fmha_${PREC} PRIVATE
+    target_include_directories(hb200_blackwell_fmha_${PREC} PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
     # 设置精度宏 (MXFP8)
-    target_compile_definitions(b200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO} MXFP8_N128)
+    target_compile_definitions(hb200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO} MXFP8_N128)
 
     # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
     # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
-    target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_compile_options(hb200_blackwell_fmha_${PREC} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
   endforeach()
 
@@ -165,7 +165,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
   # 打印使用说明
   message(STATUS "========================================")
   message(STATUS "构建完成! 运行方式:")
-  message(STATUS "  ./b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/hb200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
   message(STATUS "========================================")
 
 endif()

@@ -628,10 +628,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_kv_consumer_state;
 
       // PV(k-1): P[(k-1)%2] * V(k-1) -> O
+      // V(k-1) and its SF arrived before this iteration. Stage SFV into its
+      // ping-pong TMEM slot before waiting for O or P, overlapping UTCCP
+      // latency with both independent critical-path waits.
+      load_sfv(v_index_prev, pv_buf);
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // acquire #(k+1): P[(k-1)%2] ready
       load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
-      load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] stage V-SF[v_index_prev] -> SFV[pv_buf]
       do_pv(v_index_prev, pv_buf, first_pv);
       first_pv = false;
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
@@ -954,12 +957,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
       const int row   = thread_idx;        // each softmax thread owns exactly one row (0..127)
       const int kbase = int(nHalf);        // this group's e4m3 col offset (stage*64)
+      static_assert(size(tTMEM_STORErS_x4) % 4 == 0);
       CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < size(tTMEM_STORErS_x4); ++e) {
-        uint32_t w = tTMEM_STORErS_x4(e);
+      for (int e = 0; e < size(tTMEM_STORErS_x4); e += 4) {
         int k0 = kbase + 4 * e;            // 4-aligned global e4m3 col
         Element& dst_byte0 = sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32);
-        *reinterpret_cast<uint32_t*>(&dst_byte0) = w;
+        uint4 words = make_uint4(
+            tTMEM_STORErS_x4(e + 0), tTMEM_STORErS_x4(e + 1),
+            tTMEM_STORErS_x4(e + 2), tTMEM_STORErS_x4(e + 3));
+        *reinterpret_cast<uint4*>(&dst_byte0) = words;
       }
     }
 
@@ -980,11 +986,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     }
     ++pipeline_s_consumer_state;
 
-    if (is_g0) {
-      pipeline_c.producer_acquire(pipeline_c_producer_state);
-    }
-
-    ElementQK acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
+    ElementQK acc_scale = (old_row_max == row_max_safe)
+        ? 0.5f
+        : 0.5f * fast_exp2f(scale * (old_row_max - row_max_safe));
     row_sum *= acc_scale;
     // row_sum = sum(reg_S)
     float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
@@ -1013,6 +1017,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
 
     row_sum = local_row_sum;
+
+    // The next correction signal is not committed until the next softmax
+    // step. Delay its depth-1 producer acquire until after this step's
+    // independent row-sum work, overlapping correction consumption with the
+    // reduction instead of blocking group 0 before it.
+    if (is_g0) {
+      pipeline_c.producer_acquire(pipeline_c_producer_state);
+    }
 
     if (final_call) {
       // [MXFP8 N128 M3b] each group summed only its own 64-col half of every
@@ -1353,16 +1365,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       loadv_stats(corr_tile, tTMEM_LOADVrS);
 
-      // [MXFP8 L1] branchless: always compute the rescale factor — exp2(0)=1
-      // when the running-max is unchanged — and always apply it.
-      float scale = ::exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
+      float scale = fast_exp2f(params.scale_softmax_log2 * (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
+
+      // The softmax->correction signal protects the row stats in S/V. Once the
+      // stats have been loaded into registers and scale is computed, correction
+      // no longer needs that S buffer; release it before waiting on the single
+      // O accumulator so softmax can prepare the next P/SFP tile earlier.
+      pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+      ++pipeline_s0_c_consumer_state;
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
       correction_rescale(scale, uint32_t(TmemAllocation::O0));
-
-      pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
-      ++pipeline_s0_c_consumer_state;
 
       cutlass::arch::fence_view_async_tmem_store();
 
@@ -1381,8 +1395,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
     ++pipeline_s0_c_consumer_state;
 
-    pipeline_o.consumer_wait(pipeline_o_consumer_state);
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+
+    pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()), typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), select<0,3>(problem_shape), epilogue.params.dLSE);
