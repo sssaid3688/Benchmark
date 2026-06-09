@@ -162,7 +162,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // [PVMX 2a.0] P operand smem layout (block-scaled SS PV reads P from smem, not TMEM).
   // 2 stages, matching the double-buffered S/PV pipeline.
   static constexpr int StageCountP = 2;
-  using SmemLayoutP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutA{}, Int<StageCountP>{}));
+  // B64 is faster for the on-chip P producer/consumer path than the builder's
+  // default B128 descriptor and reduces PV shared-load wavefront conflicts.
+  using SmemLayoutAtomP = cute::UMMA::Layout_K_SW64_Atom<Element>;
+  using SmemLayoutP = decltype(cute::UMMA::tile_to_mma_shape(
+      SmemLayoutAtomP{},
+      append(typename CollectiveMmaPV::MmaShapeA_MK{}, Int<StageCountP>{}),
+      Step<_1,_2,_3>{}));
 
   // [MXFP8] scale-factor types/layouts exposed by the block-scaled QK collective.
   using ElementSF = typename CollectiveMmaQK::ElementSF;                 // float_ue8m0_t
@@ -754,7 +760,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // per thread (vs two with the 32x atom) — fewer MIO-queued instructions,
       // which NCU flagged as a top secondary stall (mio_throttle). STAT is not
       // enabled for sm_100a (SM103 only), so this #else is the live path.
-      using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b64x;
+      using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
     #endif
     // [MXFP8] P-tile width follows TileShapeQK's N. With the Route-C N=64 tile
     // the P-tile is 16 fp32-words wide, so the store atom must be the 16x form
@@ -949,7 +955,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     }
 
     // [PVMX 2a.0/perf] write P (e4m3) to smem_p[sbuf]; vectorize 4 bytes / store.
-    // SmemLayoutP = Sw<3,4,3> o ((M=128,32),1,4,STAGE). For each thread/row, 4
+    // SmemLayoutP uses a B64 K-major swizzle. For each thread/row, 4
     // consecutive e4m3 (k=4e..4e+3) lie in the same 16-byte swizzle group, so
     // the swizzle applies the same XOR — they map to 4 contiguous bytes; one
     // uint32 store replaces 4 byte stores. kbase = stage*64 is 4-aligned.
