@@ -948,8 +948,8 @@ struct FwdRunner {
     // std::cout<<"layout_SFQTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     // std::cout<<"layout_SFK_tempTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     auto problem_size_pv = select<0,2,1,3>(problem_size);
-    // SFP is generated directly in SMEM for each P tile. Keep a tiny valid
-    // global layout only so the unused TMA descriptor can be constructed.
+    // Static P quantization uses one all-ones SFP tile, reloaded for every PV
+    // tile. Avoid materializing an unnecessary Q x K x H global SFP tensor.
     using TileShapePVForSFP = typename Mainloop::TileShapePV;
     int dummy_sfp_m = size<0>(TileShapePVForSFP{});
     int dummy_sfp_n = size<1>(TileShapePVForSFP{});
@@ -1019,6 +1019,7 @@ struct FwdRunner {
       // std::cout<< "block_q: " <<(*(buffer.block_Q.get()))[0] << std::endl;
       initialize_block(buffer.block_SFQ, seed + 2027, options.init_style_sfq);
       initialize_block(buffer.block_SFK, seed + 2026, options.init_style_sfk);
+      initialize_block(buffer.block_SFP, seed + 2025, options.init_style_sfp);
       initialize_block(buffer.block_SFV, seed + 2024, options.init_style_sfv);
       
       // Build reference SF buffers in row-major order from kernel buffer

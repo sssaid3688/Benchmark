@@ -62,7 +62,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
   using LayoutSFA = typename CollectiveMmaQK::LayoutSFA;
   using LayoutSFB = typename CollectiveMmaQK::LayoutSFB;
   // [PVMX 2a.1] PV-side SF layouts (PV problem: M=seqlen_q, N=D, K=seqlen_kv).
-  using LayoutSFP = typename CollectiveMmaPV::LayoutSFA;   // P-SF (dummy gmem; on-chip real)
+  using LayoutSFP = typename CollectiveMmaPV::LayoutSFA;   // P-SF loaded from global memory
   using LayoutSFV = typename CollectiveMmaPV::LayoutSFB;   // V-SF (real)
 
   struct Arguments {
@@ -152,7 +152,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         typename CollectiveMmaPV::Arguments {
             ptr_K, dK,  // dummy A (P is produced on-chip, not loaded)
             ptr_V, select<1,0,2>(dV),
-            args.ptr_SFP, args.layout_SFP,   // [PVMX 2a.1] P-SF (dummy gmem; TMA built but unused)
+            args.ptr_SFP, args.layout_SFP,   // [PVMX 2a.1] P-SF
             args.ptr_SFV, args.layout_SFV    // [PVMX 2a.1] V-SF (real)
         }, /*workspace=*/ nullptr);
 
@@ -179,6 +179,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     cute::prefetch_tma_descriptor(params.tma_load_v.get_tma_descriptor());
     cute::prefetch_tma_descriptor(params.tma_load_sfa.get_tma_descriptor());   // [MXFP8]
     cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());   // [MXFP8]
+    cute::prefetch_tma_descriptor(params.tma_load_sfp.get_tma_descriptor());   // [PVMX 2b]
     cute::prefetch_tma_descriptor(params.tma_load_sfv.get_tma_descriptor());   // [PVMX 2a.1b]
   }
 
@@ -349,13 +350,12 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       group_modes<0,3>(sP_sf), group_modes<0,3>(tSgP_sf)
     );
 
-    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, sf_l_coord(blk_coord_kv));
-
     uint32_t lane_predicate = cute::elect_one_sync();
 
     // [MXFP8 N128] single-stage: the CTA loads ONE Q tile (M=128). The dual-
     // stage q0/q1 = 2*blk, 2*blk+1 split is gone — q0_index is the CTA's tile.
     int q0_index = get<0>(blk_coord_q);
+    auto tPgP_sf_view = tPgP_sf(_, _, _0{}, make_coord(_0{}, _0{}));
     pipeline_q.producer_acquire(pipeline_q_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);
@@ -366,7 +366,6 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
 
     // K1 (+ SFB1)
     int k_index = 0;
-    int sfp_index = 0;
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -387,20 +386,9 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     ++pipeline_kv_producer_state;
     k_index += 1;
 
-    // pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-    // if(lane_predicate){
-    //   auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-    //   copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-    // }
-
-    // ++pipeline_sfp_producer_state;
-    // sfp_index += 1; 
-
     // loop:
     mask_tile_count -= 1;
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-
-      
 
       // Ki (+ SFBi)
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
@@ -433,7 +421,6 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
       }
       ++pipeline_sfp_producer_state;
-      sfp_index += 1;
     }
     pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
       if (lane_predicate) {
@@ -441,7 +428,6 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, 0), tPsP_sf(_, pipeline_sfp_producer_state.index()));
       }
       ++pipeline_sfp_producer_state;
-      sfp_index += 1;
   }
 };
 

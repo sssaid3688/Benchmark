@@ -242,20 +242,14 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
         }
 
         for (int g = 0; g < sf_groups; g++) {
-          ElementAccumulator max_32 = sf_group_data[g];
-          ElementAccumulator scale_val = max_32 > ElementAccumulator(0)
-              ? exp2f(floorf(log2f(max_32)))
-              : ElementAccumulator(1);
           int k_begin = g * kMXFP8GroupSize_sfp;
           int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
           for (int k = k_begin; k < k_end; k++) {
-            ElementAccumulator val_fp32 = max_32 > ElementAccumulator(0)
-                ? mS[k] / scale_val
-                : ElementAccumulator(0);
+            ElementAccumulator val_fp32 = mS[k];
             val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
             mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
           }
-          sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(scale_val);
+          sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(1.0f);
         }
 
         sf_group_data[0] = float(sum);
@@ -287,7 +281,9 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
           ElementAccumulator acc = 0;
           for (int k = 0; k < size<1>(problem_shape); k++) {
             int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
-            ElementAccumulator p_fp32 = mS[k];
+            ElementAccumulator p_fp32 =
+                ElementAccumulator(mS_e4m3[k])
+              * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
 
             ElementAccumulator v_fp32 =
                 ElementAccumulator(mV(k + offset_K, d, coord_L))

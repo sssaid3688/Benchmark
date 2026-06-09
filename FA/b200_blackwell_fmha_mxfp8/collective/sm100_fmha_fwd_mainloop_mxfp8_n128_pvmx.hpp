@@ -260,7 +260,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   >;
 
   using PipelineSFP = cutlass::PipelineTmaUmmaAsync<
-    StageCountQ,  // /2
+    2,
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
@@ -653,11 +653,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
 
+      do_pv(v_index_prev, pv_buf, first_pv);
+      first_pv = false;
+
       pipeline_sfp.consumer_release(pipeline_sfp_release_state);
       ++pipeline_sfp_release_state;
 
-      do_pv(v_index_prev, pv_buf, first_pv);
-      first_pv = false;
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 
@@ -901,9 +902,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
     
-    Tensor sP_full = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
-    Tensor sP_tile = (stage == _0{}) ? sP_full(_, _, _, _0{}) : sP_full(_, _, _, _1{});
-
     Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
     constexpr int kConversionsPerStep = 2;
@@ -950,15 +948,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       }
     }
 
-    int my_row = get<0>(tTMEM_LOADcS(_0{})) % 128;
-
-    // coalesce: flatten swizzled 3-mode layout -> true 2D (128, 128) FP8
-    // then recast to uint32_t: inner 4 FP8 -> 1 uint32_t -> (128, 32)
-    auto sP_tile_flat = coalesce(sP_tile);
-    Tensor sP_u32 = recast<uint32_t>(sP_tile_flat);
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < size(tTMEM_STORErS_x4); ++j) {
-      sP_u32(my_row, j) = tTMEM_STORErS_x4(j);
+    // Write P through the original swizzled SmemLayoutP coordinates. Each
+    // softmax group owns one 64-column half of the P tile.
+    {
+      Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
+      const int row = thread_idx;
+      const int kbase = int(nHalf);
+      CUTLASS_PRAGMA_UNROLL
+      for (int e = 0; e < size(tTMEM_STORErS_x4); ++e) {
+        int k0 = kbase + 4 * e;
+        Element& dst_byte0 = sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32);
+        *reinterpret_cast<uint32_t*>(&dst_byte0) = tTMEM_STORErS_x4(e);
+      }
     }
 
     cutlass::arch::fence_view_async_shared();
