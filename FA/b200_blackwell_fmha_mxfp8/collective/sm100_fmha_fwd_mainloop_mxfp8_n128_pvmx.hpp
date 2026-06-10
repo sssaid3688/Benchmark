@@ -949,16 +949,27 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     }
 
     // Write P through the original swizzled SmemLayoutP coordinates. Each
-    // softmax group owns one 64-column half of the P tile.
+    // softmax group owns one 64-column half of the P tile. Group four packed
+    // words into one aligned 16-byte transaction to avoid shared-bank
+    // conflicts from issuing the words independently.
     {
       Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
       const int row = thread_idx;
       const int kbase = int(nHalf);
+      static_assert(size(tTMEM_STORErS_x4) % 4 == 0, "P vector store requires complete uint4 groups");
       CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < size(tTMEM_STORErS_x4); ++e) {
+      for (int e = 0; e < size(tTMEM_STORErS_x4); e += 4) {
         int k0 = kbase + 4 * e;
         Element& dst_byte0 = sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32);
-        *reinterpret_cast<uint32_t*>(&dst_byte0) = tTMEM_STORErS_x4(e);
+        uint4 packed = make_uint4(
+          tTMEM_STORErS_x4(e + 0),
+          tTMEM_STORErS_x4(e + 1),
+          tTMEM_STORErS_x4(e + 2),
+          tTMEM_STORErS_x4(e + 3));
+#ifdef MXFP8_DBG
+        assert((reinterpret_cast<uintptr_t>(&dst_byte0) & 0xfu) == 0);
+#endif
+        *reinterpret_cast<uint4*>(&dst_byte0) = packed;
       }
     }
 
