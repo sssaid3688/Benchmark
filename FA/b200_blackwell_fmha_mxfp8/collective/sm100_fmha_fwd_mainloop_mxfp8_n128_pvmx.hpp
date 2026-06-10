@@ -173,7 +173,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   using TiledMmaPV        = typename CollectiveMmaPV::TiledMma;
   using SmemLayoutAtomSFP = typename CollectiveMmaPV::SmemLayoutAtomSFA;  // P-SF atom
   using SmemLayoutAtomSFV = typename CollectiveMmaPV::SmemLayoutAtomSFB;  // V-SF atom
-  // [PVMX 2b] P-SF smem is double-buffered (softmax(k) writes while UTCCP(k-1) reads).
   using SmemLayoutSFP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFA{}, Int<2>{}));
   // [PVMX 2a.1b] V-SF smem, staged on KV pipeline (loaded by TMA on V-slots).
   using SmemLayoutSFV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFB{}, Int<StageCountKV>{}));
@@ -691,7 +690,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       do_pv(v_index_prev, pv_buf, first_pv);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
-      
+
       pipeline_sfp.consumer_release(pipeline_sfp_release_state);
       ++pipeline_sfp_release_state;
 
@@ -784,7 +783,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // per thread (vs two with the 32x atom) — fewer MIO-queued instructions,
       // which NCU flagged as a top secondary stall (mio_throttle). STAT is not
       // enabled for sm_100a (SM103 only), so this #else is the live path.
-      using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b64x;
+      using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
     #endif
     // [MXFP8] P-tile width follows TileShapeQK's N. With the Route-C N=64 tile
     // the P-tile is 16 fp32-words wide, so the store atom must be the 16x form
@@ -814,7 +813,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
     tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
     Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
-    const int kReleasePipeCount = 10;
     // wait on tensor core pipe — only group 0 holds the mma->softmax pipeline;
     // it waits for QK(k) to land in TMEM, then B_SREADY lets group 1 (which
     // holds no mma pipeline) safely read its score half. Both groups arrive.
@@ -902,13 +900,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
     
-    Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
-
-    constexpr int kConversionsPerStep = 2;
-
-    Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
-
+    constexpr int kConversionsPerStep = 16;
     NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
+    Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
+    const int p_row = thread_idx;
+    const int p_kbase = int(nHalf);
 
     // [MXFP8 N128 M3b] the pristine inter-group OrderBarrier (order_s) is an
     // ordered (group0-then-group1) sequencer; split-N instead needs symmetric
@@ -922,18 +918,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
 
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
-      float2 in = make_float2(
-        tTMEM_LOADrS(i + 0),
-        tTMEM_LOADrS(i + 1)
-      );
-      float2 out;
-      cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-      tTMEM_LOADrS(i + 0) = out.x;
-      tTMEM_LOADrS(i + 1) = out.y;
-
-      tTMEM_LOADrS(i+0) = ::exp2f(tTMEM_LOADrS(i+0));
-      tTMEM_LOADrS(i+1) = ::exp2f(tTMEM_LOADrS(i+1));
+    for (int i = 0; i < size(tTMEM_LOADrS); i += kConversionsPerStep) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < kConversionsPerStep; j += 2) {
+        float2 in = make_float2(
+          tTMEM_LOADrS(i + j + 0),
+          tTMEM_LOADrS(i + j + 1)
+        );
+        float2 out;
+        cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+        tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
+        tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+      }
 
       // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
       Array<ElementQK, kConversionsPerStep> in_conv;
@@ -941,36 +937,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       for (int j = 0; j < kConversionsPerStep; j++) {
         in_conv[j] = tTMEM_LOADrS(i + j);
       }
-      tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
-
-      if (i == size(tTMEM_LOADrS) - kReleasePipeCount) {
-        order_s.arrive();
-      }
-    }
-
-    // Write P through the original swizzled SmemLayoutP coordinates. Each
-    // softmax group owns one 64-column half of the P tile. Group four packed
-    // words into one aligned 16-byte transaction to avoid shared-bank
-    // conflicts from issuing the words independently.
-    {
-      Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
-      const int row = thread_idx;
-      const int kbase = int(nHalf);
-      static_assert(size(tTMEM_STORErS_x4) % 4 == 0, "P vector store requires complete uint4 groups");
-      CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < size(tTMEM_STORErS_x4); e += 4) {
-        int k0 = kbase + 4 * e;
-        Element& dst_byte0 = sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32);
-        uint4 packed = make_uint4(
-          tTMEM_STORErS_x4(e + 0),
-          tTMEM_STORErS_x4(e + 1),
-          tTMEM_STORErS_x4(e + 2),
-          tTMEM_STORErS_x4(e + 3));
-#ifdef MXFP8_DBG
-        assert((reinterpret_cast<uintptr_t>(&dst_byte0) & 0xfu) == 0);
-#endif
-        *reinterpret_cast<uint4*>(&dst_byte0) = packed;
-      }
+      Array<Element, kConversionsPerStep> out_conv = convert(in_conv);
+      auto out_words = reinterpret_cast<uint32_t const*>(&out_conv);
+      int k0 = p_kbase + i;
+      Element& dst_byte0 = sP_st(make_coord(p_row, k0 % 32), _0{}, k0 / 32);
+      uint4 packed = make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]);
+      *reinterpret_cast<uint4*>(&dst_byte0) = packed;
     }
 
     cutlass::arch::fence_view_async_shared();
@@ -994,7 +966,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         ? 0.5f
         : 0.5f * fast_exp2f(scale * (old_row_max - row_max_safe));
     row_sum *= acc_scale;
-    // row_sum = sum(reg_S)
+    // Compute row-sum after releasing P so it overlaps the following PV.
     float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
     float2 local_row_sum_1 = make_float2(0, 0);
     float2 local_row_sum_2 = make_float2(0, 0);
@@ -1005,13 +977,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
       cute::add(local_row_sum_f32x2, local_row_sum_f32x2, in);
 
-      in = make_float2(tTMEM_LOADrS(i+2), tTMEM_LOADrS(i+2+1));
+      in = make_float2(tTMEM_LOADrS(i+2), tTMEM_LOADrS(i+3));
       cute::add(local_row_sum_1, local_row_sum_1, in);
 
-      in = make_float2(tTMEM_LOADrS(i+4), tTMEM_LOADrS(i+4+1));
+      in = make_float2(tTMEM_LOADrS(i+4), tTMEM_LOADrS(i+5));
       cute::add(local_row_sum_2, local_row_sum_2, in);
 
-      in = make_float2(tTMEM_LOADrS(i+6), tTMEM_LOADrS(i+6+1));
+      in = make_float2(tTMEM_LOADrS(i+6), tTMEM_LOADrS(i+7));
       cute::add(local_row_sum_3, local_row_sum_3, in);
     }
 
@@ -1228,10 +1200,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
-    const int kCorrectionTileSize = 16;
+    const int kCorrectionTileSize = 8;
 
-    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
-    using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
+    using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b8x;
+    using TMEM_STORE = SM100_TMEM_STORE_32dp32b8x;
 
     typename CollectiveMmaPV::TiledMma mma;
     Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
