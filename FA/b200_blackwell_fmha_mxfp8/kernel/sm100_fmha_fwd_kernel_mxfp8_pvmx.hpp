@@ -476,6 +476,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
            is_softmax_0 ? 0 : 1, blk_coord,
            params.mainloop, logical_problem_shape,
            shared_storage.mainloop_epilogue.mainloop,   // [PVMX 2a.0] TensorStorage: softmax writes P -> smem_p
+           pipeline_load_sfp, pipeline_load_sfp_consumer_state,
            is_softmax_0 ? pipeline_mma_s0 : pipeline_mma_s1,
            is_softmax_0 ? pipeline_mma_s0_consumer_state : pipeline_mma_s1_consumer_state,
            is_softmax_0 ? pipeline_s0_corr : pipeline_s1_corr,

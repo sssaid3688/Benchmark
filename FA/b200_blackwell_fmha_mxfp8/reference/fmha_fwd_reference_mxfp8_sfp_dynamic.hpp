@@ -11,7 +11,7 @@
  *     K: (SK, D)   → SF_K: (SK, D/32)
  *     V: (SK, D)   → SF_V: (SK, D/32)
  *
- *   P: (SQ, SK) → SF_P: (SQ, ceil(SK/32))
+ *   SF_P: treated as scalar 1.0 — P stays in FP32, no quantization.
  *
  * === CUTLASS SF Layout ===========================================================
  *
@@ -55,14 +55,14 @@ static constexpr int kMXFP8GroupSize_sfp = 32;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Reference Kernel
-//   SF_Q, SF_K, SF_P, and SF_V are static inputs.
+//   SF_Q, SF_K, SF_V are used.  P stays in FP32 (SF_P ≡ 1.0).
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<
   class ProblemShapeIn,
   class TensorQ,  class TensorSFQ,
   class TensorK,  class TensorSFK,
-  class TensorSFP, class TensorV,  class TensorSFV,
+  class TensorV,  class TensorSFV,
   class TensorO,  class TensorLSE,
   class Mask
 >
@@ -70,7 +70,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
     ProblemShapeIn problem_shape_in,
     TensorQ  mQ,   TensorSFQ mSFQ,
     TensorK  mK,   TensorSFK mSFK,
-    TensorSFP mSFP, TensorV  mV,   TensorSFV mSFV,
+    TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
     Mask mask) {
 
@@ -86,10 +86,12 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
   int total_k = size<0>(mK);
   int sf_groups = (total_k + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp;
   float* sf_group_data = reinterpret_cast<float*>(mS_mem + total_k * sizeof(ElementAccumulator));
-  float* online_state = sf_group_data + sf_groups;
-  // sf_group_data and online_state 之后：E4M3 类型数组，与 mS 等大小
+  // sf_group_data 之后：E4M3 类型数组，与 mS 等大小
   cutlass::float_e4m3_t* mS_e4m3 = reinterpret_cast<cutlass::float_e4m3_t*>(
-      reinterpret_cast<char*>(online_state) + 3 * sizeof(float));
+      reinterpret_cast<char*>(sf_group_data) + sf_groups * sizeof(float));
+  // mS_e4m3 之后：UE8M0 类型数组，每组一个 scale
+  cutlass::float_ue8m0_t* sf_ue8m0 = reinterpret_cast<cutlass::float_ue8m0_t*>(
+      reinterpret_cast<char*>(mS_e4m3) + total_k * sizeof(cutlass::float_e4m3_t));
 
   ElementAccumulator softmax_scale =
       static_cast<ElementAccumulator>(1.0 / sqrt(1.0 * size<1>(mQ)));
@@ -211,69 +213,90 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
       // }
       // // ==================
 
-      // Match the kernel's online-softmax order. P is quantized tile-by-tile
-      // before PV, so quantizing once after a global softmax is not equivalent.
-      constexpr int kOnlineTileK = 128;
-      int d_chunk = (head_v + blockDim.x - 1) / blockDim.x;
-      int d_begin = threadIdx.x * d_chunk;
-      int d_end   = min(d_begin + d_chunk, head_v);
-      ElementAccumulator acc = 0;
+      // --- Phase 2: Softmax (FP32) ---
+      ElementAccumulator maxS = -std::numeric_limits<ElementAccumulator>::infinity();
+      for (int k = 0; k < size<1>(problem_shape); k++)
+        maxS = std::max<ElementAccumulator>(maxS, mS[k]);
+      if (maxS == -std::numeric_limits<ElementAccumulator>::infinity()) maxS = 0;
 
+      __syncthreads();
+
+      ElementAccumulator sum = 0;
+
+      // Reference correctness matters more than parallelism here.  Keep the
+      // softmax and MXFP8 P quantization serial so each 32-wide scale group has
+      // a deterministic max; the previous parallel max update raced between
+      // threads writing the same sf_group_data entry.
       if (threadIdx.x == 0) {
-        online_state[0] = -std::numeric_limits<ElementAccumulator>::infinity();
-        online_state[1] = 0.0f;
+        int total_k = size<1>(problem_shape);
+
+        for (int g = 0; g < sf_groups; g++) {
+          sf_group_data[g] = 0.0f;
+        }
+
+        for (int k = 0; k < total_k; k++) {
+          mS[k] = expf(softmax_scale * (mS[k] - maxS));
+          sum += mS[k];
+          int g = k / kMXFP8GroupSize_sfp;
+          sf_group_data[g] = max(sf_group_data[g], float(mS[k]));
+        }
+
+        for (int g = 0; g < sf_groups; g++) {
+          int k_begin = g * kMXFP8GroupSize_sfp;
+          int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
+          for (int k = k_begin; k < k_end; k++) {
+            ElementAccumulator val_fp32 = mS[k];
+            val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
+            mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
+          }
+          sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(1.0f);
+        }
+
+        sf_group_data[0] = float(sum);
       }
       __syncthreads();
 
-      for (int tile_begin = 0; tile_begin < size<1>(problem_shape); tile_begin += kOnlineTileK) {
-        int tile_end = min(tile_begin + kOnlineTileK, size<1>(problem_shape));
-        if (threadIdx.x == 0) {
-          ElementAccumulator old_max = online_state[0];
-          ElementAccumulator new_max = old_max;
-          for (int k = tile_begin; k < tile_end; ++k) new_max = max(new_max, mS[k]);
-          if (new_max == -std::numeric_limits<ElementAccumulator>::infinity()) new_max = 0;
-          ElementAccumulator old_scale = old_max == -std::numeric_limits<ElementAccumulator>::infinity()
-              ? 0.0f : expf(softmax_scale * (old_max - new_max));
-          ElementAccumulator tile_sum = 0;
-          for (int k = tile_begin; k < tile_end; ++k) {
-            ElementAccumulator p = expf(softmax_scale * (mS[k] - new_max));
-            tile_sum += p;
-            int g = k / kMXFP8GroupSize_sfp;
-            ElementAccumulator sfp = ElementAccumulator(mSFP(idx_Q + offset_Q, g, idx_L));
-            mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(
-                fminf(448.0f, fmaxf(-448.0f, p / sfp)));
-          }
-          online_state[0] = new_max;
-          online_state[1] = online_state[1] * old_scale + tile_sum;
-          online_state[2] = old_scale;
-        }
-        __syncthreads();
-
-        acc *= ElementAccumulator(online_state[2]);
-        for (int d = d_begin; d < d_end; ++d) {
-          ElementAccumulator tile_acc = 0;
-          for (int k = tile_begin; k < tile_end; ++k) {
-            int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
-            int gp = k / kMXFP8GroupSize_sfp;
-            ElementAccumulator p_fp32 = ElementAccumulator(mS_e4m3[k])
-                * ElementAccumulator(mSFP(idx_Q + offset_Q, gp, idx_L));
-            ElementAccumulator v_fp32 = ElementAccumulator(mV(k + offset_K, d, coord_L))
-                * ElementAccumulator(mSFV(d, gk, idx_L));
-            tile_acc += p_fp32 * v_fp32;
-          }
-          acc += tile_acc;
-        }
-        __syncthreads();
-      }
-
-      ElementAccumulator sum = online_state[1];
+      sum = ElementAccumulator(sf_group_data[0]);
       ElementAccumulator inv_sum = 1.0f / sum;
-      for (int d = d_begin; d < d_end; ++d) {
-        mO(idx_Q + offset_Q, d, coord_L) =
-            static_cast<typename TensorO::value_type>(acc * inv_sum);
+
+      // // ===== Dump all mS (softmax probabilities) =====
+      // if (threadIdx.x == 0) {
+      //   printf("\n[REF] mS[0..%d] after softmax (idx_Q=%d, idx_L=%d):\n  ",
+      //          size<1>(problem_shape) - 1, idx_Q, coord_L);
+      //   for (int k = 0; k < size<1>(problem_shape); k++) {
+      //     printf("%.6f ", (float)mS[k]);
+      //     if ((k + 1) % 16 == 0 && k + 1 < size<1>(problem_shape))
+      //       printf("\n  ");
+      //   }
+      //   printf("\n");
+      // }
+      // // ===============================================
+      // --- Phase 3: P * V (P=fp32, V=MXFP8 dequantized) ---
+      // SFV groups along K-seqlen, matching MMA hardware layout
+      {
+        int d_chunk = (head_v + blockDim.x - 1) / blockDim.x;
+        int d_begin = threadIdx.x * d_chunk;
+        int d_end   = min(d_begin + d_chunk, head_v);
+        for (int d = d_begin; d < d_end; d++) {
+          ElementAccumulator acc = 0;
+          for (int k = 0; k < size<1>(problem_shape); k++) {
+            int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
+            ElementAccumulator p_fp32 =
+                ElementAccumulator(mS_e4m3[k])
+              * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
+
+            ElementAccumulator v_fp32 =
+                ElementAccumulator(mV(k + offset_K, d, coord_L))
+              * ElementAccumulator(mSFV(d, gk, idx_L));
+            acc += p_fp32 * v_fp32;
+          }
+          mO(idx_Q + offset_Q, d, coord_L) =
+              static_cast<typename TensorO::value_type>(acc * inv_sum);
+        }
       }
+
       if (threadIdx.x == 0 && mLSE.data() != nullptr) {
-        mLSE(idx_Q + offset_Q, coord_L) = log(sum) + softmax_scale * online_state[0];
+        mLSE(idx_Q + offset_Q, coord_L) = log(sum) + softmax_scale * maxS;
       }
     }
   }
@@ -287,7 +310,7 @@ template<
   class ProblemShapeIn,
   class TensorQ,  class TensorSFQ,
   class TensorK,  class TensorSFK,
-  class TensorSFP, class TensorV,  class TensorSFV,
+  class TensorV,  class TensorSFV,
   class TensorO,  class TensorLSE,
   class Mask
 >
@@ -295,7 +318,7 @@ void fmha_reference_mxfp8_sfp(
     ProblemShapeIn problem_shape_in,
     TensorQ  mQ,   TensorSFQ mSFQ,
     TensorK  mK,   TensorSFK mSFK,
-    TensorSFP mSFP, TensorV  mV,   TensorSFV mSFV,
+    TensorV  mV,   TensorSFV mSFV,
     TensorO  mO,   TensorLSE mLSE,
     Mask mask) {
 
@@ -305,15 +328,15 @@ void fmha_reference_mxfp8_sfp(
   dim3 block(256);
   int shared_mem = size<0>(mK) * int(sizeof(typename TensorLSE::value_type))       // mS (float)
                  + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(float)  // sf_group_data
-                 + 3 * sizeof(float)                                                        // online_state
-                 + size<0>(mK) * sizeof(cutlass::float_e4m3_t);                             // mS_e4m3
+                 + size<0>(mK) * sizeof(cutlass::float_e4m3_t)                              // mS_e4m3
+                 + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(cutlass::float_ue8m0_t); // sf_ue8m0
   cudaError_t result;
   if (shared_mem >= (48 << 10)) {
     result = cudaFuncSetAttribute(
         &fmha_reference_mxfp8_kernel_sfp<
             ProblemShapeIn,
             TensorQ, TensorSFQ, TensorK, TensorSFK,
-            TensorSFP, TensorV, TensorSFV,
+            TensorV, TensorSFV,
             TensorO, TensorLSE, Mask>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
     if (cudaSuccess != result) {
@@ -325,7 +348,7 @@ void fmha_reference_mxfp8_sfp(
   }
   fmha_reference_mxfp8_kernel_sfp<<<grid, block, shared_mem>>>(
       problem_shape_in,
-      mQ, mSFQ, mK, mSFK, mSFP, mV, mSFV,
+      mQ, mSFQ, mK, mSFK, mV, mSFV,
       mO, mLSE, mask);
 }
 

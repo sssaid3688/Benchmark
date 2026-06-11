@@ -41,7 +41,6 @@
  ***************************************************************************************************/
 #pragma once
 
-// ── Fast exp2 approximation using PTX ex2.approx instruction ──
 __device__ __forceinline__ float fast_exp2f(float x) {
     float result;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
@@ -903,6 +902,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     constexpr int kConversionsPerStep = 16;
     NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
     Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
+    Tensor sSFP_full = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
+    Tensor sSFP_st = sSFP_full(_, _, _, sbuf);
     const int p_row = thread_idx;
     const int p_kbase = int(nHalf);
 
@@ -935,7 +936,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < kConversionsPerStep; j++) {
-        in_conv[j] = tTMEM_LOADrS(i + j);
+        int local_k = p_kbase + i + j;
+        int sf_group = local_k / 32;
+        auto sf_coord = make_coord(
+            make_coord(make_coord(make_coord(p_row % 32, p_row / 32), _0{}),
+                       make_coord(_0{}, _0{})),
+            _0{}, make_coord(sf_group, _0{}));
+        ElementQK sfp = ElementQK(sSFP_st(sf_coord));
+        ElementQK val_fp32 = tTMEM_LOADrS(i + j) / sfp;
+        in_conv[j] = fminf(448.0f, fmaxf(-448.0f, val_fp32));
       }
       Array<Element, kConversionsPerStep> out_conv = convert(in_conv);
       auto out_words = reinterpret_cast<uint32_t const*>(&out_conv);
@@ -1030,6 +1039,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       BlkCoord const& blk_coord,
       Params const& params, ProblemShape const& problem_shape,
       TensorStorage& storage,    // [PVMX 2a.0] softmax writes P -> storage.smem_p
+      PipelineSFP& pipeline_sfp, typename PipelineSFP::PipelineState& pipeline_sfp_consumer_state,
       PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
       OrderBarrierSoftmax& order_s) {
@@ -1057,6 +1067,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+      if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       softmax_step<false /* need_apply_mask */>(
           row_max, row_sum, stage,
           (mask_tile_count == 1) &&
@@ -1066,6 +1077,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
@@ -1075,6 +1087,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+      if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       softmax_step<true /* need_apply_mask */>(
           row_max, row_sum, stage, mask_tile_count == 1,
           blk_coord, cS, params, problem_shape, storage,
@@ -1082,6 +1095,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }

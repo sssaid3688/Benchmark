@@ -158,7 +158,7 @@ struct Options {
   
   InitStyle init_style_sfq = InitStyle::kRandom;
   InitStyle init_style_sfk = InitStyle::kRandom;
-  InitStyle init_style_sfp = InitStyle::kOne;
+  InitStyle init_style_sfp = InitStyle::kRandom;
   InitStyle init_style_sfv = InitStyle::kRandom;
 
   static void get_init_style_argument(cutlass::CommandLine& cmd, const char* name, InitStyle& dst, InitStyle const& src) {
@@ -381,9 +381,10 @@ void initialize_block(
     }
     case InitStyle::kRandom: {
       if constexpr (std::is_same_v<Element, cutlass::float_ue8m0_t>) {
-        // Scale factors use random values in [0, 1], avoiding 2x/4x amplification.
+        // Keep random UE8M0 scales positive and at most 0.5 so verification
+        // exercises static scaling without amplifying absolute output error.
         std::mt19937 gen(static_cast<unsigned int>(seed));
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        std::uniform_real_distribution<float> dist(0.0625f, 0.5f);
         std::vector<Element> data(block.size());
         for (size_t i = 0; i < block.size(); ++i) {
           data[i] = static_cast<Element>(dist(gen));
@@ -559,11 +560,12 @@ struct FwdRunner {
     DeviceAllocation<ElementData> block_V;
     DeviceAllocation<ElementScale> block_SFQ;
     DeviceAllocation<ElementScale> block_SFK;
-    DeviceAllocation<ElementScale> block_SFP;  // Dummy only; P scale is generated tile-locally in SMEM.
+    DeviceAllocation<ElementScale> block_SFP;
     DeviceAllocation<ElementScale> block_SFV;
     // Row-major SF buffer for reference verification
     DeviceAllocation<ElementScale> block_ref_SFQ;
     DeviceAllocation<ElementScale> block_ref_SFK;
+    DeviceAllocation<ElementScale> block_ref_SFP;
     DeviceAllocation<ElementScale> block_ref_SFV;
     DeviceAllocation<ElementOut> block_O;
     DeviceAllocation<ElementAccumulatorPV> block_LSE;
@@ -583,7 +585,7 @@ struct FwdRunner {
           + device_cumulative_seqlen_kv.get_storage_size() + block_SFQ.get_storage_size() + 
           block_SFK.get_storage_size() + block_SFV.get_storage_size() + block_SFP.get_storage_size()
           + block_ref_SFQ.get_storage_size() + block_ref_SFK.get_storage_size()
-          + block_ref_SFV.get_storage_size();
+          + block_ref_SFP.get_storage_size() + block_ref_SFV.get_storage_size();
     }
   };
 
@@ -630,10 +632,10 @@ struct FwdRunner {
     int SF_D = D / 32;  // =4 when D=128
     // printf("SQ:%d, SK:%d, H_KV:%d, H:%d, B:%d, SF_D:%d\n",SQ,SK,H_KV,H,B,SF_D);
     // D=128 → D/32=4 → K_tiling=1 → CUTLASS SF layout = simple row-major
-    // SF_P treated as 1.0 (P stays in FP32)
     auto sfQ = make_mxfp8_sf_tensor(buffer.block_ref_SFQ.get(), SQ, SF_D, H * B);
     auto sfK = make_mxfp8_sf_tensor(buffer.block_ref_SFK.get(), SK, SF_D, H_KV * B);
     int SF_K = (K + 31) / 32;  // ceil(K/32) — SFV groups along K-seqlen
+    auto sfP = make_mxfp8_sf_tensor(buffer.block_ref_SFP.get(), SQ, SF_K, H * B);
     auto sfV = make_mxfp8_sf_tensor(buffer.block_ref_SFV.get(), D, SF_K, H_KV * B);
     
     //     // Dump raw SF_K buffer from device to verify layout
@@ -762,7 +764,7 @@ struct FwdRunner {
     // // ====================================================================
 
     fmha_reference_mxfp8_sfp(problem_shape_ref,
-        mQ, sfQ, mK, sfK, mV, sfV, mO, mLSE, ActiveMask{});
+        mQ, sfQ, mK, sfK, sfP, mV, sfV, mO, mLSE, ActiveMask{});
 
 #else
     fmha_reference(problem_shape_ref, mQ, mK, mV, mO, mLSE, ActiveMask{});
@@ -948,16 +950,7 @@ struct FwdRunner {
     // std::cout<<"layout_SFQTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     // std::cout<<"layout_SFK_tempTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     auto problem_size_pv = select<0,2,1,3>(problem_size);
-    // Static P quantization uses one all-ones SFP tile, reloaded for every PV
-    // tile. Avoid materializing an unnecessary Q x K x H global SFP tensor.
-    using TileShapePVForSFP = typename Mainloop::TileShapePV;
-    int dummy_sfp_m = size<0>(TileShapePVForSFP{});
-    int dummy_sfp_n = size<1>(TileShapePVForSFP{});
-    int dummy_sfp_k = size<2>(TileShapePVForSFP{});
-    auto dummy_sfp_problem_size = cute::make_tuple(
-        dummy_sfp_m, dummy_sfp_n, dummy_sfp_k,
-        cute::make_tuple(cute::make_tuple(1, 1), 1));
-    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(dummy_sfp_problem_size);
+    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(problem_size_pv);
     layout_SFV = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFB(problem_size_pv);
     
     // printf("layout_SFQ: ");
@@ -1038,6 +1031,7 @@ struct FwdRunner {
         size_t ref_sfk_sz = (size_t)SK_loc * SF_D_loc * H_K_loc * B_loc;
         buffer.block_ref_SFQ.reset(ref_sfq_sz);
         buffer.block_ref_SFK.reset(ref_sfk_sz);
+        buffer.block_ref_SFP.reset((size_t)SQ_loc * SF_K_loc * H_loc * B_loc);
         buffer.block_ref_SFV.reset((size_t)D_loc * SF_K_loc * H_K_loc * B_loc);
         
         auto fill_ref = [&](auto& kernel_buf, auto& ref_buf, int rows, int hb, auto& layout_sf) {
@@ -1073,6 +1067,41 @@ struct FwdRunner {
         
         fill_ref(buffer.block_SFQ, buffer.block_ref_SFQ, SQ_loc, H_loc * B_loc, layout_SFQ);
         fill_ref(buffer.block_SFK, buffer.block_ref_SFK, SK_loc, H_K_loc * B_loc, layout_SFK);
+        // SFP: CUTLASS layout is (Q, K/32, H*B), with four scale groups per
+        // 128-row atom tile.
+        {
+          int sfp_rows = SQ_loc;
+          int sfp_groups = SF_K_loc;
+          int sfp_hb = H_loc * B_loc;
+          size_t row_tiles = (static_cast<size_t>(sfp_rows) + 127) / 128;
+          size_t group_tiles = (static_cast<size_t>(sfp_groups) + 3) / 4;
+          size_t per_hb = 512 * row_tiles * group_tiles;
+          size_t n_kernel_sfp = cosize(layout_SFP);
+          size_t n_ref_sfp = (size_t)sfp_rows * sfp_groups * sfp_hb;
+          std::vector<ElementScale> host_kernel_sfp(n_kernel_sfp);
+          std::vector<ElementScale> host_ref_sfp(n_ref_sfp, ElementScale(0));
+          cudaMemcpy(host_kernel_sfp.data(), buffer.block_SFP.get(),
+                     n_kernel_sfp * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+          for (int r = 0; r < sfp_rows; ++r) {
+            size_t row_inner = static_cast<size_t>(r % 32) * 16
+                             + static_cast<size_t>((r / 32) % 4) * 4;
+            size_t row_tile = static_cast<size_t>(r / 128);
+            for (int g = 0; g < sfp_groups; ++g) {
+              size_t group_inner = static_cast<size_t>(g % 4);
+              size_t group_tile = static_cast<size_t>(g / 4);
+              size_t cutlass_base = row_inner + group_inner
+                  + (row_tile * group_tiles + group_tile) * 512;
+              for (int h = 0; h < sfp_hb; ++h) {
+                size_t cutlass_idx = cutlass_base + static_cast<size_t>(h) * per_hb;
+                size_t rm_idx = static_cast<size_t>(r) * sfp_groups + static_cast<size_t>(g)
+                    + static_cast<size_t>(h) * sfp_rows * sfp_groups;
+                if (cutlass_idx < n_kernel_sfp) host_ref_sfp[rm_idx] = host_kernel_sfp[cutlass_idx];
+              }
+            }
+          }
+          cudaMemcpy(buffer.block_ref_SFP.get(), host_ref_sfp.data(),
+                     n_ref_sfp * sizeof(ElementScale), cudaMemcpyHostToDevice);
+        }
         // SFV: CUTLASS layout has shape (D=128, K/32, H_K*B), groups along K-seqlen
         // Reference buffer is row-major (D, K/32, H_K*B) with stride (K/32, 1, D*K/32)
         // CUTLASS SfAtom: mode0=(d%32)*16+(d/32)*4 for 128 rows, mode1=kg (flat offset),
