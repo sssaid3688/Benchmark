@@ -150,6 +150,11 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     # 设置精度宏 (MXFP8)
     target_compile_definitions(sb200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO} MXFP8_N128)
 
+    # [2-CTA] 通过 -DFMHA_2CTA_FLAG=1 配置开启 2-SM cluster 前向路径（默认关，保留 1-CTA 基线）
+    if(FMHA_2CTA_FLAG)
+      target_compile_definitions(sb200_blackwell_fmha_${PREC} PRIVATE FMHA_2CTA)
+    endif()
+
     # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
     # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
     target_compile_options(sb200_blackwell_fmha_${PREC} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

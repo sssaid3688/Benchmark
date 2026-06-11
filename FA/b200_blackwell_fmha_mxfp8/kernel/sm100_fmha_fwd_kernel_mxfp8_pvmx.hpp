@@ -162,7 +162,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
   using ClusterShape = typename CollectiveMainloop::ClusterShape;
 
-  using TmemAllocator = cute::TMEM::Allocator1Sm;
+  // [2-CTA] When the cluster spans 2 CTAs (M=2), TMEM is allocated cooperatively
+  // across the pair (tcgen05.alloc.cta_group::2); both CTAs pass the same base ptr.
+  using TmemAllocator = cute::conditional_t<
+      (cute::size(ClusterShape{}) == 1),
+      cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
   struct SharedStorage {
     using UnionType = union {
@@ -195,6 +199,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       alignas(16) typename CollectiveMainloop::PipelineO::SharedStorage mma_corr;
       alignas(16) typename CollectiveMainloop::PipelineE::SharedStorage corr_epi;
       alignas(16) typename CollectiveMainloop::OrderBarrierSoftmax::SharedStorage order_s01;
+      // [2-CTA] pairs the two CTAs' tcgen05.dealloc at kernel exit (unused 1-CTA).
+      alignas(16) cutlass::arch::ClusterBarrier tmem_dealloc;
     } pipelines;
 
     uint32_t tmem_base_ptr;
@@ -263,6 +269,16 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     auto role = warp_idx_to_WarpRole(warp_idx);
     uint32_t lane_predicate = cute::elect_one_sync();
 
+    // [2-CTA] pair-leader predicate. Under the 2-SM MMA atom, ALL cta_group::2
+    // TMA complete-tx bytes and ALL UMMA-pipeline consumer releases funnel to the
+    // EVEN-rank CTA's barriers (peer bit is masked off in the arch ops), and only
+    // the leader CTA may issue tcgen05 mma/cp/commit. 1-CTA: kAtomThrM == 1,
+    // leader is always true and everything below degrades to the original code.
+    static constexpr int kAtomThrM =
+        cute::size(typename CollectiveMainloop::CollectiveMmaQK::AtomThrShapeMNK{});
+    int cta_rank_in_pair = int(cute::block_rank_in_cluster()) % kAtomThrM;
+    bool is_mma_leader_cta = (cta_rank_in_pair == 0);
+
     if (role == WarpRole::Load && lane_predicate) {
       CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
     }
@@ -290,7 +306,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::MMA) {
       pipeline_load_q_params.role = CollectiveMainloop::PipelineQ::ThreadCategory::Consumer;
     }
-    pipeline_load_q_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    // [2-CTA] expect-tx may only be armed on the pair-leader CTA's barrier (the
+    // odd CTA's full barrier never receives any complete-tx and would wedge).
+    pipeline_load_q_params.is_leader = lane_predicate && (role == WarpRole::Load) && is_mma_leader_cta;
     pipeline_load_q_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadQ;
     typename CollectiveMainloop::PipelineQ pipeline_load_q(
       shared_storage.pipelines.load_q,
@@ -304,7 +322,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::MMA) {
       pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Consumer;
     }
-    pipeline_load_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    pipeline_load_kv_params.is_leader = lane_predicate && (role == WarpRole::Load) && is_mma_leader_cta;
     pipeline_load_kv_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadK;
     typename CollectiveMainloop::PipelineKV pipeline_load_kv(
       shared_storage.pipelines.load_kv,
@@ -318,7 +336,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::MMA) {
       pipeline_load_sfp_params.role = CollectiveMainloop::PipelineSFP::ThreadCategory::Consumer;
     }
-    pipeline_load_sfp_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    pipeline_load_sfp_params.is_leader = lane_predicate && (role == WarpRole::Load) && is_mma_leader_cta;
     pipeline_load_sfp_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadSFP;
     typename CollectiveMainloop::PipelineSFP pipeline_load_sfp(
       shared_storage.pipelines.load_sfp,
@@ -329,10 +347,19 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::MMA) {
       pipeline_mma_s0_params.role = CollectiveMainloop::PipelineS::ThreadCategory::Producer;
     }
-    if (role == WarpRole::Softmax0) {
+    // [loose split-N] BOTH softmax groups are real consumers of the single S
+    // pipeline: each group waits the QK commit itself (replaces the B_SREADY
+    // rendezvous) and releases independently after writing its own P half
+    // (replaces B_PDONE — the MMA's empty barrier waits for both groups'
+    // arrivals). Decoupling the groups lets them drift and de-bursts the MUFU.
+    if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
       pipeline_mma_s0_params.role = CollectiveMainloop::PipelineS::ThreadCategory::Consumer;
     }
-    pipeline_mma_s0_params.consumer_arv_count = NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+    // [2-CTA] consumer_release of a 2-SM UMMA pipeline routes EVERY consumer
+    // thread of BOTH CTAs to the leader's empty barrier (umma_arrive_2x1SM_sm0),
+    // so the count must cover the whole pair (pristine GEMM: ×size(AtomThrShape)).
+    // [loose split-N] ×2: both softmax groups release.
+    pipeline_mma_s0_params.consumer_arv_count = kAtomThrM * 2 * NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineS pipeline_mma_s0(
       shared_storage.pipelines.mma_s0,
       pipeline_mma_s0_params,
@@ -345,7 +372,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::Softmax1) {
       pipeline_mma_s1_params.role = CollectiveMainloop::PipelineS::ThreadCategory::Consumer;
     }
-    pipeline_mma_s1_params.consumer_arv_count = NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+    pipeline_mma_s1_params.consumer_arv_count = kAtomThrM * NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineS pipeline_mma_s1(
       shared_storage.pipelines.mma_s1,
       pipeline_mma_s1_params,
@@ -386,7 +413,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     if (role == WarpRole::Correction) {
       pipeline_mma_corr_params.role = CollectiveMainloop::PipelineO::ThreadCategory::Consumer;
     }
-    pipeline_mma_corr_params.consumer_arv_count = NumWarpsCorrection * cutlass::NumThreadsPerWarp;
+    pipeline_mma_corr_params.consumer_arv_count = kAtomThrM * NumWarpsCorrection * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineO pipeline_mma_corr(
       shared_storage.pipelines.mma_corr,
       pipeline_mma_corr_params,
@@ -414,13 +441,36 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     TmemAllocator tmem_allocator;
 
+    // [2-CTA] init the dealloc-pairing barrier before the cluster-wide
+    // pipeline-init handshake publishes all barriers (arrive count = the peer's
+    // epilogue warp, which performs the handshake before free()).
+    if constexpr (kAtomThrM > 1) {
+      if (warp_idx == 0 && lane_predicate) {
+        shared_storage.pipelines.tmem_dealloc.init(NumWarpsEpilogue * cutlass::NumThreadsPerWarp);
+      }
+    }
+
     __syncthreads();
 
     pipeline_load_q.init_masks(ClusterShape{});
     pipeline_load_kv.init_masks(ClusterShape{});
+    // [2-CTA] SFP was the one UMMA pipeline missing its mask init: with mask 0 the
+    // MMA warp's consumer_release (tcgen05.commit multicast) signals NO CTA and the
+    // load warp deadlocks on the SFP empty barrier. No-op under 1-CTA.
+    pipeline_load_sfp.init_masks(ClusterShape{});
     pipeline_mma_s0.init_masks(ClusterShape{});
     pipeline_mma_s1.init_masks(ClusterShape{});
     pipeline_mma_corr.init_masks(ClusterShape{});
+
+    // [2-CTA] cluster-wide barrier: guarantee every CTA in the cluster has its
+    // pipeline mbarriers initialized & visible before any cross-CTA UMMA
+    // arrive/commit or multicast TMA. Missing this deadlocks the 2-SM path.
+    // For 1-CTA (cluster_size == 1) both calls degrade to __syncthreads().
+    {
+      int cluster_size = cute::size(ClusterShape{});
+      cutlass::pipeline_init_arrive_relaxed(cluster_size);
+      cutlass::pipeline_init_wait(cluster_size);
+    }
 
     typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_consumer_state;
     typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineQ>();
@@ -472,12 +522,14 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         bool is_softmax_0 = role == WarpRole::Softmax0;
 
+        // [loose split-N] both groups consume the SAME (s0) pipeline; each warp
+        // keeps its own thread-local PipelineState copy (s1 pipeline stays inert).
         mainloop.softmax(
            is_softmax_0 ? 0 : 1, blk_coord,
            params.mainloop, logical_problem_shape,
            shared_storage.mainloop_epilogue.mainloop,   // [PVMX 2a.0] TensorStorage: softmax writes P -> smem_p
-           is_softmax_0 ? pipeline_mma_s0 : pipeline_mma_s1,
-           is_softmax_0 ? pipeline_mma_s0_consumer_state : pipeline_mma_s1_consumer_state,
+           pipeline_mma_s0,
+           pipeline_mma_s0_consumer_state,
            is_softmax_0 ? pipeline_s0_corr : pipeline_s1_corr,
            is_softmax_0 ? pipeline_s0_corr_producer_state : pipeline_s1_corr_producer_state,
            order_s01
@@ -557,6 +609,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         if (!allocated) {
           tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+          // [2-CTA] release the cta_group::2 allocation permit so the peer CTA's
+          // alloc/dealloc can proceed (pristine 2-SM GEMM does this after alloc).
+          tmem_allocator.release_allocation_lock();
           __syncwarp();
           allocated = true;
         }
@@ -565,17 +620,23 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        mainloop.mma(
-          blk_coord,
-          params.mainloop, logical_problem_shape,
-          shared_storage.mainloop_epilogue.mainloop,
-          pipeline_load_q, pipeline_load_q_consumer_state,
-          pipeline_load_kv, pipeline_load_kv_consumer_state,
-          pipeline_load_sfp, pipeline_load_sfp_consumer_state,
-          pipeline_mma_s0, pipeline_mma_s0_producer_state,
-          pipeline_mma_s1, pipeline_mma_s1_producer_state,
-          pipeline_mma_corr, pipeline_mma_corr_producer_state
-        );
+        // [2-CTA] only the pair-leader CTA issues UMMA work: tcgen05 mma/cp/commit
+        // are cta_group::2 collective ops, the leader's full barriers receive ALL
+        // TMA bytes, and its empty barriers receive ALL consumer releases. The
+        // peer CTA's MMA warp only participates in the TMEM allocation above.
+        if (is_mma_leader_cta) {
+          mainloop.mma(
+            blk_coord,
+            params.mainloop, logical_problem_shape,
+            shared_storage.mainloop_epilogue.mainloop,
+            pipeline_load_q, pipeline_load_q_consumer_state,
+            pipeline_load_kv, pipeline_load_kv_consumer_state,
+            pipeline_load_sfp, pipeline_load_sfp_consumer_state,
+            pipeline_mma_s0, pipeline_mma_s0_producer_state,
+            pipeline_mma_s1, pipeline_mma_s1_producer_state,
+            pipeline_mma_corr, pipeline_mma_corr_producer_state
+          );
+        }
 
       }
     }
@@ -631,8 +692,13 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         has_valid = true;
 
+        // [2-CTA] the epilogue is instantiated with the PER-CTA tile (M=128):
+        // each CTA stores its own 128-row half of the cooperative M-tile, so the
+        // per-CTA O tile index is atom_m * m + cta_rank. 1-CTA: identity.
+        auto blk_coord_epi = replace<0>(blk_coord, kAtomThrM * get<0>(blk_coord) + cta_rank_in_pair);
+
         epilogue.store(
-          blk_coord, logical_problem_shape,
+          blk_coord_epi, logical_problem_shape,
           params.epilogue, params.problem_shape,
           epilogue_storage,
           pipeline_corr_epi, pipeline_corr_epi_consumer_state
@@ -643,6 +709,17 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       static_assert(NumWarpsEpilogue <= 1);
       if constexpr (NumWarpsEpilogue == 1) {
         if(has_valid) {
+          // [2-CTA] tcgen05.dealloc.cta_group::2 frees the PAIR-wide allocation:
+          // neither CTA may free while its peer still issues tcgen05 ops. Same
+          // handshake as pristine GEMM: follower arrives first, leader waits,
+          // leader arrives back, follower waits — then both free.
+          if constexpr (kAtomThrM > 1) {
+            auto& dealloc_bar = shared_storage.pipelines.tmem_dealloc;
+            uint32_t peer_rank = uint32_t(cute::block_rank_in_cluster()) ^ 1;
+            dealloc_bar.arrive(peer_rank, !is_mma_leader_cta);
+            dealloc_bar.wait(0);
+            dealloc_bar.arrive(peer_rank, is_mma_leader_cta);
+          }
           uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
           tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
         }

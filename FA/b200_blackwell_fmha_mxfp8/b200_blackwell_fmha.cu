@@ -158,7 +158,9 @@ struct Options {
   
   InitStyle init_style_sfq = InitStyle::kRandom;
   InitStyle init_style_sfk = InitStyle::kRandom;
-  InitStyle init_style_sfp = InitStyle::kOne;
+  // [real static SFP] P's static quantization scale factors are RANDOM ue8m0
+  // (powers of two in (0,1]) over the full (SQ, ceil(K/32), H*B) tensor.
+  InitStyle init_style_sfp = InitStyle::kRandom;
   InitStyle init_style_sfv = InitStyle::kRandom;
 
   static void get_init_style_argument(cutlass::CommandLine& cmd, const char* name, InitStyle& dst, InitStyle const& src) {
@@ -501,12 +503,18 @@ struct FwdRunner {
       TileShape, StrideQ, StrideK, StrideV,
       ActiveMask
     >;
+  // [2-CTA] the epilogue is PER-CTA: each CTA owns and stores only its own
+  // M-half of the cooperative tile, so the epilogue tile is TileShapePV /
+  // AtomThrShape (128 rows). Under 1-CTA this is TileShapePV unchanged.
+  using EpilogueTileShape = decltype(cute::shape_div(
+      typename Mainloop::TileShapePV{},
+      typename Mainloop::CollectiveMmaPV::AtomThrShapeMNK{}));
   using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
       ProblemShapeType,
       Mainloop,
       cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
         ElementOut, ElementAccumulatorPV,
-        typename Mainloop::TileShapePV,
+        EpilogueTileShape,
         StrideO, StrideLSE
       >,
       TileScheduler,
@@ -565,6 +573,7 @@ struct FwdRunner {
     DeviceAllocation<ElementScale> block_ref_SFQ;
     DeviceAllocation<ElementScale> block_ref_SFK;
     DeviceAllocation<ElementScale> block_ref_SFV;
+    DeviceAllocation<ElementScale> block_ref_SFP;   // [real static SFP] row-major (SQ, ceil(K/32), H*B)
     DeviceAllocation<ElementOut> block_O;
     DeviceAllocation<ElementAccumulatorPV> block_LSE;
     DeviceAllocation<ElementOut> block_ref_O;
@@ -761,8 +770,11 @@ struct FwdRunner {
     // }
     // // ====================================================================
 
+    // [real static SFP] row-major SFP for the reference: (SQ, ceil(K/32), H*B)
+    auto sfP = make_mxfp8_sf_tensor(buffer.block_ref_SFP.get(), SQ, SF_K, H * B);
+
     fmha_reference_mxfp8_sfp(problem_shape_ref,
-        mQ, sfQ, mK, sfK, mV, sfV, mO, mLSE, ActiveMask{});
+        mQ, sfQ, mK, sfK, mV, sfV, sfP, mO, mLSE, ActiveMask{});
 
 #else
     fmha_reference(problem_shape_ref, mQ, mK, mV, mO, mLSE, ActiveMask{});
@@ -948,16 +960,9 @@ struct FwdRunner {
     // std::cout<<"layout_SFQTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     // std::cout<<"layout_SFK_tempTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     auto problem_size_pv = select<0,2,1,3>(problem_size);
-    // Static P quantization uses one all-ones SFP tile, reloaded for every PV
-    // tile. Avoid materializing an unnecessary Q x K x H global SFP tensor.
-    using TileShapePVForSFP = typename Mainloop::TileShapePV;
-    int dummy_sfp_m = size<0>(TileShapePVForSFP{});
-    int dummy_sfp_n = size<1>(TileShapePVForSFP{});
-    int dummy_sfp_k = size<2>(TileShapePVForSFP{});
-    auto dummy_sfp_problem_size = cute::make_tuple(
-        dummy_sfp_m, dummy_sfp_n, dummy_sfp_k,
-        cute::make_tuple(cute::make_tuple(1, 1), 1));
-    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(dummy_sfp_problem_size);
+    // [real static SFP] the static P scale factors cover the FULL PV problem
+    // ((SQ rows) x (K/32 groups) x (H*B)) — every PV tile loads its own slice.
+    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(problem_size_pv);
     layout_SFV = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFB(problem_size_pv);
     
     // printf("layout_SFQ: ");
@@ -995,7 +1000,15 @@ struct FwdRunner {
 
       buffer.block_SFQ.reset(size(filter_zeros(layout_SFQ)));
       buffer.block_SFK.reset(size(filter_zeros(layout_SFK)));
-      buffer.block_SFP.reset(size(filter_zeros(layout_SFP)));
+      // [real static SFP] per-mode product in size_t: the flat size() of the
+      // full-problem SFP layout overflows int32 beyond ~2^31 elements (~46k²·40).
+      {
+        auto sfp_fz = filter_zeros(layout_SFP);
+        size_t sfp_elems = size_t(cute::size<0>(sfp_fz))
+                         * size_t(cute::size<1>(sfp_fz))
+                         * size_t(cute::size<2>(sfp_fz));
+        buffer.block_SFP.reset(sfp_elems);
+      }
       buffer.block_SFV.reset(size(filter_zeros(layout_SFV)));
 
 
@@ -1039,6 +1052,7 @@ struct FwdRunner {
         buffer.block_ref_SFQ.reset(ref_sfq_sz);
         buffer.block_ref_SFK.reset(ref_sfk_sz);
         buffer.block_ref_SFV.reset((size_t)D_loc * SF_K_loc * H_K_loc * B_loc);
+        buffer.block_ref_SFP.reset((size_t)SQ_loc * SF_K_loc * H_loc * B_loc);   // [real static SFP]
         
         auto fill_ref = [&](auto& kernel_buf, auto& ref_buf, int rows, int hb, auto& layout_sf) {
           if (hb == 0 || SF_D_loc == 0) return;
@@ -1109,10 +1123,45 @@ struct FwdRunner {
           }
           cudaMemcpy(buffer.block_ref_SFV.get(), host_ref_sfv.data(),
                      n_ref_sfv * sizeof(ElementScale), cudaMemcpyHostToDevice);
-        
+
           // Simple random SFV initialization (user requested keep random)
           // No override needed — random SFV already set by initialize_block above
         }  // end SFV-specific block
+
+        // [real static SFP] repack the swizzled kernel SFP into the row-major
+        // (SQ, ceil(K/32), H*B) reference buffer. Index through the cute layout
+        // object itself (mode-1 takes the K-ELEMENT coordinate; the stride-0
+        // sub-mode realizes the 32:1 sharing), avoiding hand-rolled formulas.
+        {
+          size_t n_kernel_sfp = cosize(layout_SFP);
+          size_t n_ref_sfp = (size_t)SQ_loc * SF_K_loc * H_loc * B_loc;
+          std::vector<ElementScale> host_kernel_sfp(n_kernel_sfp);
+          std::vector<ElementScale> host_ref_sfp(n_ref_sfp, ElementScale(0));
+          cudaMemcpy(host_kernel_sfp.data(), buffer.block_SFP.get(),
+                     n_kernel_sfp * sizeof(ElementScale), cudaMemcpyDeviceToHost);
+          for (int r = 0; r < SQ_loc; r++) {
+            for (int kg = 0; kg < SF_K_loc; kg++) {
+              size_t cutlass_idx = layout_SFP(cute::make_coord(
+                  r, kg * 32, cute::make_coord(cute::_0{}, 0)));
+              size_t hb_stride;
+              {
+                // per-(head*batch) stride from the layout itself
+                size_t idx_hb1 = layout_SFP(cute::make_coord(
+                    0, 0, cute::make_coord(cute::_0{}, (H_loc * B_loc > 1) ? 1 : 0)));
+                hb_stride = idx_hb1;  // == 0 when only one head*batch
+              }
+              for (int h = 0; h < H_loc * B_loc; h++) {
+                size_t cidx = cutlass_idx + (size_t)h * hb_stride;
+                size_t rm_idx = (size_t)r * SF_K_loc + kg + (size_t)h * SQ_loc * SF_K_loc;
+                if (cidx < n_kernel_sfp && rm_idx < n_ref_sfp) {
+                  host_ref_sfp[rm_idx] = host_kernel_sfp[cidx];
+                }
+              }
+            }
+          }
+          cudaMemcpy(buffer.block_ref_SFP.get(), host_ref_sfp.data(),
+                     n_ref_sfp * sizeof(ElementScale), cudaMemcpyHostToDevice);
+        }
       }  // end fill_ref outer block
       
       size_t total_sfq = size(filter_zeros(layout_SFQ));
@@ -1551,14 +1600,26 @@ void run_fwd_128(Mask fusion, Options const & options, cutlass::KernelHardwareIn
 
   using HeadDim = _128;
 #if defined(MXFP8_N128)
+#if defined(FMHA_2CTA)
+  // [2-CTA] M=256 super-tile, split across the 2-CTA cluster (each CTA owns M=128).
+  using CtaM = _256;
+#else
   using CtaM = _128;
+#endif
 #else
   using CtaM = _256;
 #endif
 
   if (options.persistent) {
+#if defined(FMHA_2CTA)
+    // [2-CTA] PersistentTileScheduler is not cluster-aware (the two CTAs of a
+    // pair would decode DIFFERENT tiles); fall back to the individual scheduler.
+    std::cerr << "[FMHA_2CTA] --persistent is not supported on the 2-CTA path; using individual scheduler.\n";
+    run(Shape<CtaM, _128, HeadDim>{}, "tma ws n128 acc fp32 individual", Option<Tag::kIsPersistent, false_type>{});
+#else
     // Persistent Tile Scheduler
     run(Shape<CtaM, _128, HeadDim>{}, "tma ws n128 acc fp32 persistent", Option<Tag::kIsPersistent, true_type>{});
+#endif
   }
   else {
     // Individual Tile Scheduler
