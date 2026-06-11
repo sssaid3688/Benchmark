@@ -45,20 +45,28 @@ struct IndividualTileScheduler {
 
   struct Params {
     dim3 grid;
+    int cluster_m = 1;   // [2-CTA] CTAs per cooperative M-tile (cluster M extent)
   };
 
   bool valid_ = true;
+  int cluster_m_ = 1;
 
   CUTLASS_DEVICE
-  IndividualTileScheduler(Params const&) {}
+  IndividualTileScheduler(Params const& p) : cluster_m_(p.cluster_m) {}
 
   template<class ProblemSize, class ClusterShape, class TileShape>
   static Params to_underlying_arguments(
       ProblemSize const& problem_size, KernelHardwareInfo hw_info,
       ClusterShape const& cluster_shape, TileShape const& tile_shape) {
     using namespace cute;
-    dim3 grid(round_up(ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<0>(cluster_shape)), size<3,0>(problem_size), size<3,1>(problem_size));
-    return Params{ grid };
+    // [2-CTA] One cooperative M-tile (TileShape M = 256 under FMHA_2CTA) is handled
+    // by a cluster of cluster_m CTAs. grid.x = num_m_tiles * cluster_m so the cluster
+    // launch (cluster dim = cluster_m) yields exactly num_m_tiles clusters. For 1-CTA
+    // (cluster_m == 1) this reduces to the original grid.x = num_m_tiles.
+    int cluster_m = size<0>(cluster_shape);
+    int num_m = ceil_div(size<0>(problem_size), size<0>(tile_shape));
+    dim3 grid(num_m * cluster_m, size<3,0>(problem_size), size<3,1>(problem_size));
+    return Params{ grid, cluster_m };
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -73,7 +81,10 @@ struct IndividualTileScheduler {
   CUTLASS_DEVICE
   auto get_block_coord() {
     using namespace cute;
-    return make_coord(blockIdx.x, _0{}, make_coord(blockIdx.y, blockIdx.z));
+    // [2-CTA] both CTAs of a cluster share the same cooperative M-tile index
+    // (blockIdx.x / cluster_m); the 2-SM MMA atom splits the 256-row tile into the
+    // two CTAs' 128-row halves by block_rank. cluster_m == 1 -> m_tile = blockIdx.x.
+    return make_coord(blockIdx.x / cluster_m_, _0{}, make_coord(blockIdx.y, blockIdx.z));
   }
 
   CUTLASS_DEVICE

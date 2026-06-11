@@ -63,6 +63,7 @@ template<
   class TensorQ,  class TensorSFQ,
   class TensorK,  class TensorSFK,
   class TensorV,  class TensorSFV,
+  class TensorSFP,
   class TensorO,  class TensorLSE,
   class Mask
 >
@@ -71,6 +72,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
     TensorQ  mQ,   TensorSFQ mSFQ,
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
+    TensorSFP mSFP,
     TensorO  mO,   TensorLSE mLSE,
     Mask mask) {
 
@@ -244,12 +246,18 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
         for (int g = 0; g < sf_groups; g++) {
           int k_begin = g * kMXFP8GroupSize_sfp;
           int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
+          // [real static SFP] P quantization uses the STATIC per-(row, k-group)
+          // scale factor from gmem: P_q = e4m3(P / sf); PV (phase 3) multiplies
+          // sf back. The row_sum above stays the TRUE softmax normalizer.
+          cutlass::float_ue8m0_t sf_u =
+              mSFP(idx_Q + offset_Q, (k_begin + offset_K) / kMXFP8GroupSize_sfp, idx_L);
+          float sf = float(sf_u);
           for (int k = k_begin; k < k_end; k++) {
-            ElementAccumulator val_fp32 = mS[k];
+            ElementAccumulator val_fp32 = mS[k] / sf;
             val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
             mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
           }
-          sf_ue8m0[g] = static_cast<cutlass::float_ue8m0_t>(1.0f);
+          sf_ue8m0[g] = sf_u;
         }
 
         sf_group_data[0] = float(sum);
@@ -311,6 +319,7 @@ template<
   class TensorQ,  class TensorSFQ,
   class TensorK,  class TensorSFK,
   class TensorV,  class TensorSFV,
+  class TensorSFP,
   class TensorO,  class TensorLSE,
   class Mask
 >
@@ -319,6 +328,7 @@ void fmha_reference_mxfp8_sfp(
     TensorQ  mQ,   TensorSFQ mSFQ,
     TensorK  mK,   TensorSFK mSFK,
     TensorV  mV,   TensorSFV mSFV,
+    TensorSFP mSFP,
     TensorO  mO,   TensorLSE mLSE,
     Mask mask) {
 
@@ -336,7 +346,7 @@ void fmha_reference_mxfp8_sfp(
         &fmha_reference_mxfp8_kernel_sfp<
             ProblemShapeIn,
             TensorQ, TensorSFQ, TensorK, TensorSFK,
-            TensorV, TensorSFV,
+            TensorV, TensorSFV, TensorSFP,
             TensorO, TensorLSE, Mask>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
     if (cudaSuccess != result) {
@@ -348,7 +358,7 @@ void fmha_reference_mxfp8_sfp(
   }
   fmha_reference_mxfp8_kernel_sfp<<<grid, block, shared_mem>>>(
       problem_shape_in,
-      mQ, mSFQ, mK, mSFK, mV, mSFV,
+      mQ, mSFQ, mK, mSFK, mV, mSFV, mSFP,
       mO, mLSE, mask);
 }
 

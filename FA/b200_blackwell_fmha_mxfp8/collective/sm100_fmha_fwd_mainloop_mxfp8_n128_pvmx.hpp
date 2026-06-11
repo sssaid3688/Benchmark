@@ -41,11 +41,33 @@
  ***************************************************************************************************/
 #pragma once
 
+#include <cuda_fp16.h>   // [FA4-exp f16x2] __half2 / h2exp2 / __hadd2
+
 // ── Fast exp2 approximation using PTX ex2.approx instruction ──
 __device__ __forceinline__ float fast_exp2f(float x) {
     float result;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
     return result;
+}
+
+// ── [FA4 §3.1.3] FMA/ALU-pipe polynomial 2^x ──
+// Degree-4 minimax-ish (Taylor) on the fractional part in [-0.5, 0.5]; integer
+// part folded in via exponent-bit arithmetic (magic-number round, no CVT).
+// Runs entirely on the FMA + integer pipes, so it executes CONCURRENTLY with
+// MUFU ex2.approx: softmax alternates pairs between the two paths to raise the
+// total exponential throughput (MUFU alone is 16 ops/clk/SM and measured ~51%
+// of kernel wall time). |rel err| ≈ 4e-5 — far below E4M3's ~6e-2 quantization.
+__device__ __forceinline__ float fast_exp2f_poly(float x) {
+    x = fmaxf(x, -125.0f);                       // keep 2^x normal; true value ≈ 1e-38 ≈ 0
+    float t  = x + 12582912.0f;                  // 2^23 + 2^22 magic: round-to-nearest int
+    float xi = t - 12582912.0f;                  // integer part round(x)
+    float xf = x - xi;                           // fractional part in [-0.5, 0.5]
+    float p  = fmaf(xf, 0x1.3b2c9cp-7f, 0x1.c6b08ep-5f);   // c4·xf + c3
+    p = fmaf(xf, p, 0x1.ebfbe0p-3f);             // c2
+    p = fmaf(xf, p, 0x1.62e430p-1f);             // c1 = ln2
+    p = fmaf(xf, p, 1.0f);                       // 2^xf
+    int e2 = __float_as_int(t) - 0x4B400000;     // low mantissa bits of t = (int)xi
+    return __int_as_float(__float_as_int(p) + (e2 << 23));   // p · 2^xi
 }
 
 #include "cutlass/cutlass.h"
@@ -121,13 +143,24 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #ifdef MXFP8_KV_STAGES
   static constexpr int StageCountKV = MXFP8_KV_STAGES;
 #else
-  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
+  // [SFP-on-K-slot] 6 stages: the K release is delayed one iteration to protect
+  // softmax's SFP read window, which costs one KV-pair of prefetch headroom —
+  // two extra stages restore it (2-CTA halved K/V tiles leave ample smem).
+  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 6 : 3;
 #endif
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
 
+  // [2-CTA] FA4-style 2-SM cooperative MMA: a CTA pair (cluster M=2) co-executes
+  // one M=256 UMMA, each CTA owning M=128 of the accumulator + staging half of B.
+#if defined(FMHA_2CTA)
+  using ClusterShape = Shape<_2, _1, _1>;
+  using KernelScheduleFmha = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
+#else
   using ClusterShape = Shape<_1, _1, _1>;
+  using KernelScheduleFmha = cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100;
+#endif
 
   static const int Alignment = 128 / sizeof_bits_v<Element>;
 
@@ -145,7 +178,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ElementBlockScaled, StrideK, Alignment,
       ElementQK,
       TileShapeQK, ClusterShape, cutlass::gemm::collective::StageCount<3> /* changed later */,
-      cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+      KernelScheduleFmha>::CollectiveOp;
 
   // [PVMX 2a.1] PV is now block-scaled MXFP8 SS: P,V = e4m3 + ue8m0 SF along seqlen_kv.
   using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -154,7 +187,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ElementBlockScaled, decltype(select<1,0,2>(StrideV{})), Alignment,
       ElementPV,
       TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3> /* changed later */,
-      cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+      KernelScheduleFmha>::CollectiveOp;
 
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
   using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV>{}));
@@ -173,7 +206,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   using TiledMmaPV        = typename CollectiveMmaPV::TiledMma;
   using SmemLayoutAtomSFP = typename CollectiveMmaPV::SmemLayoutAtomSFA;  // P-SF atom
   using SmemLayoutAtomSFV = typename CollectiveMmaPV::SmemLayoutAtomSFB;  // V-SF atom
-  using SmemLayoutSFP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFA{}, Int<2>{}));
+  // [SFP-on-K-slot] 3 smem stages (k%3), matching the 3 in-flight K slots of the
+  // 6-stage KV pipeline: SFP(k+3)'s overwrite is gated by the (delayed) K(k)
+  // release, which transitively proves softmax(k) AND UTCCP(k) consumed stage k%3.
+  using SmemLayoutSFP = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFA{}, Int<3>{}));
   // [PVMX 2a.1b] V-SF smem, staged on KV pipeline (loaded by TMA on V-slots).
   using SmemLayoutSFV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutSFB{}, Int<StageCountKV>{}));
 
@@ -247,19 +283,25 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   };
 
   // from load to mma warp, protects q in smem
+  // [2-CTA] PipelineTmaUmmaAsync<Stages, ClusterShape, AtomThrShape>: must pass
+  // ClusterShape as the 2nd param so the UMMA-consumer arrive uses the right
+  // cta_group (in 1-CTA both are <1,1,1> so the old 2-arg form happened to work).
   using PipelineQ = cutlass::PipelineTmaUmmaAsync<
     StageCountQ,
+    ClusterShape,
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
   // from load to mma warp, protects k/v in smem
   using PipelineKV = cutlass::PipelineTmaUmmaAsync<
     StageCountKV,
+    ClusterShape,
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
   using PipelineSFP = cutlass::PipelineTmaUmmaAsync<
     2,
+    ClusterShape,
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
 
@@ -268,7 +310,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // consumes ONE pipeline (pipeline_mma_s0); depth 2 maps its two stages onto
   // the two TMEM buffers S0/S1, selected by PipelineState::index(). QK(k)
   // commits stage k%2; softmax_step(k) / PV read the same buffer via index().
-  using PipelineS = cutlass::PipelineUmmaAsync<2>;
+  // [2-CTA] pass the QK MMA's AtomThrShapeMNK so the UMMA commit/arrive uses the
+  // SAME cta_group as the MMA atom (cta_group::2 in 2-SM); default <1,1,1> = 1-SM.
+  using PipelineS = cutlass::PipelineUmmaAsync<2, typename CollectiveMmaQK::AtomThrShapeMNK>;
 
   // from softmax0/1/ to correction wg
   using PipelineC = cutlass::PipelineAsync<1>;
@@ -282,7 +326,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // accumulates into the single O before correction has rescaled/consumed
   // PV(i)'s result — a WAR race on O (~1% corrupted outputs). Depth 1 forces
   // PV(i+1) to wait until correction has consumed PV(i)'s O.
-  using PipelineO = cutlass::PipelineUmmaAsync<1>;
+  using PipelineO = cutlass::PipelineUmmaAsync<1, typename CollectiveMmaPV::AtomThrShapeMNK>;
 
   // from corr to epilogue
   using PipelineE = cutlass::PipelineAsync<2>;
@@ -290,20 +334,30 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<
     /*stages*/ 1, /*groups*/ 2>;
 
+  // [2-CTA] under the 2-SM MMA atom, BOTH CTAs issue cta_group::2 TMA copies but
+  // ALL complete-tx bytes are credited to the pair-leader CTA's barrier (the arch
+  // ops zero the peer bit of the mbarrier address), so the leader must expect
+  // size(AtomThrShapeMNK) × the per-CTA stage bytes — exactly like the pristine
+  // block-scaled GEMM collective. =1 under 1-CTA (no behaviour change).
+  static const int kTmaTxFactor = cute::size(typename CollectiveMmaQK::AtomThrShapeMNK{});
+
   // [MXFP8] Q-pipeline transaction = Q tile bytes + SFQ tile bytes.
   static const int TransactionBytesLoadQ_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
   static const int TransactionBytesLoadSFQ   = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFQ{})) * cute::sizeof_bits_v<ElementSF>);
-  static const int TransactionBytesLoadQ     = TransactionBytesLoadQ_data + TransactionBytesLoadSFQ;
+  static const int TransactionBytesLoadQ     = kTmaTxFactor * (TransactionBytesLoadQ_data + TransactionBytesLoadSFQ);
 
   // [MXFP8] KV-pipeline transaction = K|V tile bytes + SF-sized payload (real
   // K scale factors on K-slots, ignored filler on V-slots) — kept equal.
   static const int TransactionBytesLoadK_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
   static const int TransactionBytesLoadV_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
   static const int TransactionBytesLoadSFK   = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
-  static const int TransactionBytesLoadSFP = cutlass::bits_to_bytes(
+  static const int TransactionBytesLoadSFP = kTmaTxFactor * cutlass::bits_to_bytes(
       cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
-  static const int TransactionBytesLoadK     = TransactionBytesLoadK_data + TransactionBytesLoadSFK;
-  static const int TransactionBytesLoadV     = TransactionBytesLoadV_data + TransactionBytesLoadSFK;
+  // [SFP-on-K-slot] both KV slots additionally carry one SFP stage (the V slot
+  // as an identical-bytes filler, keeping all stages' transaction sizes equal).
+  static const int TransactionBytesSFPStage  = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
+  static const int TransactionBytesLoadK     = kTmaTxFactor * (TransactionBytesLoadK_data + TransactionBytesLoadSFK + TransactionBytesSFPStage);
+  static const int TransactionBytesLoadV     = kTmaTxFactor * (TransactionBytesLoadV_data + TransactionBytesLoadSFK + TransactionBytesSFPStage);
 
   static_assert(TransactionBytesLoadK == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
 
@@ -455,8 +509,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tCtSFB1 = tCtSFB;  tCtSFB1.data() = tCtSFB1.data().get() + uint32_t(TmemAllocation::SFB1);
 
     // UTCCP (tcgen05.cp) smem->TMEM copies, mirroring the block-scaled
-    // GEMM collective's mma_init().
-    using UtccpOp = SM100_UTCCP_4x32dp128bit_1cta;
+    // GEMM collective's mma_init(). [2-CTA] auto-select 2cta UTCCP when the
+    // QK MMA atom is a CTA pair (AtomThrID == 2).
+    using UtccpOp = cute::conditional_t<
+        (cute::size(typename TiledMmaQK::AtomThrID{}) == Int<2>{}),
+        SM100_UTCCP_4x32dp128bit_2cta, SM100_UTCCP_4x32dp128bit_1cta>;
     auto tCtSFA0_c = make_tensor(tCtSFA0.data(), filter_zeros(tCtSFA0.layout()));
     auto tCtSFB0_c = make_tensor(tCtSFB0.data(), filter_zeros(tCtSFB0.layout()));
     auto tCtSFB1_c = make_tensor(tCtSFB1.data(), filter_zeros(tCtSFB1.layout()));
@@ -478,9 +535,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // ===================================================================
 
     // ===================================================================
-    // [PVMX 2a.1b/2b] block-scaled PV SF: SFP (P, online) and SFV (V, from gmem)
-    // both double-buffered + per-tile UTCCP. V-SF is staged by the load TMA into
-    // smem_sfv (KV pipeline); SFP is computed by softmax into smem_sfp.
+    // [PVMX 2a.1b/2b] block-scaled PV SF: SFP (P, static quantization, TMA-loaded
+    // from gmem on its own pipeline) and SFV (V, from gmem on the KV pipeline),
+    // both double-buffered + per-tile UTCCP smem -> TMEM.
     // ===================================================================
     Tensor sSFP_full = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
     Tensor sSFV_full = make_tensor(make_smem_ptr(storage.smem_sfv.data()), SmemLayoutSFV{});
@@ -507,10 +564,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     auto sfv0_s2t_dst = thr_utccp_SFV.partition_D(tCtSFV0_c);
     auto sfv1_s2t_dst = thr_utccp_SFV.partition_D(tCtSFV1_c);
     // [PVMX 2b] per-tile P-SF UTCCP (mirror load_sfb): smem_sfp[buf] -> SFP[buf] TMEM.
-    auto load_sfp = [&](int buf) {
+    auto load_sfp = [&](int smem_stage, int buf) {
       if (cute::elect_one_sync()) {
-        if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,0), sfp0_s2t_dst);
-        else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,1), sfp1_s2t_dst);
+        // smem stage (k%3) decoupled from the TMEM ping-pong slot (k%2)
+        if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,smem_stage), sfp0_s2t_dst);
+        else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,smem_stage), sfp1_s2t_dst);
       }
     };
     // [PVMX 2a.1b] per-tile V-SF UTCCP: smem_sfv[vidx] -> SFV[buf] TMEM.
@@ -590,6 +648,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
 
     // Q scale factors -> SFA0 TMEM, once (Q is fixed for all KV tiles).
+    // (A "stage SFP once in the prologue" variant deadlocked timing-dependently
+    // on 20260611 — the per-tile SFP transport below stays. See procee.md.)
     load_sfa();
 
     {
@@ -605,9 +665,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-    // release K0  (KV release order == slot order: K0,V0,K1,V1,...)
-    pipeline_kv.consumer_release(pipeline_kv_release_state);
-    ++pipeline_kv_release_state;
+    // [SFP-on-K-slot] K(k)'s release is DELAYED one iteration: its smem slot now
+    // also carries SFP(k), which softmax(k) reads; the s0 producer_acquire(#k+2)
+    // (next iteration) proves softmax(k) released, making the K refill safe.
+    // Release order stays slot order (K0,V0,K1,V1,...), shifted as a whole.
 
     // acquire S buffer 1 for QK1 (loop iter 1). depth-2 acquire #1 is granted
     // immediately (no prior occupant of buffer 1).
@@ -645,23 +706,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       load_sfv(v_index_prev, pv_buf);
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // acquire #(k+1): P[(k-1)%2] ready
-      
-      sp_index = pipeline_sfp_consumer_state.index();
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
 
-      load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
+      // [real static SFP] smem_sfp[pv_buf] was written by softmax(k-1) BEFORE it
+      // released the S buffer (the acquire above proves the release happened),
+      // so the UTCCP below reads exactly the bytes softmax used. No SFP
+      // pipeline/TMA involvement remains.
+      load_sfp((k - 1) % 3, pv_buf);   // [PVMX 2b] stage P-SF smem[(k-1)%3] -> SFP[pv_buf]
 
       do_pv(v_index_prev, pv_buf, first_pv);
       first_pv = false;
 
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
-
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 
-      // release V(k-1) then K(k)  (slot order)
+      // release K(k-1) then V(k-1) (slot order; one iteration delayed — see
+      // the [SFP-on-K-slot] note: acquire(#k+1) above proves softmax(k-1) done)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
       pipeline_kv.consumer_release(pipeline_kv_release_state);
@@ -681,20 +740,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_s0_producer_state;
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-      sp_index = pipeline_sfp_consumer_state.index();
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
-
-      load_sfp(pv_buf);                // [PVMX 2b] tail: stage P-SF[pv_buf] -> SFP[pv_buf]
+      // [real static SFP] smem_sfp[pv_buf] published by softmax(n-1); see loop.
+      load_sfp((n - 1) % 3, pv_buf);   // [PVMX 2b] tail: stage P-SF smem[(n-1)%3] -> SFP[pv_buf]
       load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] tail: stage V-SF[v_index_prev] -> SFV[pv_buf]
       do_pv(v_index_prev, pv_buf, first_pv);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
-
-      // release V(n-1)
+      // release K(n-1) then V(n-1) (the delayed final pair)
+      pipeline_kv.consumer_release(pipeline_kv_release_state);
+      ++pipeline_kv_release_state;
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
 
@@ -712,7 +767,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   CUTLASS_DEVICE auto
   softmax_step(
       float& row_max, float& row_sum,
-      Stage stage, bool final_call,
+      Stage stage, bool final_call, int sfp_stage,
       BlkCoord const& blk_coord, CoordTensor const& cS,
       Params const& params, ProblemShape const& problem_shape,
       TensorStorage& storage,    // [PVMX 2a.0] write P -> storage.smem_p
@@ -733,10 +788,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // smem exchange buffer for the cross-group row_max / row_sum reduction —
     // one float per (group, row). Function-static: both softmax groups execute
     // this same instantiation so they share the one allocation; other warp
-    // roles never reach here.
-    __shared__ float smem_sm_exch[2][128];
+    // roles never reach here. [loose split-N] double-buffered by tile parity:
+    // with B_PDONE gone the groups may drift up to one B_REDUCE interval, so
+    // consecutive uses of one slot are now two barriers apart (formally safe).
+    __shared__ float smem_sm_exch[2][2][128];
 
-    Tensor tScS_full = typename CollectiveMmaQK::TiledMma{}.get_slice(0).partition_C(cS);
+    // [2-CTA] slice the coordinate tensor by this CTA's rank in the MMA pair:
+    // rank 0 owns rows [0,128) of the cooperative tile, rank 1 rows [128,256).
+    // With slice 0 the peer CTA would mask/report rows 128 too low. 1-CTA: rank 0.
+    int cta_rank_in_pair = int(cute::block_rank_in_cluster())
+                         % cute::size(typename CollectiveMmaQK::TiledMma::AtomThrID{});
+    Tensor tScS_full = typename CollectiveMmaQK::TiledMma{}.get_slice(cta_rank_in_pair).partition_C(cS);
 
     // [MXFP8 N128 M2] double-buffered S: select the S/P/V buffer from the
     // S-pipeline consumer state index (0/1). softmax_step(k) consumes commit #k
@@ -779,10 +841,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       using TMEM_LOAD = SM100_TMEM_LOAD_STAT_32dp32b32x;
     #else
       // [MXFP8 N128 M3b] split-N: each group reads only its 64-col score half.
-      // Use the 64-wide TMEM-load atom so the whole half lands in ONE tcgen05.ld
-      // per thread (vs two with the 32x atom) — fewer MIO-queued instructions,
-      // which NCU flagged as a top secondary stall (mio_throttle). STAT is not
-      // enabled for sm_100a (SM103 only), so this #else is the live path.
+      // (64x atom retested under loose split-N: 755 ms vs 740 ms — 32x stays.)
       using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
     #endif
     // [MXFP8] P-tile width follows TileShapeQK's N. With the Route-C N=64 tile
@@ -813,15 +872,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
     tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
     Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
-    // wait on tensor core pipe — only group 0 holds the mma->softmax pipeline;
-    // it waits for QK(k) to land in TMEM, then B_SREADY lets group 1 (which
-    // holds no mma pipeline) safely read its score half. Both groups arrive.
-    if (is_g0) {
-      pipeline_s.consumer_wait(pipeline_s_consumer_state);
-    }
-    cutlass::arch::NamedBarrier::arrive_and_wait(256, /*B_SREADY*/ 0u);
+    // [loose split-N] BOTH groups are consumers of the S pipeline: each waits
+    // the QK(k) commit itself (the old g0-wait + B_SREADY rendezvous is gone —
+    // the only remaining cross-group sync point is the B_REDUCE max exchange,
+    // which is data-mandatory). This lets the groups drift within/across the
+    // non-reduction phases and feeds the MUFU a steadier exp stream.
+    pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
     // read all of S from tmem into reg mem
+    // [S-prefetch experiments 20260611, REVERTED] three cross-tile prefetch
+    // variants (mid-loop chunked / repositioned handshake / step-tail) all
+    // measured 838-1060 ms vs 798 ms without, despite bit-identical precision:
+    // the ld latency is already hidden by inter-group warp drift, and pinning
+    // the 64 S registers across steps degrades scheduling freedom.
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
 
@@ -876,9 +939,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // (Both groups already finished reading their score halves into registers,
     // so it is now safe for group 1's P write to land in group 0's old score
     // region — see the P-in-S note below.)
-    smem_sm_exch[stage][thread_idx] = row_max;
-    cutlass::arch::NamedBarrier::arrive_and_wait(256, /*B_REDUCE*/ 1u);
-    row_max = ::fmax(row_max, smem_sm_exch[stage ^ 1][thread_idx]);
+    // [loose split-N] the max exchange only couples g0-warp-w with g1-warp-w
+    // (same 32 rows): use a per-warp-pair 64-thread barrier (ids 1..4) instead
+    // of one 256-thread rendezvous, so the four row-bands drift independently.
+    const uint32_t warp_in_group = uint32_t(thread_idx) >> 5;
+    smem_sm_exch[sbuf][stage][thread_idx] = row_max;
+    cutlass::arch::NamedBarrier::arrive_and_wait(64, /*B_REDUCE pair*/ 1u + warp_in_group);
+    row_max = ::fmax(row_max, smem_sm_exch[sbuf][stage ^ 1][thread_idx]);
 
     ElementQK row_max_safe = row_max == -INFINITY ? 0 : row_max;
 
@@ -897,11 +964,34 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     ElementQK scale = params.scale_softmax_log2;
     ElementQK row_max_scale = row_max_safe * scale;
 
+    // [real static SFP] fetch this thread's two per-32-col-group P scale
+    // factors (ue8m0: value = 2^(e-127)) and FOLD the division into the exp2
+    // argument: P/sf = exp2(scale·(S − rowmax) − (e−127)) — exact for the
+    // power-of-two scales, zero extra per-element cost. Values are read
+    // straight from gmem through the canonical SF layout (L2-hot; the smem
+    // copy feeds the UTCCP/MMA path) — identical math to reading SMEM_SFP
+    // without coupling softmax into the SFP pipeline.
+    // [SFP-on-K-slot] read this thread's two scale-factor bytes from SMEM —
+    // delivered by the K(k) TMA transaction, whose completion is transitively
+    // guaranteed before this softmax step (the MMA consumer_waits K(k) before
+    // issuing the QK(k) commit that gates us). Canonical SF atom layout:
+    // offset = (r%32)*16 + ((r/32)%4)*4 + group.
+    constexpr int kSFPStageBytesSm =
+        cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
+    uint8_t const* sfp_smem = reinterpret_cast<uint8_t const*>(storage.smem_sfp.data()) + sfp_stage * kSFPStageBytesSm;
+    int sfp_off = (thread_idx % 32) * 16 + ((thread_idx / 32) % 4) * 4 + int(nHalf) / 32;
+    uint8_t sfp_e0 = sfp_smem[sfp_off];
+    uint8_t sfp_e1 = sfp_smem[sfp_off + 1];
+    float sfp_v0 = float(reinterpret_cast<cutlass::float_ue8m0_t const&>(sfp_e0));
+    float sfp_v1 = float(reinterpret_cast<cutlass::float_ue8m0_t const&>(sfp_e1));
+
     float2 scale_fp32x2 = make_float2(scale, scale);
-    float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
+    float bias_g0 = -row_max_scale - float(int(sfp_e0) - 127);
+    float bias_g1 = -row_max_scale - float(int(sfp_e1) - 127);
+    float2 bias_g0_f32x2 = make_float2(bias_g0, bias_g0);
+    float2 bias_g1_f32x2 = make_float2(bias_g1, bias_g1);
     
     constexpr int kConversionsPerStep = 16;
-    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
     Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
     const int p_row = thread_idx;
     const int p_kbase = int(nHalf);
@@ -917,6 +1007,24 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // Thread owns its row's 64 cols (group half) = 2 SF blocks (size=64; 64/32=2).
     // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
 
+    // [FA4-exp f16x2] one ex2.approx.f16x2 evaluates TWO exponentials per MUFU
+    // op. P is quantized to E4M3 immediately after (fp16 carries ~3x E4M3's
+    // mantissa), so nothing is lost — this HALVES the exponential-unit time
+    // (measured ~51% of kernel wall time) WITHOUT adding instructions (the
+    // polynomial-emulation variant lost 4% to issue pressure on this
+    // issue-bound kernel). Exps stay fp16 in `hexp` for the quant step and the
+    // post-release row-sum.
+    // [exp-experiments 20260611] two FA4-§3.1.3-style attempts were measured and
+    // REVERTED — keep the plain fp32 ex2.approx path:
+    //   1) 50% polynomial emulation on FMA/ALU: stalls halved but +9 inst/elem on
+    //      an ISSUE-BOUND kernel → −4% (838 ms vs 805 ms shape1).
+    //   2) ex2.approx.f16x2 (raw PTX, half the MUFU *instructions*): XU pipe time
+    //      UNCHANGED (~48%) — MUFU element throughput (16 exp/clk) is the hard
+    //      invariant on B200, f16x2 only added pack overhead → −3.7% (835 ms).
+    // Conclusion: the exponential section is MUFU-element-throughput-bound and
+    // irreducible on B200 by instruction selection (B300 doubles MUFU per FA4).
+    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += kConversionsPerStep) {
       CUTLASS_PRAGMA_UNROLL
@@ -926,9 +1034,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           tTMEM_LOADrS(i + j + 1)
         );
         float2 out;
-        cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-        tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
-        tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+        // [real static SFP] bias per 32-col group: regs [0:32) are this half's
+        // first group, [32:64) the second (i is compile-time under the unroll).
+        cute::fma(out, scale_fp32x2, in, (i < 32) ? bias_g0_f32x2 : bias_g1_f32x2);
+        // [FA4 §3.1.3 @25%] under loose split-N the MUFU duty is high enough
+        // that offloading ONE pair in four to the FMA-pipe polynomial adds
+        // throughput (at 50% the issue cost dominated — see iter-2cta.5).
+        if ((j & 7) == 6) {   // 1 of 4 pairs = 25% on FMA pipe (37.5% measured worse)
+          tTMEM_LOADrS(i + j + 0) = fast_exp2f_poly(out.x);
+          tTMEM_LOADrS(i + j + 1) = fast_exp2f_poly(out.y);
+        } else {
+          tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
+          tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+        }
       }
 
       // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
@@ -947,52 +1065,42 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     cutlass::arch::fence_view_async_shared();
 
-    // [MXFP8 N128 M3b] P-in-S: P is embedded at S+32 (P0/P1). group 0 writes
-    // P[0:64]→fp32 cols [32:48], group 1 writes P[64:128]→[48:64]. group 1's
-    // P write lands inside group 0's old score region [0:64], so both groups
-    // must have finished reading scores (done — past B_REDUCE) AND finished
-    // writing their P half before group 0 releases the S buffer (mma then
-    // reuses it / PV reads the full 128-wide P).
-    cutlass::arch::NamedBarrier::arrive_and_wait(256, /*B_PDONE*/ 2u);
-
-    // notify tensor core warp that P is ready (group 0 owns the pipeline);
-    // both groups advance the consumer state so sbuf stays in lockstep.
-    if (is_g0) {
-      pipeline_s.consumer_release(pipeline_s_consumer_state);
-    }
+    // [loose split-N] each group releases independently after ITS P half is in
+    // smem (fence above). The MMA's empty barrier counts BOTH groups' arrivals
+    // (consumer_arv_count ×2), so "full P tile ready before PV / S-buffer
+    // reuse" is preserved exactly — the old B_PDONE rendezvous is redundant.
+    // (Both groups already stopped reading S registers before B_REDUCE.)
+    pipeline_s.consumer_release(pipeline_s_consumer_state);
     ++pipeline_s_consumer_state;
 
     ElementQK acc_scale = (old_row_max == row_max_safe)
-        ? 0.5f
-        : 0.5f * fast_exp2f(scale * (old_row_max - row_max_safe));
-    row_sum *= acc_scale;
+        ? 1.0f
+        : fast_exp2f(scale * (old_row_max - row_max_safe));
     // Compute row-sum after releasing P so it overlaps the following PV.
-    float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
-    float2 local_row_sum_1 = make_float2(0, 0);
-    float2 local_row_sum_2 = make_float2(0, 0);
-    float2 local_row_sum_3 = make_float2(0, 0);
-
+    // [real static SFP] the in-register exps are P/sf_g — accumulate per
+    // 32-col group and scale each partial back by sf_g so row_sum stays the
+    // TRUE softmax normalizer (matching the reference).
+    float2 sum_g0a = make_float2(0, 0), sum_g0b = make_float2(0, 0);
+    float2 sum_g1a = make_float2(0, 0), sum_g1b = make_float2(0, 0);
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
+    for (int i = 0; i < 32; i += 4) {
       float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
-      cute::add(local_row_sum_f32x2, local_row_sum_f32x2, in);
-
+      cute::add(sum_g0a, sum_g0a, in);
       in = make_float2(tTMEM_LOADrS(i+2), tTMEM_LOADrS(i+3));
-      cute::add(local_row_sum_1, local_row_sum_1, in);
-
-      in = make_float2(tTMEM_LOADrS(i+4), tTMEM_LOADrS(i+5));
-      cute::add(local_row_sum_2, local_row_sum_2, in);
-
-      in = make_float2(tTMEM_LOADrS(i+6), tTMEM_LOADrS(i+7));
-      cute::add(local_row_sum_3, local_row_sum_3, in);
+      cute::add(sum_g0b, sum_g0b, in);
     }
-
-    cute::add(local_row_sum_f32x2, local_row_sum_f32x2, local_row_sum_1);
-    cute::add(local_row_sum_2, local_row_sum_2, local_row_sum_3);
-    cute::add(local_row_sum_f32x2, local_row_sum_f32x2, local_row_sum_2);
-    float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
-
-    row_sum = local_row_sum;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 32; i < size(tTMEM_LOADrS); i += 4) {
+      float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
+      cute::add(sum_g1a, sum_g1a, in);
+      in = make_float2(tTMEM_LOADrS(i+2), tTMEM_LOADrS(i+3));
+      cute::add(sum_g1b, sum_g1b, in);
+    }
+    cute::add(sum_g0a, sum_g0a, sum_g0b);
+    cute::add(sum_g1a, sum_g1a, sum_g1b);
+    row_sum = row_sum * acc_scale
+            + sfp_v0 * (sum_g0a.x + sum_g0a.y)
+            + sfp_v1 * (sum_g1a.x + sum_g1a.y);
 
     // The next correction signal is not committed until the next softmax
     // step. Delay its depth-1 producer acquire until after this step's
@@ -1007,14 +1115,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // P tile, so its running row_sum is a partial. Combine into the global
       // row_sum (the per-step acc_scale rescales are identical on both groups,
       // so the two partials add up correctly). Reuse the B_REDUCE barrier.
-      smem_sm_exch[stage][thread_idx] = row_sum;
-      cutlass::arch::NamedBarrier::arrive_and_wait(256, /*B_REDUCE*/ 1u);
-      row_sum += smem_sm_exch[stage ^ 1][thread_idx];
+      // final combine uses the OPPOSITE parity slot: its previous use (step
+      // k_last-1) is separated from these writes by the B_REDUCE of k_last.
+      const uint32_t warp_in_group_f = uint32_t(thread_idx) >> 5;
+      smem_sm_exch[sbuf ^ 1][stage][thread_idx] = row_sum;
+      cutlass::arch::NamedBarrier::arrive_and_wait(64, /*B_REDUCE pair*/ 1u + warp_in_group_f);
+      row_sum += smem_sm_exch[sbuf ^ 1][stage ^ 1][thread_idx];
+
+      // re-acquire the S part in the final step — [loose split-N] both groups
+      // wait (the matching trailing release is also dual); only g0 writes the
+      // final V-stats.
+      pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
       if (is_g0) {
-        // re-acquire the S part in the final step
-        pipeline_s.consumer_wait(pipeline_s_consumer_state);
-
         Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
         tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
         tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
@@ -1055,17 +1168,22 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       pipeline_c.producer_acquire(pipeline_c_producer_state);
     }
 
+    // [SFP-on-K-slot] smem_sfp stage = tile index % 3 (decoupled from sbuf=k%2)
+    int sfp_tile_idx = 0;
+
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       softmax_step<false /* need_apply_mask */>(
           row_max, row_sum, stage,
           (mask_tile_count == 1) &&
               (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+          sfp_tile_idx % 3,
           blk_coord, cS, params, problem_shape, storage,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      ++sfp_tile_idx;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
@@ -1077,34 +1195,36 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       softmax_step<true /* need_apply_mask */>(
           row_max, row_sum, stage, mask_tile_count == 1,
+          sfp_tile_idx % 3,
           blk_coord, cS, params, problem_shape, storage,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      ++sfp_tile_idx;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
 
-    // [MXFP8 N128 M3b] only group 0 drives the pipelines (group 1 produced no
-    // s_corr signals and consumed no mma->softmax commits — its s1 pipelines
-    // stay inert). The trailing balancing matches the single-stage variant.
+    // [MXFP8 N128 M3b] group 0 alone drives the softmax->correction pipeline;
+    // [loose split-N] the S-pipeline trailing balancing is DUAL (both groups
+    // release — the empty-barrier arrival count covers both).
     if (is_g0) {
       pipeline_c.producer_commit(pipeline_c_producer_state);
       ++pipeline_c_producer_state;
 
       pipeline_c.producer_acquire(pipeline_c_producer_state);
-      // [MXFP8 N128 M2] empty steps to sync against pipe s. The double-buffered
-      // mma() issues n+2 S-pipeline commits (n QK + 2 tail balancing commits, vs
-      // n+1 in single-buffered milestone-1): n consumed by softmax_step, one by
-      // the final_call re-wait, so TWO trailing empty wait/release pairs balance
-      // it (milestone-1 needed only one).
-      pipeline_s.consumer_release(pipeline_s_consumer_state);
-      ++pipeline_s_consumer_state;
-      pipeline_s.consumer_wait(pipeline_s_consumer_state);
-      pipeline_s.consumer_release(pipeline_s_consumer_state);
-      ++pipeline_s_consumer_state;
     }
+    // [MXFP8 N128 M2] empty steps to sync against pipe s. The double-buffered
+    // mma() issues n+2 S-pipeline commits (n QK + 2 tail balancing commits, vs
+    // n+1 in single-buffered milestone-1): n consumed by softmax_step, one by
+    // the final_call re-wait, so TWO trailing empty wait/release pairs balance
+    // it (milestone-1 needed only one).
+    pipeline_s.consumer_release(pipeline_s_consumer_state);
+    ++pipeline_s_consumer_state;
+    pipeline_s.consumer_wait(pipeline_s_consumer_state);
+    pipeline_s.consumer_release(pipeline_s_consumer_state);
+    ++pipeline_s_consumer_state;
   }
 
   template<class Stage, class TensorO>
@@ -1128,7 +1248,26 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor cO = make_identity_tensor(select<0,1>(TileShapePV{}));
     Tensor tOtO = partition_fragment_C(mma, select<0,1>(TileShapePV{}));
     Tensor tOcO = mma.get_slice(0).partition_C(cO);
-    Tensor tOsO = mma.get_slice(0).partition_C(sO);
+    // [2-CTA] sO is the PER-CTA 128-row tile (epilogue is instantiated with the
+    // per-CTA M), but the 2-SM atom's partition_C expects the cooperative (256,N)
+    // pair tile. Present sO as a logical (256,N) tensor whose two M-halves alias
+    // the same physical rows; get_slice(rank) then maps each CTA's TMEM half onto
+    // its OWN smem tile. 1-CTA takes the original identity path.
+    auto make_tOsO = [&]() {
+      constexpr int kThrM = cute::size(typename CollectiveMmaPV::TiledMma::AtomThrID{});
+      if constexpr (kThrM == 1) {
+        return mma.get_slice(0).partition_C(sO);
+      }
+      else {
+        auto pair_alias = make_layout(
+            make_shape (make_shape (size<0>(sO), Int<kThrM>{}), size<1>(sO)),
+            make_stride(make_stride(        _1{},        _0{}), size<0>(sO)));
+        Tensor sO_pair = make_tensor(sO.data(), composition(sO.layout(), pair_alias));
+        int cta_rank_in_pair = int(cute::block_rank_in_cluster()) % kThrM;
+        return mma.get_slice(cta_rank_in_pair).partition_C(sO_pair);
+      }
+    };
+    Tensor tOsO = make_tOsO();
 
     Tensor tOtO_i = logical_divide(tOtO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
     Tensor tOcO_i = logical_divide(tOcO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
@@ -1294,7 +1433,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tStS = partition_fragment_C(typename CollectiveMmaQK::TiledMma{}, select<0,1>(TileShapeQK{}));
 
     Tensor cS = make_identity_tensor(select<0,1>(TileShapeQK{}));
-    Tensor tScS = typename CollectiveMmaQK::TiledMma{}.get_slice(0).partition_C(cS);
+    // [2-CTA] rank-sliced coords: feeds the LSE row index below — slice 0 would
+    // make the peer CTA duplicate the leader's LSE rows and leave its own unwritten.
+    int cta_rank_in_pair = int(cute::block_rank_in_cluster())
+                         % cute::size(typename CollectiveMmaQK::TiledMma::AtomThrID{});
+    Tensor tScS = typename CollectiveMmaQK::TiledMma{}.get_slice(cta_rank_in_pair).partition_C(cS);
 
     Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
     Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
@@ -1352,9 +1495,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
-      correction_rescale(scale, uint32_t(TmemAllocation::O0));
-
-      cutlass::arch::fence_view_async_tmem_store();
+      // [FA4 §3.1.4 conditional rescaling] once the running row-max stabilizes,
+      // scale == 1.0 exactly (exp2 of 0) and the rescale is the identity — but it
+      // still cost a full 128x128 fp32 TMEM round-trip per KV tile, on the
+      // critical path of the depth-1 O pipeline (PV(i+1) waits for the release).
+      // Skip it warp-collectively (tcgen05.ld/st are warp ops): a warp only
+      // rescales if ANY of its 32 rows saw the max move. Numerically exact.
+      if (__any_sync(0xffffffffu, scale != 1.0f)) {
+        correction_rescale(scale, uint32_t(TmemAllocation::O0));
+        cutlass::arch::fence_view_async_tmem_store();
+      }
 
       pipeline_o.consumer_release(pipeline_o_consumer_state);
       ++pipeline_o_consumer_state;
@@ -1446,7 +1596,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
 
     if (epilogue.params.ptr_LSE != nullptr) {
-      int row_idx = thread_idx + get<0>(TileShape{}) * get<0>(blk_coord);
+      // [2-CTA] this CTA's rows start rank*128 into the cooperative M-tile.
+      constexpr int kAtomThrM = cute::size(typename CollectiveMmaQK::AtomThrShapeMNK{});
+      int cta_rank_in_pair = int(cute::block_rank_in_cluster()) % kAtomThrM;
+      int row_idx = thread_idx + get<0>(TileShape{}) * get<0>(blk_coord)
+                  + cta_rank_in_pair * (get<0>(TileShape{}) / kAtomThrM);
 
       int row_offset = 0;
       if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {

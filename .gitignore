@@ -5,3 +5,7 @@ FA/build/
 FA/build
 FA/build/
 cutlass/media/docs/cpp/build/
+FA/build*/
+*.ncu-rep
+make.log
+nohup.out
