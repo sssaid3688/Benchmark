@@ -120,7 +120,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #ifdef MXFP8_KV_STAGES
   static constexpr int StageCountKV = MXFP8_KV_STAGES;
 #else
-  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
+  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 6 : 3;
 #endif
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
@@ -301,8 +301,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   static const int TransactionBytesLoadSFK   = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
   static const int TransactionBytesLoadSFP = cutlass::bits_to_bytes(
       cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
-  static const int TransactionBytesLoadK     = TransactionBytesLoadK_data + TransactionBytesLoadSFK;
-  static const int TransactionBytesLoadV     = TransactionBytesLoadV_data + TransactionBytesLoadSFK;
+  static const int TransactionBytesLoadK     = TransactionBytesLoadK_data + TransactionBytesLoadSFK + TransactionBytesLoadSFP;
+  static const int TransactionBytesLoadV     = TransactionBytesLoadV_data + TransactionBytesLoadSFK + TransactionBytesLoadSFP;
 
   static_assert(TransactionBytesLoadK == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
 
@@ -506,10 +506,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     auto sfv0_s2t_dst = thr_utccp_SFV.partition_D(tCtSFV0_c);
     auto sfv1_s2t_dst = thr_utccp_SFV.partition_D(tCtSFV1_c);
     // [PVMX 2b] per-tile P-SF UTCCP (mirror load_sfb): smem_sfp[buf] -> SFP[buf] TMEM.
-    auto load_sfp = [&](int buf) {
+    auto load_sfp = [&](int stage,int buf) {
       if (cute::elect_one_sync()) {
-        if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,0), sfp0_s2t_dst);
-        else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,1), sfp1_s2t_dst);
+        if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,stage), sfp0_s2t_dst);
+        else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,stage), sfp1_s2t_dst);
       }
     };
     // [PVMX 2a.1b] per-tile V-SF UTCCP: smem_sfv[vidx] -> SFV[buf] TMEM.
@@ -604,9 +604,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
     ++pipeline_kv_consumer_state;
 
-    // release K0  (KV release order == slot order: K0,V0,K1,V1,...)
-    pipeline_kv.consumer_release(pipeline_kv_release_state);
-    ++pipeline_kv_release_state;
+    // // release K0  (KV release order == slot order: K0,V0,K1,V1,...)
+    // pipeline_kv.consumer_release(pipeline_kv_release_state);
+    // ++pipeline_kv_release_state;
 
     // acquire S buffer 1 for QK1 (loop iter 1). depth-2 acquire #1 is granted
     // immediately (no prior occupant of buffer 1).
@@ -645,17 +645,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // acquire #(k+1): P[(k-1)%2] ready
       
-      sp_index = pipeline_sfp_consumer_state.index();
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
+      // sp_index = pipeline_sfp_consumer_state.index();
+      // pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      // ++pipeline_sfp_consumer_state;
 
-      load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
+      load_sfp((k - 1) % 3, pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
 
       do_pv(v_index_prev, pv_buf, first_pv);
       first_pv = false;
 
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
+      // pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+      // ++pipeline_sfp_release_state;
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
@@ -680,20 +680,22 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_s0_producer_state;
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-      sp_index = pipeline_sfp_consumer_state.index();
-      pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
-      ++pipeline_sfp_consumer_state;
+      // sp_index = pipeline_sfp_consumer_state.index();
+      // pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      // ++pipeline_sfp_consumer_state;
 
-      load_sfp(pv_buf);                // [PVMX 2b] tail: stage P-SF[pv_buf] -> SFP[pv_buf]
+      load_sfp((n - 1) % 3, pv_buf);                // [PVMX 2b] tail: stage P-SF[pv_buf] -> SFP[pv_buf]
       load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] tail: stage V-SF[v_index_prev] -> SFV[pv_buf]
       do_pv(v_index_prev, pv_buf, first_pv);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 
-      pipeline_sfp.consumer_release(pipeline_sfp_release_state);
-      ++pipeline_sfp_release_state;
+      // pipeline_sfp.consumer_release(pipeline_sfp_release_state);
+      // ++pipeline_sfp_release_state;
 
-      // release V(n-1)
+      // release K(n-1) then V(n-1) (the delayed final pair)
+      pipeline_kv.consumer_release(pipeline_kv_release_state);
+      ++pipeline_kv_release_state;
       pipeline_kv.consumer_release(pipeline_kv_release_state);
       ++pipeline_kv_release_state;
 
@@ -1065,7 +1067,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-      if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      // if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       softmax_step<false /* need_apply_mask */>(
           row_max, row_sum, stage,
           (mask_tile_count == 1) &&
@@ -1075,7 +1077,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
-      if (is_g0) ++pipeline_sfp_consumer_state;
+      // if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
@@ -1085,7 +1087,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
-      if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
+      // if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       softmax_step<true /* need_apply_mask */>(
           row_max, row_sum, stage, mask_tile_count == 1,
           blk_coord, cS, params, problem_shape, storage,
@@ -1093,7 +1095,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
-      if (is_g0) ++pipeline_sfp_consumer_state;
+      // if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }

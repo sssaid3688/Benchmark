@@ -367,26 +367,25 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     int k_index = 0;
     int sfp_index = 0;
 
- 
-
     // K0 (+ SFB0)
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
       copy(params.tma_load_k.with(*tma_barrier, 0), tKgK(_, k_index), tKsK(_, pipeline_kv_producer_state.index()));
       copy(params.tma_load_sfb.with(*tma_barrier, 0), tKgSFB(_, k_index), tKsSFK(_, pipeline_kv_producer_state.index()));  // [MXFP8]
+      copy(params.tma_load_sfp.with(*tma_barrier, 0), tPgP_sf_view(_, k_index), tPsP_sf(_, k_index % 3));
     }
     ++pipeline_kv_producer_state;
 
-       // SFP0 is needed by the first softmax tile. Launch it before K0/V0 so its
-    // GMEM latency overlaps the QK prologue instead of stalling softmax0.
-    pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-    if (lane_predicate) {
-      auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-      copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, sfp_index), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-    }
-    ++pipeline_sfp_producer_state;
-    ++sfp_index;
+    //    // SFP0 is needed by the first softmax tile. Launch it before K0/V0 so its
+    // // GMEM latency overlaps the QK prologue instead of stalling softmax0.
+    // pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
+    // if (lane_predicate) {
+    //   auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
+    //   copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, sfp_index), tPsP_sf(_, pipeline_sfp_producer_state.index()));
+    // }
+    // ++pipeline_sfp_producer_state;
+    // ++sfp_index;
     // [MXFP8 N128] single-stage: no second Q tile is loaded.
 
     // V1 (+ SFV1) — V-slot now carries real V-SF (was K-SF filler).
@@ -395,6 +394,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
       copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
       copy(params.tma_load_sfv.with(*tma_barrier, 0), tVgSFV(_, k_index), tVsSFV(_, pipeline_kv_producer_state.index()));  // [PVMX 2a.1b]
+      copy(params.tma_load_sfp.with(*tma_barrier, 0), tPgP_sf_view(_, k_index), tPsP_sf(_, k_index % 3));
     }
     ++pipeline_kv_producer_state;
     k_index += 1;
@@ -409,7 +409,7 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_k.with(*tma_barrier, 0), tKgK(_, k_index), tKsK(_, pipeline_kv_producer_state.index()));
         copy(params.tma_load_sfb.with(*tma_barrier, 0), tKgSFB(_, k_index), tKsSFK(_, pipeline_kv_producer_state.index()));  // [MXFP8]
-
+        copy(params.tma_load_sfp.with(*tma_barrier, 0), tPgP_sf_view(_, k_index), tPsP_sf(_, k_index % 3));
         // Match the Blackwell MLA load pipeline: warm the current V tile while
         // K is in flight so the following V TMA does not pay the full L2
         // lookup/request latency on its critical path.
@@ -423,18 +423,18 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
         copy(params.tma_load_sfv.with(*tma_barrier, 0), tVgSFV(_, k_index), tVsSFV(_, pipeline_kv_producer_state.index()));  // [PVMX 2a.1b]
-
+        copy(params.tma_load_sfp.with(*tma_barrier, 0), tPgP_sf_view(_, k_index), tPsP_sf(_, k_index % 3));
       }
       ++pipeline_kv_producer_state;
       k_index += 1;
 
-      pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
-      if (lane_predicate) {
-        auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
-        copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, sfp_index), tPsP_sf(_, pipeline_sfp_producer_state.index()));
-      }
-      ++pipeline_sfp_producer_state;
-      ++sfp_index;
+      // pipeline_sfp.producer_acquire(pipeline_sfp_producer_state);
+      // if (lane_predicate) {
+      //   auto tma_barrier_sfp = pipeline_sfp.producer_get_barrier(pipeline_sfp_producer_state);
+      //   copy(params.tma_load_sfp.with(*tma_barrier_sfp, 0), tPgP_sf_view(_, sfp_index), tPsP_sf(_, pipeline_sfp_producer_state.index()));
+      // }
+      // ++pipeline_sfp_producer_state;
+      // ++sfp_index;
     }
   }
 };
