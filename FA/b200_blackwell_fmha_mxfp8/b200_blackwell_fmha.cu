@@ -68,7 +68,8 @@
         ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 \
             --b=1 --h=40 --d=128 --q=256 --k=128
 
-        ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
+        ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 \
+        --b=1 --h=40 --d=128 --q=170100 --k=170100 --verify=1
             
             
 */

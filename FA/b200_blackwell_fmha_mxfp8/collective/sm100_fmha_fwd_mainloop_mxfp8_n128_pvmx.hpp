@@ -917,7 +917,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // old fabsf() was redundant; and the separate amax pass over 64 regs is folded in.
     // Thread owns its row's 64 cols (group half) = 2 SF blocks (size=64; 64/32=2).
     // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
-
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += kConversionsPerStep) {
       CUTLASS_PRAGMA_UNROLL
@@ -933,23 +932,22 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       }
 
       // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
+      int local_k = p_kbase + i;
+      int sf_group = local_k / 32;
+      auto sf_coord = make_coord(
+          make_coord(make_coord(make_coord(p_row % 32, p_row / 32), _0{}),
+                     make_coord(_0{}, _0{})),
+          _0{}, make_coord(sf_group, _0{}));
+      ElementQK inv_scale = ElementQK(1.0f) / ElementQK(sSFP_st(sf_coord));
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < kConversionsPerStep; j++) {
-        int local_k = p_kbase + i + j;
-        int sf_group = local_k / 32;
-        auto sf_coord = make_coord(
-            make_coord(make_coord(make_coord(p_row % 32, p_row / 32), _0{}),
-                       make_coord(_0{}, _0{})),
-            _0{}, make_coord(sf_group, _0{}));
-        ElementQK sfp = ElementQK(sSFP_st(sf_coord));
-        ElementQK val_fp32 = tTMEM_LOADrS(i + j) / sfp;
+        ElementQK val_fp32 = tTMEM_LOADrS(i + j) * inv_scale;
         in_conv[j] = fminf(448.0f, fmaxf(-448.0f, val_fp32));
       }
       Array<Element, kConversionsPerStep> out_conv = convert(in_conv);
       auto out_words = reinterpret_cast<uint32_t const*>(&out_conv);
-      int k0 = p_kbase + i;
-      Element& dst_byte0 = sP_st(make_coord(p_row, k0 % 32), _0{}, k0 / 32);
+      Element& dst_byte0 = sP_st(make_coord(p_row, local_k % 32), _0{}, local_k / 32);
       uint4 packed = make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]);
       *reinterpret_cast<uint4*>(&dst_byte0) = packed;
     }
