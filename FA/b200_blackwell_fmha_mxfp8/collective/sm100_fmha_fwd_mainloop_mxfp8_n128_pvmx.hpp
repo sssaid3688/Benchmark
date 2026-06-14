@@ -713,7 +713,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   CUTLASS_DEVICE auto
   softmax_step(
       float& row_max, float& row_sum,
-      Stage stage, bool final_call,
+      Stage stage, bool final_call, int sfp_stage,
       BlkCoord const& blk_coord, CoordTensor const& cS,
       Params const& params, ProblemShape const& problem_shape,
       TensorStorage& storage,    // [PVMX 2a.0] write P -> storage.smem_p
@@ -898,27 +898,88 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     ElementQK scale = params.scale_softmax_log2;
     ElementQK row_max_scale = row_max_safe * scale;
 
+    // float2 scale_fp32x2 = make_float2(scale, scale);
+    // float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
+    
+    // constexpr int kConversionsPerStep = 16;
+    // NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
+    // Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
+    // Tensor sSFP_full = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
+    // Tensor sSFP_st = sSFP_full(_, _, _, sbuf);
+    // const int p_row = thread_idx;
+    // const int p_kbase = int(nHalf);
+
+    // [MXFP8 N128 M3b] the pristine inter-group OrderBarrier (order_s) is an
+    // ordered (group0-then-group1) sequencer; split-N instead needs symmetric
+    // rendezvous + reduction, done with NamedBarriers above. order_s unused.
+    constexpr int kSFPStageBytesSm =
+        cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFP{})) * cute::sizeof_bits_v<ElementSF>);
+    uint8_t const* sfp_smem = reinterpret_cast<uint8_t const*>(storage.smem_sfp.data()) + sfp_stage * kSFPStageBytesSm;
+    int sfp_off = (thread_idx % 32) * 16 + ((thread_idx / 32) % 4) * 4 + int(nHalf) / 32;
+    uint8_t sfp_e0 = sfp_smem[sfp_off];
+    uint8_t sfp_e1 = sfp_smem[sfp_off + 1];
+    float sfp_v0 = float(reinterpret_cast<cutlass::float_ue8m0_t const&>(sfp_e0));
+    float sfp_v1 = float(reinterpret_cast<cutlass::float_ue8m0_t const&>(sfp_e1));
+
     float2 scale_fp32x2 = make_float2(scale, scale);
-    float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
+    float bias_g0 = -row_max_scale - float(int(sfp_e0) - 127);
+    float bias_g1 = -row_max_scale - float(int(sfp_e1) - 127);
+    float2 bias_g0_f32x2 = make_float2(bias_g0, bias_g0);
+    float2 bias_g1_f32x2 = make_float2(bias_g1, bias_g1);
     
     constexpr int kConversionsPerStep = 16;
-    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
     Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
-    Tensor sSFP_full = make_tensor(make_smem_ptr(storage.smem_sfp.data()), SmemLayoutSFP{});
-    Tensor sSFP_st = sSFP_full(_, _, _, sbuf);
     const int p_row = thread_idx;
     const int p_kbase = int(nHalf);
 
     // [MXFP8 N128 M3b] the pristine inter-group OrderBarrier (order_s) is an
     // ordered (group0-then-group1) sequencer; split-N instead needs symmetric
     // rendezvous + reduction, done with NamedBarriers above. order_s unused.
+    
     (void) order_s;
 
-    // [PVMX 2b][opt 20260605] Phase 1+2 FUSED: scale+exp -> P (fp32) in tTMEM_LOADrS
-    // AND accumulate per-32 amax in the SAME pass. P = exp2(...) >= 0 always, so the
-    // old fabsf() was redundant; and the separate amax pass over 64 regs is folded in.
-    // Thread owns its row's 64 cols (group half) = 2 SF blocks (size=64; 64/32=2).
-    // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
+    // // [PVMX 2b][opt 20260605] Phase 1+2 FUSED: scale+exp -> P (fp32) in tTMEM_LOADrS
+    // // AND accumulate per-32 amax in the SAME pass. P = exp2(...) >= 0 always, so the
+    // // old fabsf() was redundant; and the separate amax pass over 64 regs is folded in.
+    // // Thread owns its row's 64 cols (group half) = 2 SF blocks (size=64; 64/32=2).
+    // // stride-2 keeps i and i+1 in the same SF block (kSFVec=32 even), so one fmax/pair.
+    // CUTLASS_PRAGMA_UNROLL
+    // for (int i = 0; i < size(tTMEM_LOADrS); i += kConversionsPerStep) {
+    //   CUTLASS_PRAGMA_UNROLL
+    //   for (int j = 0; j < kConversionsPerStep; j += 2) {
+    //     float2 in = make_float2(
+    //       tTMEM_LOADrS(i + j + 0),
+    //       tTMEM_LOADrS(i + j + 1)
+    //     );
+    //     float2 out;
+    //     cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+    //     tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
+    //     tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+    //   }
+
+    //   // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
+    //   int local_k = p_kbase + i;
+    //   int sf_group = local_k / 32;
+    //   auto sf_coord = make_coord(
+    //       make_coord(make_coord(make_coord(p_row % 32, p_row / 32), _0{}),
+    //                  make_coord(_0{}, _0{})),
+    //       _0{}, make_coord(sf_group, _0{}));
+    //   ElementQK inv_scale = ElementQK(1.0f) / ElementQK(sSFP_st(sf_coord));
+    //   Array<ElementQK, kConversionsPerStep> in_conv;
+    //   CUTLASS_PRAGMA_UNROLL
+    //   for (int j = 0; j < kConversionsPerStep; j++) {
+    //     ElementQK val_fp32 = tTMEM_LOADrS(i + j) * inv_scale;
+    //     in_conv[j] = fminf(448.0f, fmaxf(-448.0f, val_fp32));
+    //   }
+    //   Array<Element, kConversionsPerStep> out_conv = convert(in_conv);
+    //   auto out_words = reinterpret_cast<uint32_t const*>(&out_conv);
+    //   Element& dst_byte0 = sP_st(make_coord(p_row, local_k % 32), _0{}, local_k / 32);
+    //   uint4 packed = make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]);
+    //   *reinterpret_cast<uint4*>(&dst_byte0) = packed;
+    // }
+
+    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += kConversionsPerStep) {
       CUTLASS_PRAGMA_UNROLL
@@ -928,28 +989,31 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           tTMEM_LOADrS(i + j + 1)
         );
         float2 out;
-        cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-        tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
-        tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+        // [real static SFP] bias per 32-col group: regs [0:32) are this half's
+        // first group, [32:64) the second (i is compile-time under the unroll).
+        cute::fma(out, scale_fp32x2, in, (i < 32) ? bias_g0_f32x2 : bias_g1_f32x2);
+        // [FA4 §3.1.3 @25%] under loose split-N the MUFU duty is high enough
+        // that offloading ONE pair in four to the FMA-pipe polynomial adds
+        // throughput (at 50% the issue cost dominated — see iter-2cta.5).
+        // if ((j & 7) == 6) {   // 1 of 4 pairs = 25% on FMA pipe (37.5% measured worse)
+        //   tTMEM_LOADrS(i + j + 0) = fast_exp2f_poly(out.x);
+        //   tTMEM_LOADrS(i + j + 1) = fast_exp2f_poly(out.y);
+        // } else {
+          tTMEM_LOADrS(i + j + 0) = fast_exp2f(out.x);
+          tTMEM_LOADrS(i + j + 1) = fast_exp2f(out.y);
+        // }
       }
 
       // Quantize FP32 → E4M3 and pack into register buffer (uint32_t per 4×FP8)
-      int local_k = p_kbase + i;
-      int sf_group = local_k / 32;
-      auto sf_coord = make_coord(
-          make_coord(make_coord(make_coord(p_row % 32, p_row / 32), _0{}),
-                     make_coord(_0{}, _0{})),
-          _0{}, make_coord(sf_group, _0{}));
-      ElementQK inv_scale = ElementQK(1.0f) / ElementQK(sSFP_st(sf_coord));
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < kConversionsPerStep; j++) {
-        ElementQK val_fp32 = tTMEM_LOADrS(i + j) * inv_scale;
-        in_conv[j] = fminf(448.0f, fmaxf(-448.0f, val_fp32));
+        in_conv[j] = tTMEM_LOADrS(i + j);
       }
       Array<Element, kConversionsPerStep> out_conv = convert(in_conv);
       auto out_words = reinterpret_cast<uint32_t const*>(&out_conv);
-      Element& dst_byte0 = sP_st(make_coord(p_row, local_k % 32), _0{}, local_k / 32);
+      int k0 = p_kbase + i;
+      Element& dst_byte0 = sP_st(make_coord(p_row, k0 % 32), _0{}, k0 / 32);
       uint4 packed = make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]);
       *reinterpret_cast<uint4*>(&dst_byte0) = packed;
     }
@@ -1064,7 +1128,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     if (is_g0) {
       pipeline_c.producer_acquire(pipeline_c_producer_state);
     }
-
+    int sfp_tile_idx = 0;
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
       // if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
@@ -1072,11 +1136,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           row_max, row_sum, stage,
           (mask_tile_count == 1) &&
               (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+          sfp_tile_idx%3,
           blk_coord, cS, params, problem_shape, storage,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      sfp_tile_idx++;
       // if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
@@ -1090,11 +1156,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // if (is_g0) pipeline_sfp.consumer_wait(pipeline_sfp_consumer_state);
       softmax_step<true /* need_apply_mask */>(
           row_max, row_sum, stage, mask_tile_count == 1,
+          sfp_tile_idx%3,
           blk_coord, cS, params, problem_shape, storage,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
+      ++sfp_tile_idx;
       // if (is_g0) ++pipeline_sfp_consumer_state;
 
       cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
@@ -1365,9 +1433,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_s0_c_consumer_state;
 
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
-
-      correction_rescale(scale, uint32_t(TmemAllocation::O0));
-
+      if (__any_sync(0xffffffffu, scale != 1.0f)) {
+        correction_rescale(scale, uint32_t(TmemAllocation::O0));
+      }
       cutlass::arch::fence_view_async_tmem_store();
 
       pipeline_o.consumer_release(pipeline_o_consumer_state);
