@@ -1,11 +1,1 @@
-<<<<<<< HEAD
-bulid/
-=======
-build
-__pycache__/
-*.pyc
-FA/build/
-FA/build
-FA/build/
-cutlass/media/docs/cpp/build/
->>>>>>> oy123/best
+build/
