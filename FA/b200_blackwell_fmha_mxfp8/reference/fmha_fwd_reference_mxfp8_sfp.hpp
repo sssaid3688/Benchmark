@@ -11,7 +11,8 @@
  *     K: (SK, D)   → SF_K: (SK, D/32)
  *     V: (SK, D)   → SF_V: (SK, D/32)
  *
- *   SF_P: treated as scalar 1.0 — P stays in FP32, no quantization.
+ *   SF_P: static UE8M0 scale 2^-9. P is stored as E4M3(P * 512)
+ *         and dequantized as E4M3 * 2^-9 for the PV multiply.
  *
  * === CUTLASS SF Layout ===========================================================
  *
@@ -41,6 +42,18 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 static constexpr int kMXFP8GroupSize_sfp = 32;
+static constexpr int kMXFP8OnlineTile_sfp = 128;
+
+#ifndef MXFP8_PSTATIC_EXP
+#define MXFP8_PSTATIC_EXP -9
+#endif
+
+#if (MXFP8_PSTATIC_EXP) != -9
+#error "fmha_reference_mxfp8_sfp expects fixed static P scale 2^-9 (MXFP8_PSTATIC_EXP=-9)."
+#endif
+
+static constexpr int kMXFP8PStaticExp_sfp = MXFP8_PSTATIC_EXP;
+static constexpr int kMXFP8PStaticSfpByte_sfp = 127 + kMXFP8PStaticExp_sfp;
 
 /// Create a simple 3-mode SF tensor: (rows, sf_groups, hb).
 /// D=128 → D/32=4 → CUTLASS layout ≡ simple row-major.
@@ -55,7 +68,8 @@ static constexpr int kMXFP8GroupSize_sfp = 32;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Reference Kernel
-//   SF_Q, SF_K, SF_V are used.  P stays in FP32 (SF_P ≡ 1.0).
+//   SF_Q, SF_K, SF_V are used. P follows the static-P kernel convention:
+//   scale = 2^floor(log2(1/448)) = 2^-9.
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<
@@ -88,10 +102,11 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
   // mS 之后：每组 32 个 K 元素共享一个 scale 值
   int total_k = size<0>(mK);
   int sf_groups = (total_k + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp;
+  int sf_storage_groups = sf_groups < 2 ? 2 : sf_groups;
   float* sf_group_data = reinterpret_cast<float*>(mS_mem + total_k * sizeof(ElementAccumulator));
   // sf_group_data 之后：E4M3 类型数组，与 mS 等大小
   cutlass::float_e4m3_t* mS_e4m3 = reinterpret_cast<cutlass::float_e4m3_t*>(
-      reinterpret_cast<char*>(sf_group_data) + sf_groups * sizeof(float));
+      reinterpret_cast<char*>(sf_group_data) + sf_storage_groups * sizeof(float));
   // mS_e4m3 之后：UE8M0 类型数组，每组一个 scale
   cutlass::float_ue8m0_t* sf_ue8m0 = reinterpret_cast<cutlass::float_ue8m0_t*>(
       reinterpret_cast<char*>(mS_e4m3) + total_k * sizeof(cutlass::float_e4m3_t));
@@ -217,11 +232,6 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
       // // ==================
 
       // --- Phase 2: Softmax (FP32) ---
-      ElementAccumulator maxS = -std::numeric_limits<ElementAccumulator>::infinity();
-      for (int k = 0; k < size<1>(problem_shape); k++)
-        maxS = std::max<ElementAccumulator>(maxS, mS[k]);
-      if (maxS == -std::numeric_limits<ElementAccumulator>::infinity()) maxS = 0;
-
       __syncthreads();
 
       ElementAccumulator sum = 0;
@@ -237,32 +247,65 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
           sf_group_data[g] = 0.0f;
         }
 
-        for (int k = 0; k < total_k; k++) {
-          mS[k] = expf(softmax_scale * (mS[k] - maxS));
-          sum += mS[k];
-          int g = k / kMXFP8GroupSize_sfp;
-          sf_group_data[g] = max(sf_group_data[g], float(mS[k]));
+        ElementAccumulator chain_w =
+            -std::numeric_limits<ElementAccumulator>::infinity();
+        ElementAccumulator prev_v =
+            -std::numeric_limits<ElementAccumulator>::infinity();
+        for (int g = 0; g < sf_groups; g++) {
+          sf_ue8m0[g] = cutlass::float_ue8m0_t();
         }
 
-        for (int g = 0; g < sf_groups; g++) {
-          int k_begin = g * kMXFP8GroupSize_sfp;
-          int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
-          // op6 static-P path fixes P-SFP to e8m0 byte 127, i.e. scale 1.0.
-          cutlass::float_ue8m0_t sf_u = static_cast<cutlass::float_ue8m0_t>(1.0f);
-          float sf = 1.0f;
-          for (int k = k_begin; k < k_end; k++) {
-            ElementAccumulator val_fp32 = mS[k] / sf;
+        for (int tile_begin = 0; tile_begin < total_k;
+             tile_begin += kMXFP8OnlineTile_sfp) {
+          int tile_end = min(tile_begin + kMXFP8OnlineTile_sfp, total_k);
+          int g0_end = min(tile_begin + kMXFP8OnlineTile_sfp / 2, tile_end);
+          ElementAccumulator local0_max =
+              -std::numeric_limits<ElementAccumulator>::infinity();
+          for (int k = tile_begin; k < g0_end; k++) {
+            local0_max = std::max<ElementAccumulator>(local0_max, mS[k]);
+          }
+
+          // Mirror the 2SM lazy chain: G0's 64-col half alone advances w_k.
+          // Tile 0 uses v_0=w_0; later tiles use v_k=w_{k-1}. G1 can therefore
+          // produce P>1, and fixed SFP=2^-9 must handle the E4M3 boundary.
+          bool first_tile = (chain_w ==
+              -std::numeric_limits<ElementAccumulator>::infinity());
+          ElementAccumulator v_k = first_tile
+              ? std::max<ElementAccumulator>(chain_w, local0_max)
+              : chain_w;
+          chain_w = std::max<ElementAccumulator>(chain_w, local0_max);
+          if (v_k == -std::numeric_limits<ElementAccumulator>::infinity()) {
+            v_k = 0;
+          }
+          if (prev_v !=
+              -std::numeric_limits<ElementAccumulator>::infinity()) {
+            sum *= expf(softmax_scale * (prev_v - v_k));
+          }
+          prev_v = v_k;
+
+          // Static-P kernel stores P / 2^-9 (= P * 512) as E4M3 and keeps
+          // the matching UE8M0 scale byte 118 in SFP for PV.
+          constexpr uint32_t kPStaticScaleBits =
+              uint32_t(kMXFP8PStaticSfpByte_sfp) << 23;
+          float sf = __uint_as_float(kPStaticScaleBits);
+          cutlass::float_ue8m0_t sf_u = static_cast<cutlass::float_ue8m0_t>(sf);
+          for (int k = tile_begin; k < tile_end; k++) {
+            ElementAccumulator p = expf(softmax_scale * (mS[k] - v_k));
+            sum += p;
+            ElementAccumulator val_fp32 = p / sf;
             val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));
             mS_e4m3[k] = static_cast<cutlass::float_e4m3_t>(val_fp32);
+            sf_ue8m0[k / kMXFP8GroupSize_sfp] = sf_u;
           }
-          sf_ue8m0[g] = sf_u;
         }
 
         sf_group_data[0] = float(sum);
+        sf_group_data[1] = float(prev_v);
       }
       __syncthreads();
 
       sum = ElementAccumulator(sf_group_data[0]);
+      ElementAccumulator final_v = ElementAccumulator(sf_group_data[1]);
       ElementAccumulator inv_sum = 1.0f / sum;
 
       // // ===== Dump all mS (softmax probabilities) =====
@@ -285,16 +328,47 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
         int d_end   = min(d_begin + d_chunk, head_v);
         for (int d = d_begin; d < d_end; d++) {
           ElementAccumulator acc = 0;
-          for (int k = 0; k < size<1>(problem_shape); k++) {
-            int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
-            ElementAccumulator p_fp32 =
-                ElementAccumulator(mS_e4m3[k])
-              * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
+          ElementAccumulator chain_w =
+              -std::numeric_limits<ElementAccumulator>::infinity();
+          ElementAccumulator prev_v =
+              -std::numeric_limits<ElementAccumulator>::infinity();
+          int total_k = size<1>(problem_shape);
+          for (int tile_begin = 0; tile_begin < total_k;
+               tile_begin += kMXFP8OnlineTile_sfp) {
+            int tile_end = min(tile_begin + kMXFP8OnlineTile_sfp, total_k);
+            int g0_end = min(tile_begin + kMXFP8OnlineTile_sfp / 2, tile_end);
+            ElementAccumulator local0_max =
+                -std::numeric_limits<ElementAccumulator>::infinity();
+            for (int k = tile_begin; k < g0_end; k++) {
+              local0_max = std::max<ElementAccumulator>(local0_max, mS[k]);
+            }
 
-            ElementAccumulator v_fp32 =
-                ElementAccumulator(mV(k + offset_K, d, coord_L))
-              * ElementAccumulator(mSFV(d, gk, idx_L));
-            acc += p_fp32 * v_fp32;
+            bool first_tile = (chain_w ==
+                -std::numeric_limits<ElementAccumulator>::infinity());
+            ElementAccumulator v_k = first_tile
+                ? std::max<ElementAccumulator>(chain_w, local0_max)
+                : chain_w;
+            chain_w = std::max<ElementAccumulator>(chain_w, local0_max);
+            if (v_k == -std::numeric_limits<ElementAccumulator>::infinity()) {
+              v_k = 0;
+            }
+            if (prev_v !=
+                -std::numeric_limits<ElementAccumulator>::infinity()) {
+              acc *= expf(softmax_scale * (prev_v - v_k));
+            }
+            prev_v = v_k;
+
+            for (int k = tile_begin; k < tile_end; k++) {
+              int gk = (k + offset_K) / kMXFP8GroupSize_sfp;
+              ElementAccumulator p_fp32 =
+                  ElementAccumulator(mS_e4m3[k])
+                * ElementAccumulator(sf_ue8m0[k / kMXFP8GroupSize_sfp]);
+
+              ElementAccumulator v_fp32 =
+                  ElementAccumulator(mV(k + offset_K, d, coord_L))
+                * ElementAccumulator(mSFV(d, gk, idx_L));
+              acc += p_fp32 * v_fp32;
+            }
           }
           mO(idx_Q + offset_Q, d, coord_L) =
               static_cast<typename TensorO::value_type>(acc * inv_sum);
@@ -302,7 +376,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
       }
 
       if (threadIdx.x == 0 && mLSE.data() != nullptr) {
-        mLSE(idx_Q + offset_Q, coord_L) = log(sum) + softmax_scale * maxS;
+        mLSE(idx_Q + offset_Q, coord_L) = log(sum) + softmax_scale * final_v;
       }
     }
   }
@@ -334,8 +408,10 @@ void fmha_reference_mxfp8_sfp(
 
   dim3 grid(size<0>(mO), size<2>(mO), 1);
   dim3 block(256);
+  int sf_groups = (size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp;
+  int sf_storage_groups = sf_groups < 2 ? 2 : sf_groups;
   int shared_mem = size<0>(mK) * int(sizeof(typename TensorLSE::value_type))       // mS (float)
-                 + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(float)  // sf_group_data
+                 + sf_storage_groups * sizeof(float)  // sf_group_data: sum + final_v + optional debug groups
                  + size<0>(mK) * sizeof(cutlass::float_e4m3_t)                              // mS_e4m3
                  + ((size<0>(mK) + kMXFP8GroupSize_sfp - 1) / kMXFP8GroupSize_sfp) * sizeof(cutlass::float_ue8m0_t); // sf_ue8m0
   cudaError_t result;

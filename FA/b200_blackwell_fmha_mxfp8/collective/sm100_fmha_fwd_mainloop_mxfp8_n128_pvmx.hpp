@@ -46,12 +46,19 @@
 // the online per-32-block amax: the whole amax chain (fused fmax pass, e8m0
 // ceil-log2 math), the per-tile SFP smem store and the per-tile SFP UTCCP are
 // all compiled out. SFP TMEM is filled ONCE (constant byte) at first_pv.
+// The fixed scale is 2^floor(log2(1/448)) = 2^-9, so softmax writes
+// E4M3(P * 512) and PV dequantizes with UE8M0 byte 118.
 // Numerics: P > 448*2^EXP saturates (e4m3 satfinite); P < ~2^(EXP-9) flushes
 // to zero — accuracy vs the dynamic release is part of the evaluation.
 #ifdef MXFP8_PSTATIC
 #ifndef MXFP8_PSTATIC_EXP
-#define MXFP8_PSTATIC_EXP 7
+#define MXFP8_PSTATIC_EXP -9
 #endif
+#if (MXFP8_PSTATIC_EXP) != -9
+#error "MXFP8_PSTATIC uses fixed P scale 2^-9; set MXFP8_PSTATIC_EXP=-9."
+#endif
+static constexpr int kMXFP8PStaticExp = MXFP8_PSTATIC_EXP;
+static constexpr int kMXFP8PStaticSfpByte = 127 + kMXFP8PStaticExp;
 #endif
 
 // ── [刀15 SM12] 2SM 12-warp softmax (correction 并入 softmax G0) ──
@@ -524,13 +531,6 @@ CUTE_DEVICE void issue_pv_mxfp8_blockscaled_ts(
     uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(
         atom_k.idesc_, atom_k.tsfa_addr_, atom_k.tsfb_addr_);
     uint32_t idesc_hi = uint32_t(idesc >> 32);
-    if constexpr (kIs2Sm) {
-      // TS A is sourced from TMEM and follows the K-major TMEM-A contract
-      // (matching SM100_MMA_F8F6F4_2x1SM_TS). The PV SS atom may carry the
-      // smem-A major bit, so clear it for the hand-written TS issue path.
-      idesc_hi &= ~(1u << 15);
-    }
-
     // Each block-scaled MXFP8 MMA consumes K=32 FP8 P elements, packed as
     // 8 TMEM columns of 32-bit words.
     uint32_t p_tmem_k = p_tmem_base + uint32_t(k_block * 8);
@@ -2559,7 +2559,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
 
     cutlass::arch::fence_view_async_tmem_store();
-
     // [M3 sub-tile] each group releases ITS OWN S sub-slot once its half of P
     // (+SFP) is written and fenced. The MMA's next QK sub-MMA only reuses THIS
     // group's 64 cols (gated by this release), and PV acquires BOTH
@@ -2571,26 +2570,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     if (is_g0 && cute::elect_one_sync()) { unsigned _r=cute::block_rank_in_cluster(); if(_r<4){ atomicMax(&g_bcn[_r*16+5], 3u); __threadfence_system(); } }   // [2SM] softmax did consumer_release(S)
 #endif
     ++pipeline_s_consumer_state;
-
-    // [M3-3 LAGGED CHAIN v2] g1's end-of-step chain read (rounds k>=1): pick
-    // up g0's round-k publish (w_k = v_{k+1}) for the NEXT tile — off g1's
-    // critical path (P for this tile is already written and released).
-    if (!is_g0 && !chain_first) {
-#ifndef MXFP8_2SM_DECOUPLE_PERF
-      order_s.wait();
-#endif
-      chain_w = smem_sm_exch[0][thread_idx];
-#ifndef MXFP8_2SM_DECOUPLE_PERF
-      order_s.arrive();
-#endif
-    }
-
-    // [M3-2 LAZY-MAX] c-pipeline is g0-only again (one corr signal per tile).
-#ifndef MXFP8_2SM_DECOUPLE_PERF
-    if (is_g0) {
-      pipeline_c.producer_acquire(pipeline_c_producer_state);
-    }
-#endif
 
 #ifdef MXFP8_E2RSF
     // [刀8 E2RSF] only the final cross-accumulator reduction remains after the
@@ -2636,6 +2615,26 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
 
     row_sum = local_row_sum;
+#endif
+
+    // [M3-3 LAGGED CHAIN v2] g1's end-of-step chain read (rounds k>=1): pick
+    // up g0's round-k publish (w_k = v_{k+1}) for the NEXT tile — off g1's
+    // critical path (P for this tile is already written and released).
+    if (!is_g0 && !chain_first) {
+#ifndef MXFP8_2SM_DECOUPLE_PERF
+      order_s.wait();
+#endif
+      chain_w = smem_sm_exch[0][thread_idx];
+#ifndef MXFP8_2SM_DECOUPLE_PERF
+      order_s.arrive();
+#endif
+    }
+
+    // [M3-2 LAZY-MAX] c-pipeline is g0-only again (one corr signal per tile).
+#ifndef MXFP8_2SM_DECOUPLE_PERF
+    if (is_g0) {
+      pipeline_c.producer_acquire(pipeline_c_producer_state);
+    }
 #endif
 
     if (final_call) {
@@ -2707,7 +2706,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // (strictly earlier in program order than the old per-tile Phase-5 store).
     {
       int tfill = int(threadIdx.x) % (4 * cutlass::NumThreadsPerWarp);
-      constexpr uint32_t kSFByte = uint32_t((MXFP8_PSTATIC_EXP) + 127) & 0xFFu;
+      constexpr uint32_t kSFByte = uint32_t(kMXFP8PStaticSfpByte) & 0xFFu;
       constexpr uint32_t kSFWord = 0x01010101u * kSFByte;
       uint32_t* sf_w = reinterpret_cast<uint32_t*>(storage.smem_sfp.data());
       sf_w[(is_g0 ? 0 : 128) + tfill] = kSFWord;
@@ -3299,7 +3298,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // tile-0 fence + S release, which gates the MMA's one-shot SFP UTCCP).
     if constexpr (kGroup < 2) {
       int tfill = int(threadIdx.x) % (4 * cutlass::NumThreadsPerWarp);
-      constexpr uint32_t kSFByte = uint32_t((MXFP8_PSTATIC_EXP) + 127) & 0xFFu;
+      constexpr uint32_t kSFByte = uint32_t(kMXFP8PStaticSfpByte) & 0xFFu;
       constexpr uint32_t kSFWord = 0x01010101u * kSFByte;
       uint32_t* sf_w = reinterpret_cast<uint32_t*>(storage.smem_sfp.data());
       sf_w[(kGroup == 0 ? 0 : 128) + tfill] = kSFWord;

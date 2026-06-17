@@ -158,8 +158,8 @@ struct Options {
   
   InitStyle init_style_sfq = InitStyle::kRandom;
   InitStyle init_style_sfk = InitStyle::kRandom;
-  // [real static SFP] P's static quantization scale factors are RANDOM ue8m0
-  // (powers of two in (0,1]) over the full (SQ, ceil(K/32), H*B) tensor.
+  // Static-P uses the compile-time scale 2^-9 in kernel/reference code.
+  // The host SFP buffers are retained as ABI/debug placeholders only.
   InitStyle init_style_sfp = InitStyle::kRandom;
   InitStyle init_style_sfv = InitStyle::kRandom;
 
@@ -561,13 +561,13 @@ struct FwdRunner {
     DeviceAllocation<ElementData> block_V;
     DeviceAllocation<ElementScale> block_SFQ;
     DeviceAllocation<ElementScale> block_SFK;
-    DeviceAllocation<ElementScale> block_SFP;  // Dummy only; P scale is generated tile-locally in SMEM.
+    DeviceAllocation<ElementScale> block_SFP;  // Static-P ABI placeholder; kernel fills constant SFP on-chip.
     DeviceAllocation<ElementScale> block_SFV;
     // Row-major SF buffer for reference verification
     DeviceAllocation<ElementScale> block_ref_SFQ;
     DeviceAllocation<ElementScale> block_ref_SFK;
     DeviceAllocation<ElementScale> block_ref_SFV;
-    DeviceAllocation<ElementScale> block_ref_SFP;   // [real static SFP] row-major (SQ, ceil(K/32), H*B)
+    DeviceAllocation<ElementScale> block_ref_SFP;   // Static-P reference ABI/debug placeholder.
     DeviceAllocation<ElementOut> block_O;
     DeviceAllocation<ElementAccumulatorPV> block_LSE;
     DeviceAllocation<ElementOut> block_ref_O;
@@ -586,7 +586,7 @@ struct FwdRunner {
           + device_cumulative_seqlen_kv.get_storage_size() + block_SFQ.get_storage_size() + 
           block_SFK.get_storage_size() + block_SFV.get_storage_size() + block_SFP.get_storage_size()
           + block_ref_SFQ.get_storage_size() + block_ref_SFK.get_storage_size()
-          + block_ref_SFV.get_storage_size();
+          + block_ref_SFV.get_storage_size() + block_ref_SFP.get_storage_size();
     }
   };
 
@@ -632,8 +632,8 @@ struct FwdRunner {
     int B    = size<1>(HB);
     int SF_D = D / 32;  // =4 when D=128
     // printf("SQ:%d, SK:%d, H_KV:%d, H:%d, B:%d, SF_D:%d\n",SQ,SK,H_KV,H,B,SF_D);
-    // D=128 → D/32=4 → K_tiling=1 → CUTLASS SF layout = simple row-major
-    // SF_P treated as 1.0 (P stays in FP32)
+    // D=128 -> D/32=4. SF_P is not host-driven in static-P mode:
+    // kernel and reference both use fixed scale 2^-9.
     auto sfQ = make_mxfp8_sf_tensor(buffer.block_ref_SFQ.get(), SQ, SF_D, H * B);
     auto sfK = make_mxfp8_sf_tensor(buffer.block_ref_SFK.get(), SK, SF_D, H_KV * B);
     int SF_K = (K + 31) / 32;  // ceil(K/32) — SFV groups along K-seqlen
@@ -764,7 +764,8 @@ struct FwdRunner {
     // }
     // // ====================================================================
 
-    // [real static SFP] row-major SFP for the reference: (SQ, ceil(K/32), H*B)
+    // Static-P reference ignores this tensor and computes scale 2^-9 internally.
+    // Keep the row-major tensor only to preserve the reference ABI.
     auto sfP = make_mxfp8_sf_tensor(buffer.block_ref_SFP.get(), SQ, SF_K, H * B);
 
     fmha_reference_mxfp8_sfp(problem_shape_ref,
@@ -781,8 +782,6 @@ struct FwdRunner {
       return false;
     }
 
-    // const double kMaxDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-2;
-    // const double kMeanDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-3;
     const double kMaxDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-2;
     const double kMeanDiffThresh = sizeof(Element) == 1 ? 1e-1 : 1e-3;
 
@@ -963,7 +962,8 @@ struct FwdRunner {
     // std::cout<<"layout_SFQTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     // std::cout<<"layout_SFK_tempTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     auto problem_size_pv = select<0,2,1,3>(problem_size);
-    // P-SFP is produced on-chip by softmax_step. Keep a small valid dummy
+    // P-SFP is the fixed static scale 2^-9 and is produced on-chip by softmax.
+    // Keep a small valid dummy
     // descriptor/buffer only so the existing PV block-scaled argument ABI stays
     // intact; the kernel never reads this tensor for P-SFP values.
     auto problem_size_pv_sfp_dummy = make_tuple(128, 128, 128, make_tuple(1, 1));
@@ -1049,7 +1049,7 @@ struct FwdRunner {
         buffer.block_ref_SFQ.reset(ref_sfq_sz);
         buffer.block_ref_SFK.reset(ref_sfk_sz);
         buffer.block_ref_SFV.reset((size_t)D_loc * SF_K_loc * H_K_loc * B_loc);
-        buffer.block_ref_SFP.reset((size_t)SQ_loc * SF_K_loc * H_loc * B_loc);   // [real static SFP]
+        buffer.block_ref_SFP.reset((size_t)SQ_loc * SF_K_loc * H_loc * B_loc);   // Static-P ABI/debug only.
         
         auto fill_ref = [&](auto& kernel_buf, auto& ref_buf, int rows, int hb, auto& layout_sf) {
           if (hb == 0 || SF_D_loc == 0) return;
