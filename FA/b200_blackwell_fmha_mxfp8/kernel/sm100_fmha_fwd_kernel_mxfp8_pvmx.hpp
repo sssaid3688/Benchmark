@@ -437,14 +437,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     // separately by making the peer participate in the cooperative arrives.)
     pipeline_mma_s0_params.producer_arv_count = 1;
 #if defined(MXFP8_2SM_N128SINGLE)
-    // [刀27 N128SINGLE] s0 is the ONLY live S pipeline; BOTH softmax groups
-    // (G0 + G1, 4 warps each) release it. The 2-SM consumer_release routes EVERY
-    // consumer thread of BOTH CTAs to the leader's empty barrier
-    // (umma_arrive_2x1SM_sm0), so the count covers the whole pair (×AtomThrShape)
-    // AND both groups (×2): kAtomThrM · 2 · NumWarpsSoftmax · 32 = 2·2·4·32 = 512.
-    // GOLD VALUE — verbatim from oyhj kernel:362
-    // (consumer_arv_count = kAtomThrM * 2 * NumWarpsSoftmax * 32). Over-count
-    // hangs the MMA producer_acquire; under-count races S. Do NOT change.
+    // [刀27 N128SINGLE] s0 is the live S/P pipeline; both softmax groups release
+    // it, so each slot needs both groups across the 2-SM atom.
     pipeline_mma_s0_params.consumer_arv_count =
         (int)cute::size(typename CollectiveMainloop::PipelineS::AtomThrShape_MNK{})
         * (2 * NumWarpsSoftmax) * cutlass::NumThreadsPerWarp;
@@ -819,11 +813,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
            params.mainloop, logical_problem_shape,
            shared_storage.mainloop_epilogue.mainloop,   // [PVMX 2a.0] TensorStorage: softmax writes P -> smem_p
 #if defined(MXFP8_2SM_N128SINGLE)
-           // [刀27 N128SINGLE] BOTH groups consume the single live S pipeline (s0)
-           // + its single consumer state. The x2 consumer_arv_count on s0 makes
-           // each S slot need both groups' release. Each group still reads its own
-           // 64-col half (s_base / s_base+nHalf) and uses its own corr pipeline.
-           // (oyhj kernel:531-532.)
            pipeline_mma_s0,
            pipeline_mma_s0_consumer_state,
 #else

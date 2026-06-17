@@ -50,7 +50,7 @@
 // to zero — accuracy vs the dynamic release is part of the evaluation.
 #ifdef MXFP8_PSTATIC
 #ifndef MXFP8_PSTATIC_EXP
-#define MXFP8_PSTATIC_EXP 0
+#define MXFP8_PSTATIC_EXP 7
 #endif
 #endif
 
@@ -447,6 +447,108 @@ CUTE_DEVICE void gemm_bs(Atom& atom, bool zero_acc,
   }
 }
 
+// PV variant for MXFP8 block-scaled MMA where A=P is already in TMEM and B=V
+// remains the normal SMEM descriptor. CUTLASS wraps the SS spelling, but this
+// TS spelling is needed to avoid staging P through smem_p.
+template<bool kIs2Sm>
+CUTE_DEVICE void tcgen05_mma_pv_mxfp8_block_scale_ts(
+    uint32_t d_tmem,
+    uint32_t p_tmem,
+    uint64_t v_desc,
+    uint32_t idesc_hi,
+    uint32_t scaleC,
+    uint32_t sfp_tmem,
+    uint32_t sfv_tmem) {
+#if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
+  if (cute::elect_one_sync()) {
+    if constexpr (kIs2Sm) {
+      asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
+        "}\n"
+        :
+        : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
+          "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
+    }
+    else {
+      asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
+        "}\n"
+        :
+        : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
+          "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
+    }
+  }
+#else
+  CUTE_INVALID_CONTROL_PATH("Attempting to use SM100 MXFP8 PV MMA without CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
+#endif
+}
+
+template<bool kIs2Sm, class Atom, class TV, class TO, class TSFP, class TSFV>
+CUTE_DEVICE void issue_pv_mxfp8_blockscaled_ts(
+    Atom& atom,
+    bool zero_acc,
+    uint32_t p_tmem_base,
+    TV const& tV,
+    TO&& tO,
+    TSFP const& tSFP,
+    TSFV const& tSFV,
+    bool bcn_pv = false) {
+  using TOBase = std::remove_reference_t<TO>;
+  static_assert(cute::is_rmem<typename TV::engine_type>::value,
+                "SM100 MXFP8 PV expects V as an SMEM descriptor fragment.");
+  static_assert(cute::is_tmem<typename TOBase::engine_type>::value,
+                "SM100 MXFP8 PV accumulates O in TMEM.");
+  static_assert(cute::is_tmem<typename TSFP::engine_type>::value,
+                "SM100 MXFP8 PV expects SFP in TMEM.");
+  static_assert(cute::is_tmem<typename TSFV::engine_type>::value,
+                "SM100 MXFP8 PV expects SFV in TMEM.");
+
+  using ScaleOut = decltype(atom.accumulate_);
+  atom.accumulate_ = zero_acc ? ScaleOut::Zero : ScaleOut::One;
+  if (bcn_pv) BCN_PV(83);
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int k_block = 0; k_block < size<2>(tV); k_block++) {
+    if (bcn_pv) BCN_PV(84 + 2 * k_block);
+    auto tVk = tV(_,_,k_block);
+    auto tSFPk = tSFP(_,_,k_block);
+    auto tSFVk = tSFV(_,_,k_block);
+
+    auto atom_k = atom.with(atom.accumulate_, tSFPk, tSFVk);
+    uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(
+        atom_k.idesc_, atom_k.tsfa_addr_, atom_k.tsfb_addr_);
+    uint32_t idesc_hi = uint32_t(idesc >> 32);
+    if constexpr (kIs2Sm) {
+      // TS A is sourced from TMEM and follows the K-major TMEM-A contract
+      // (matching SM100_MMA_F8F6F4_2x1SM_TS). The PV SS atom may carry the
+      // smem-A major bit, so clear it for the hand-written TS issue path.
+      idesc_hi &= ~(1u << 15);
+    }
+
+    // Each block-scaled MXFP8 MMA consumes K=32 FP8 P elements, packed as
+    // 8 TMEM columns of 32-bit words.
+    uint32_t p_tmem_k = p_tmem_base + uint32_t(k_block * 8);
+
+    tcgen05_mma_pv_mxfp8_block_scale_ts<kIs2Sm>(
+        raw_pointer_cast(tO.data()),
+        p_tmem_k,
+        tVk(_0{}),
+        idesc_hi,
+        uint32_t(atom.accumulate_),
+        atom_k.tsfa_addr_,
+        atom_k.tsfb_addr_);
+
+    if (bcn_pv) BCN_PV(85 + 2 * k_block);
+    atom.accumulate_ = ScaleOut::One;
+  }
+}
+
 template<
   class Element_,
   class ElementQK_,
@@ -544,6 +646,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ElementPV,
       MmaTileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3> /* changed later */,
       cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100>::CollectiveOp;   // [2SM M2] MMA tile M=256
+  static constexpr bool kPVIs2Sm =
+      int(cute::size(typename CollectiveMmaPV::TiledMma::AtomThrID{})) == 2;
 
 #ifdef MXFP8_OSPLIT
   // [刀12 OSPLIT] N=64 sub-MMA PV collective — the EXACT mirror of CollectiveMmaQK64,
@@ -562,6 +666,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ElementPV,
       MmaTileShapePV64, ClusterShape, cutlass::gemm::collective::StageCount<3> /* changed later */,
       cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100>::CollectiveOp;
+  static constexpr bool kPV64Is2Sm =
+      int(cute::size(typename CollectiveMmaPV64::TiledMma::AtomThrID{})) == 2;
   static_assert(cute::size(typename CollectiveMmaPV64::TiledMma::AtomThrID{}) == 2,
                 "[OSPLIT] N=64 PV collective must remain a 2-SM (cta_group::2) atom");
 #endif
@@ -1063,9 +1169,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     Tensor tOtO0 = tOtO;  tOtO0.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
 
-    // [PVMX 2a.0] P now lives in a real smem buffer (2-stage). SS PV reads A=P from smem.
-    Tensor sP = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{});
-    Tensor tOrP = thr_mma_pv.make_fragment_A(sP);   // (MMA, M, K, STAGE)
+    // P is produced by softmax directly into TMEM P0/P1. PV issues the TS
+    // block-scaled MMA form so A=P is read from TMEM, while B=V stays in SMEM.
 
     // ===================================================================
     // [MXFP8] block-scaled QK: scale-factor smem -> TMEM infrastructure.
@@ -1317,7 +1422,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         g_dbg_pv_vidx[g_dbg_npv] = vidx; g_dbg_pv_buf[g_dbg_npv] = buf; g_dbg_pv_first[g_dbg_npv] = first_pv?1:0; g_dbg_npv = g_dbg_npv + 1;
       }
 #endif
-      Tensor tOrPk   = tOrP(_,_,_,buf);   // [PVMX 2a.0] smem P, stage `buf` (full tile)
+      uint32_t p_tmem_base = warp_uniform(uint32_t(buf ? TmemAllocation::P1 : TmemAllocation::P0));
       Tensor tCtSFPk = tCtSFP;
       tCtSFPk.data() = tCtSFP.data().get() + warp_uniform(uint32_t(buf ? TmemAllocation::SFP1 : TmemAllocation::SFP0));
       Tensor tCtSFVk = tCtSFV;
@@ -1327,8 +1432,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       Tensor tOtOk   = tOtO;
       tOtOk.data()   = tOtO.data().get()
           + warp_uniform(uint32_t(TmemAllocation::O0) + uint32_t(sub) * 64u);
-      gemm_bs(mma_pv, /*zero_acc=*/first_pv, tOrPk, tOrV(_,_,_, 2*vidx + sub), tOtOk,
-              tCtSFPk, tCtSFVk, /*bcn_pv=*/true);
+      issue_pv_mxfp8_blockscaled_ts<kPV64Is2Sm>(
+          mma_pv, /*zero_acc=*/first_pv, p_tmem_base,
+          tOrV(_,_,_, 2*vidx + sub), tOtOk, tCtSFPk, tCtSFVk,
+          /*bcn_pv=*/true);
     };
 #else
     // [M3-2 LAZY-MAX] PV is WHOLE-TILE again: both P halves share one scale
@@ -1340,14 +1447,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         g_dbg_pv_vidx[g_dbg_npv] = vidx; g_dbg_pv_buf[g_dbg_npv] = buf; g_dbg_pv_first[g_dbg_npv] = first_pv?1:0; g_dbg_npv = g_dbg_npv + 1;
       }
 #endif
-      Tensor tOrPk   = tOrP(_,_,_,buf);   // [PVMX 2a.0] smem P, stage `buf`
+      uint32_t p_tmem_base = warp_uniform(uint32_t(buf ? TmemAllocation::P1 : TmemAllocation::P0));
       Tensor tCtSFPk = tCtSFP;
       tCtSFPk.data() = tCtSFP.data().get() + warp_uniform(uint32_t(buf ? TmemAllocation::SFP1 : TmemAllocation::SFP0));
       Tensor tCtSFVk = tCtSFV;
       tCtSFVk.data() = tCtSFV.data().get() + warp_uniform(uint32_t(buf ? TmemAllocation::SFV1 : TmemAllocation::SFV0));
-      // [PVMX 2a.1b/2b] block-scaled SS PV with per-tile P-SF (SFP[buf]) AND per-tile V-SF (SFV[buf]).
-      gemm_bs(mma_pv, /*zero_acc=*/first_pv, tOrPk, tOrV(_,_,_,vidx), tOtO0, tCtSFPk, tCtSFVk,
-              /*bcn_pv=*/true);
+      issue_pv_mxfp8_blockscaled_ts<kPVIs2Sm>(
+          mma_pv, /*zero_acc=*/first_pv, p_tmem_base,
+          tOrV(_,_,_,vidx), tOtO0, tCtSFPk, tCtSFVk,
+          /*bcn_pv=*/true);
     };
 #endif
     // ------------------------------------------------------------------
@@ -1415,8 +1523,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       qk_sfb_uaddr = warp_uniform(uint32_t(buf ? TmemAllocation::SFB1 : TmemAllocation::SFB0));
 #endif
 #if defined(MXFP8_2SM_N128SINGLE)
-      // [刀27 N128SINGLE] one N128 QK MMA -> S0, commit s0 only. s1 untouched
-      // (constructed-but-inert; both softmax groups consume s0). (oyhj 655-660.)
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
       do_qk(k_index, buf);                                   // QK0 -> S[0:128)
       BCN(5);   // [2SM] past first QK 2-SM MMA (do_qk)
@@ -1457,7 +1563,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // acquire S sub-slots (buffer 1) for QK1 (loop iter 1). depth-2 acquire #2
     // is granted immediately (no prior occupant of buffer 1).
 #if defined(MXFP8_2SM_N128SINGLE)
-    pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // [刀27] s0 only (oyhj 675)
+    pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
@@ -1494,7 +1600,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_kv_consumer_state;
 
 #if defined(MXFP8_2SM_N128SINGLE)
-      // [刀27 N128SINGLE] QK(k) -> S[k%2] (whole 128), commit s0 only. (oyhj 692-695.)
       do_qk(k_index, qk_buf);
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
       ++pipeline_s0_producer_state;
@@ -1531,9 +1636,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);   // [OSPLIT: h0 of O]
       BCN(80);  // [2SM] loop: past corr acquire, before PipelineS sub-slot acquires
 #if defined(MXFP8_2SM_N128SINGLE)
-      // [刀27 N128SINGLE] acquire #(k+1) on s0: depth-2 waits BOTH softmax groups'
-      // release #(k-1) (the x2 arrive-count makes one s0 slot need both groups),
-      // so the whole 128-col P + SFP of tile k-1 are ready. (oyhj 708.)
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
@@ -1596,8 +1698,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // loop iteration (no QK follows); then acquire #(n+2) on each
       // sub-pipeline waits g0/g1 release #n ⟹ both P halves of tile n-1 ready.
 #if defined(MXFP8_2SM_N128SINGLE)
-      // [刀27 N128SINGLE] single S pipeline: ONE balancing commit + ONE acquire
-      // on s0 (the buffer acquired at end of last loop iter). (oyhj 752-755.)
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
       ++pipeline_s0_producer_state;
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
@@ -1652,8 +1752,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       // final balancing commits (match the trailing producer_acquires)
 #if defined(MXFP8_2SM_N128SINGLE)
-      // [刀27 N128SINGLE] final balancing commit on s0 (matches the trailing
-      // producer_acquire above). (oyhj 757-758.)
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
       ++pipeline_s0_producer_state;
 #else
@@ -2150,11 +2248,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
-    constexpr int kConversionsPerStep = 2;
-
-    Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
-
-    NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
+    constexpr int kExpConversionsPerStep = 2;
 
     // [M3-2] order_s now serializes the global online-max chain (above).
 
@@ -2240,7 +2334,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     for (int i = 0; i < kE2Keep; i += 2) {
 #else
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
+    for (int i = 0; i < size(tTMEM_LOADrS); i += kExpConversionsPerStep) {
 #endif
       float2 in = make_float2(tTMEM_LOADrS(i+0), tTMEM_LOADrS(i+1));
 #ifdef MXFP8_LCFUSE
@@ -2346,6 +2440,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // = 2 SF blocks (size(tTMEM_LOADrS)=64; 64/32=2).
     constexpr int kSFVec   = 32;
     constexpr int kNSFBlk  = 2;
+    (void)kSFVec;
 #ifdef MXFP8_PSTATIC
     // [PSTATIC] Phases 2-3 compiled out: the e8m0 exponent is the compile-time
     // constant MXFP8_PSTATIC_EXP. exp_b/scale_inv_b keep their names so the
@@ -2385,28 +2480,31 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       scale_inv_b[b] = __uint_as_float((uint32_t)(127 - e) << 23); // [opt] 2^-e, no SFU exp2
     }
 #endif
-    // Phase 4: scale P by 2^-exp_b, convert to e4m3. IMPORTANT: don't mutate
-    // tTMEM_LOADrS — the row_sum loop downstream sums it (the unscaled exp P).
+    // Phase 4: scale P by 2^-exp_b, convert to e4m3, and pack four FP8
+    // values per uint32 TMEM word. The row_sum loop downstream still consumes
+    // the unscaled FP32 values in tTMEM_LOADrS.
+    constexpr int kPConversionsPerWord = 4;
+    Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kPConversionsPerWord>>(tTMEM_STORErS_x4);
+    NumericArrayConverter<Element, ElementQK, kPConversionsPerWord> convert_p;
+
 #if defined(MXFP8_E2OFFLOAD) || defined(MXFP8_E2NULL_PERF)
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kE2Keep; i += 2) {
-      int b = i / kSFVec;
+    for (int i = 0; i < kE2Keep; i += kPConversionsPerWord) {
 #else
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += 2) {
-      int b = i / kSFVec;
+    for (int i = 0; i < size(tTMEM_LOADrS); i += kPConversionsPerWord) {
 #endif
-      Array<ElementQK, kConversionsPerStep> in_conv;
+      Array<ElementQK, kPConversionsPerWord> in_conv;
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < kPConversionsPerWord; ++j) {
 #if defined(MXFP8_PSTATIC) && ((MXFP8_PSTATIC_EXP) == 0)
-      // [PSTATIC EXP=0] SF = 1.0 — the per-element rescale multiply is gone.
-      (void)b;
-      in_conv[0] = tTMEM_LOADrS(i+0);
-      in_conv[1] = tTMEM_LOADrS(i+1);
+        in_conv[j] = tTMEM_LOADrS(i+j);
 #else
-      in_conv[0] = tTMEM_LOADrS(i+0) * scale_inv_b[b];
-      in_conv[1] = tTMEM_LOADrS(i+1) * scale_inv_b[b];
+        int b = (i + j) / kSFVec;
+        in_conv[j] = tTMEM_LOADrS(i+j) * scale_inv_b[b];
 #endif
-      tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
+      }
+      tTMEM_STORErS_x4_e[i / kPConversionsPerWord] = convert_p(in_conv);
     }
     // Phase 5: write e8m0 P-SF to smem_sfp[sbuf]. Group g owns kblocks [g*2, g*2+1].
     // Derived from SmemLayoutAtomSFP probe ((((_32,_4),_1),(_32,_1)),_1,(_4,_1)) with
@@ -2449,118 +2547,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     }
 #endif
 
-    // [PVMX 2a.0/perf] write P (e4m3) to smem_p[sbuf]; vectorize 4 bytes / store.
-    // SmemLayoutP = Sw<3,4,3> o ((M=128,32),1,4,STAGE). For each thread/row, 4
-    // consecutive e4m3 (k=4e..4e+3) lie in the same 16-byte swizzle group, so
-    // the swizzle applies the same XOR — they map to 4 contiguous bytes; one
-    // uint32 store replaces 4 byte stores. kbase = stage*64 is 4-aligned.
-    {
-#ifdef M3_PSTCF_PERF
-      // [T3-1 PROBE — NUMERICS WRONG, FLOPs identical] conflict-free FAKE P
-      // store: addr = e*512B + row*4B -> within a warp lane==bank, zero bank
-      // conflicts. Replaces the real swizzled store (measured 4.0-way conflict:
-      // 32 lanes write the same k0 column-group, post-swizzle bits4-6 take only
-      // 8 values -> 4 lanes/bank). Quantifies the upper bound of a real fix.
-      uint32_t* pbase = reinterpret_cast<uint32_t*>(storage.smem_p.data());
-      const int row = thread_idx;
-      CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < size(tTMEM_STORErS_x4); ++e) {
-        pbase[e * 128 + row] = tTMEM_STORErS_x4(e);
-      }
-#else
-      // [T3-1 BANK-CONFLICT FIX] lane-XOR column rotation. The straight loop
-      // (every lane storing the same k0 column-group) measured a 4.0-way bank
-      // conflict (ncu: 8.39M vs 2.10M ideal wavefronts per store site): post-
-      // swizzle address bits4-6 = ((r%4)*2+d)^(r/4) take only 8 values across
-      // 32 lanes, and bits2-3 are lane-invariant. Rotating the column order
-      // per lane with cc = s ^ (row&3) makes bits2-3 take all 4 values across
-      // the 4 lanes that previously collided -> 32 lanes hit 32 distinct banks
-      // (conflict-free; probe fmha_2sm_pstcf measured the upper bound +56 TF).
-      // No dynamic register indexing (3 SELs pick the word) and no divergence.
-      // The +4*cc byte offset only touches bits2-3, BELOW the Sw<3,4,3> 16B
-      // granularity, so the swizzled 16B-group base address is unaffected.
-      Tensor sP_st = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
-      const int row   = thread_idx;        // each softmax thread owns exactly one row (0..127)
-      const int kbase = int(nHalf);        // this group's e4m3 col offset (stage*64)
-#ifdef MXFP8_DBG_PADDR
-      // [T3-1 layout probe] print REAL smem_p byte offsets for a few (row, k0)
-      // to settle the SmemLayoutP address function (models so far contradict
-      // the measured 4-way conflict). Leader CTA only; softmax printf at this
-      // point is the proven-safe 续19g pattern.
-      if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && sbuf == 0 && is_g0 &&
-          (row == 0 || row == 1 || row == 8 || row == 9 || row == 32)) {
-        auto* b0 = reinterpret_cast<uint8_t*>(storage.smem_p.data());
-        for (int e : {0, 1, 4, 8, 12}) {
-          int k0 = kbase + 4 * e;
-          auto* p = reinterpret_cast<uint8_t*>(&sP_st(make_coord(row, k0 % 32), _0{}, k0 / 32));
-          printf("[PADDR] row=%d k0=%d off=%d\n", row, k0, (int)(p - b0));
-        }
-      }
-#endif
-      // [T3-1 FIX = STS.128] The rolled 32-bit store loop measured a 4.0-way
-      // bank conflict (113M kernel-wide): real layout (PADDR-probed) is
-      // addr = swz343((row%8)*128) + (row/8)*1024 + k0, so one STS.32 has all
-      // 32 lanes on the same k0 column -> banks bits4-6 = (k0>>4)^(row%8) take
-      // 8 values, bits2-3 lane-invariant -> 4 lanes/bank. Lane-rotation fails
-      // here (4 colliding lanes are row≡r mod 8, rotation classes row%4 — and
-      // ptxas canonicalizes reindexed loops anyway). The WORKING fix, proven
-      // by /tmp/bankprobe2 SASS (ptxas auto-fused contiguous volatile st.u32
-      // into STS.128 -> measured ZERO conflicts on this exact layout): 16B
-      // vector stores. Each lane's 16B granule = the swizzle granule, so an
-      // 8-lane wavefront tiles 128B cleanly. kg0 is 16-aligned and the layout
-      // keeps 16B groups contiguous -> st.shared.v4.u32 is legal.
-      static_assert(size(decltype(tTMEM_STORErS_x4){}) % 4 == 0, "P STS.128 needs groups of 4");
+    // [PVMX] write packed e4m3 P directly to TMEM P0/P1. The PV MMA reads this
+    // TMEM tile as operand A, so the former smem_p STS path is no longer used.
 #if defined(MXFP8_E2OFFLOAD) || defined(MXFP8_E2NULL_PERF)
-      // [刀10 E2OFFLOAD] only the kept columns' P is stored here; the tail C
-      // columns' STS.128 (same recipe, col base kbase+kE2Keep) is issued by
-      // the correction warpgroup.
-      static_assert((kE2Keep % 16) == 0, "E2OFFLOAD keep-range must be a 16-col STS.128 granule");
-      CUTLASS_PRAGMA_UNROLL
-      for (int g = 0; g < kE2Keep / 16; ++g) {
-#else
-      CUTLASS_PRAGMA_UNROLL
-      for (int g = 0; g < size(tTMEM_STORErS_x4) / 4; ++g) {
+#error "MXFP8_E2OFFLOAD/E2NULL still write their P tail to smem_p; port that tail to TMEM before using TMEM-P PV."
 #endif
-        const int kg0 = kbase + 16 * g;    // 16-aligned group base col
-        Element& dst_byte0 = sP_st(make_coord(row, kg0 % 32), _0{}, kg0 / 32);
-        const uint32_t dst_addr = cute::cast_smem_ptr_to_uint(&dst_byte0);
-        asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::
-                     "r"(dst_addr),
-                     "r"(tTMEM_STORErS_x4(4*g+0)), "r"(tTMEM_STORErS_x4(4*g+1)),
-                     "r"(tTMEM_STORErS_x4(4*g+2)), "r"(tTMEM_STORErS_x4(4*g+3)));
-      }
-#endif
-    }
+    copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4);
 #ifdef MXFP8_DBG
-    // [续19g] read back the e4m3 P from smem_p (what the PV reads directly) for row 0,
-    // dequantize (× 2^exp_b), store at GLOBAL kv. Compare to raw P (exact) in driver.
-    if (blockIdx.x==0 && blockIdx.y==0 && blockIdx.z==0 && thread_idx==0) {
-      Tensor sP_rd = make_tensor(make_smem_ptr(storage.smem_p.data()), SmemLayoutP{})(_, _, _, sbuf);
-      int kvb = get<1>(tTMEM_LOADcS(0));
-      for (int i = 0; i < size(tTMEM_LOADrS) && i < 64; ++i) {
-        int k = int(nHalf) + i;
-        Element e = sP_rd(make_coord(0, k % 32), _0{}, k / 32);
-        float dq = float(e) * ::exp2f((float)exp_b[i / 32]);
-        if (kvb + i < 256) g_dbg_Pdq[kvb + i] = dq;
-      }
-    }
+    // smem_p no longer mirrors P; keep g_dbg_Pdq disabled rather than reporting
+    // stale smem data.
 #endif
 
-    cutlass::arch::fence_view_async_shared();
-    // [续19an-perf] the old [2SM PV-FIX] `fence.proxy.async.shared::cluster` here is
-    // REMOVED. It was added under the (now-disproven) model that the leader's PV MMA
-    // reads P from BOTH CTAs' smem cross-cluster. Measured truth (tut_tma2cta + the Q
-    // root-cause): the A operand is per-CTA-LOCAL-read — each CTA's tcgen05 unit reads
-    // ITS OWN smem P half, so the ::cta-scope fence_view_async_shared() above is the
-    // correct (and sufficient) generic->async publication. The ::cluster fence ran in
-    // the softmax hot loop and showed up as the kernel's entire `membar` stall delta
-    // vs base (ncu: 0.88 vs 0.00 cycles/issue).
+    cutlass::arch::fence_view_async_tmem_store();
 
     // [M3 sub-tile] each group releases ITS OWN S sub-slot once its half of P
-    // (+SFP) is written and fenced — the B_PDONE cross-group NamedBarrier is
-    // GONE. The MMA's next QK sub-MMA only reuses THIS group's 64 cols (gated
-    // by this release), and PV acquires BOTH sub-pipelines so it still sees
-    // the full 128-wide P + SFP.
+    // (+SFP) is written and fenced. The MMA's next QK sub-MMA only reuses THIS
+    // group's 64 cols (gated by this release), and PV acquires BOTH
+    // sub-pipelines so it still sees the full 128-wide P + SFP.
 #ifndef MXFP8_2SM_DECOUPLE_PERF
     pipeline_s.consumer_release(pipeline_s_consumer_state);
 #endif
