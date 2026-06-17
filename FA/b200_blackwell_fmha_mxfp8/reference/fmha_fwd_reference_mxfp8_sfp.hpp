@@ -81,6 +81,7 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
 
   using Element = typename TensorO::value_type;
   using ElementAccumulator = typename TensorLSE::value_type;
+  (void)mSFP;
 
   extern __shared__ char mS_mem[];
   ElementAccumulator* mS = reinterpret_cast<ElementAccumulator*>(mS_mem);
@@ -246,12 +247,9 @@ void __global__ fmha_reference_mxfp8_kernel_sfp(
         for (int g = 0; g < sf_groups; g++) {
           int k_begin = g * kMXFP8GroupSize_sfp;
           int k_end = min(k_begin + kMXFP8GroupSize_sfp, total_k);
-          // [real static SFP] P quantization uses the STATIC per-(row, k-group)
-          // scale factor from gmem: P_q = e4m3(P / sf); PV (phase 3) multiplies
-          // sf back. The row_sum above stays the TRUE softmax normalizer.
-          cutlass::float_ue8m0_t sf_u =
-              mSFP(idx_Q + offset_Q, (k_begin + offset_K) / kMXFP8GroupSize_sfp, idx_L);
-          float sf = float(sf_u);
+          // op6 static-P path fixes P-SFP to e8m0 byte 127, i.e. scale 1.0.
+          cutlass::float_ue8m0_t sf_u = static_cast<cutlass::float_ue8m0_t>(1.0f);
+          float sf = 1.0f;
           for (int k = k_begin; k < k_end; k++) {
             ElementAccumulator val_fp32 = mS[k] / sf;
             val_fp32 = fminf(448.0f, fmaxf(-448.0f, val_fp32));

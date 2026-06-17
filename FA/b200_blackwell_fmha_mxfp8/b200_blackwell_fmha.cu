@@ -68,7 +68,7 @@
         ./examples/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha_mxfp8 \
             --b=1 --h=40 --d=128 --q=256 --k=128
 
-        ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 --b=1 --h=1 --d=128 --q=1 --k=128 --verify=1
+        ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 --b=1 --h=40 --d=128 --q=170100 --k=170100 --verify=1
             
             
 */
@@ -503,18 +503,12 @@ struct FwdRunner {
       TileShape, StrideQ, StrideK, StrideV,
       ActiveMask
     >;
-  // [2-CTA] the epilogue is PER-CTA: each CTA owns and stores only its own
-  // M-half of the cooperative tile, so the epilogue tile is TileShapePV /
-  // AtomThrShape (128 rows). Under 1-CTA this is TileShapePV unchanged.
-  using EpilogueTileShape = decltype(cute::shape_div(
-      typename Mainloop::TileShapePV{},
-      typename Mainloop::CollectiveMmaPV::AtomThrShapeMNK{}));
   using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
       ProblemShapeType,
       Mainloop,
       cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
         ElementOut, ElementAccumulatorPV,
-        EpilogueTileShape,
+        typename Mainloop::TileShapePV,
         StrideO, StrideLSE
       >,
       TileScheduler,
@@ -944,6 +938,14 @@ struct FwdRunner {
     size_t lse_elems = static_cast<size_t>(SQ) * static_cast<size_t>(H) * static_cast<size_t>(B);
     size_t varlen_output_offset = kIsVarlen ? static_cast<size_t>(D) * static_cast<size_t>(SQ) * static_cast<size_t>(H) : 0;
 
+#if defined(MXFP8_OP6_STATIC_2SM)
+    // Match op6's validated BHSD-contiguous layout for the 2SM static-P path:
+    // rows are contiguous within each head, and heads are separated by S*D.
+    stride_Q = make_stride(D64, _1{}, make_stride(make_stride(SQ64 * D64, SQ64 * D64), H64 * SQ64 * D64));
+    stride_O = stride_Q;
+    stride_K = make_stride(D64, _1{}, make_stride(make_stride(_0{}, SK64 * D64), H_K64 * SK64 * D64));
+    stride_V = stride_K;
+#else
     stride_Q = make_stride(H64*D64 , _1{}, make_stride(make_stride(D64, H_Q64*D64), H64*D64*SQ64));
     stride_O = stride_Q;
     // printf("stride_Q: ");
@@ -951,6 +953,7 @@ struct FwdRunner {
     // printf("\n");
     stride_K = make_stride(H_K64*D64 , _1{}, make_stride(make_stride(_0{}, D64), H_K64*D64*SK64));
     stride_V = stride_K;
+#endif
     stride_LSE = make_stride(_1{}, make_stride(make_stride(SQ64, SQ64*H_Q64), SQ64*H64));
     // using SFConfig = cutlass::detail::Sm1xxBlockScaledConfig<SF_VEC>;
     layout_SFQ = Sm1xxBlkScaledConfigQK::tile_atom_to_shape_SFA(problem_size);
@@ -960,9 +963,11 @@ struct FwdRunner {
     // std::cout<<"layout_SFQTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     // std::cout<<"layout_SFK_tempTypename: " << type_name<decltype(layout_SFQ)>() << std::endl;
     auto problem_size_pv = select<0,2,1,3>(problem_size);
-    // [real static SFP] the static P scale factors cover the FULL PV problem
-    // ((SQ rows) x (K/32 groups) x (H*B)) — every PV tile loads its own slice.
-    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(problem_size_pv);
+    // P-SFP is produced on-chip by softmax_step. Keep a small valid dummy
+    // descriptor/buffer only so the existing PV block-scaled argument ABI stays
+    // intact; the kernel never reads this tensor for P-SFP values.
+    auto problem_size_pv_sfp_dummy = make_tuple(128, 128, 128, make_tuple(1, 1));
+    layout_SFP = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFA(problem_size_pv_sfp_dummy);
     layout_SFV = Sm1xxBlkScaledConfigPV::tile_atom_to_shape_SFB(problem_size_pv);
     
     // printf("layout_SFQ: ");
@@ -1000,15 +1005,7 @@ struct FwdRunner {
 
       buffer.block_SFQ.reset(size(filter_zeros(layout_SFQ)));
       buffer.block_SFK.reset(size(filter_zeros(layout_SFK)));
-      // [real static SFP] per-mode product in size_t: the flat size() of the
-      // full-problem SFP layout overflows int32 beyond ~2^31 elements (~46k²·40).
-      {
-        auto sfp_fz = filter_zeros(layout_SFP);
-        size_t sfp_elems = size_t(cute::size<0>(sfp_fz))
-                         * size_t(cute::size<1>(sfp_fz))
-                         * size_t(cute::size<2>(sfp_fz));
-        buffer.block_SFP.reset(sfp_elems);
-      }
+      buffer.block_SFP.reset(size(filter_zeros(layout_SFP)));
       buffer.block_SFV.reset(size(filter_zeros(layout_SFV)));
 
 
@@ -1032,7 +1029,7 @@ struct FwdRunner {
       // std::cout<< "block_q: " <<(*(buffer.block_Q.get()))[0] << std::endl;
       initialize_block(buffer.block_SFQ, seed + 2027, options.init_style_sfq);
       initialize_block(buffer.block_SFK, seed + 2026, options.init_style_sfk);
-      initialize_block(buffer.block_SFP, seed + 2025, options.init_style_sfp);
+      initialize_block(buffer.block_SFP, seed + 2025, InitStyle::kOne);
       initialize_block(buffer.block_SFV, seed + 2024, options.init_style_sfv);
       
       // Build reference SF buffers in row-major order from kernel buffer
@@ -1128,40 +1125,8 @@ struct FwdRunner {
           // No override needed — random SFV already set by initialize_block above
         }  // end SFV-specific block
 
-        // [real static SFP] repack the swizzled kernel SFP into the row-major
-        // (SQ, ceil(K/32), H*B) reference buffer. Index through the cute layout
-        // object itself (mode-1 takes the K-ELEMENT coordinate; the stride-0
-        // sub-mode realizes the 32:1 sharing), avoiding hand-rolled formulas.
-        {
-          size_t n_kernel_sfp = cosize(layout_SFP);
-          size_t n_ref_sfp = (size_t)SQ_loc * SF_K_loc * H_loc * B_loc;
-          std::vector<ElementScale> host_kernel_sfp(n_kernel_sfp);
-          std::vector<ElementScale> host_ref_sfp(n_ref_sfp, ElementScale(0));
-          cudaMemcpy(host_kernel_sfp.data(), buffer.block_SFP.get(),
-                     n_kernel_sfp * sizeof(ElementScale), cudaMemcpyDeviceToHost);
-          for (int r = 0; r < SQ_loc; r++) {
-            for (int kg = 0; kg < SF_K_loc; kg++) {
-              size_t cutlass_idx = layout_SFP(cute::make_coord(
-                  r, kg * 32, cute::make_coord(cute::_0{}, 0)));
-              size_t hb_stride;
-              {
-                // per-(head*batch) stride from the layout itself
-                size_t idx_hb1 = layout_SFP(cute::make_coord(
-                    0, 0, cute::make_coord(cute::_0{}, (H_loc * B_loc > 1) ? 1 : 0)));
-                hb_stride = idx_hb1;  // == 0 when only one head*batch
-              }
-              for (int h = 0; h < H_loc * B_loc; h++) {
-                size_t cidx = cutlass_idx + (size_t)h * hb_stride;
-                size_t rm_idx = (size_t)r * SF_K_loc + kg + (size_t)h * SQ_loc * SF_K_loc;
-                if (cidx < n_kernel_sfp && rm_idx < n_ref_sfp) {
-                  host_ref_sfp[rm_idx] = host_kernel_sfp[cidx];
-                }
-              }
-            }
-          }
-          cudaMemcpy(buffer.block_ref_SFP.get(), host_ref_sfp.data(),
-                     n_ref_sfp * sizeof(ElementScale), cudaMemcpyHostToDevice);
-        }
+        // block_ref_SFP is kept only for the reference function ABI. The
+        // reference now computes the same fixed static P-SFP as the kernel.
       }  // end fill_ref outer block
       
       size_t total_sfq = size(filter_zeros(layout_SFQ));
@@ -1339,13 +1304,18 @@ struct FwdRunner {
     typename Operation::Arguments arguments{
       problem_shape_,
 #if defined(MXFP8_N128)
-      { buffers[buffer_index]->block_Q.get(), stride_Q,
-        buffers[buffer_index]->block_K.get(), stride_K,
-        buffers[buffer_index]->block_V.get(), stride_V,
-        buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
-        buffers[buffer_index]->block_SFK.get(), layout_SFK,
-        buffers[buffer_index]->block_SFP.get(), layout_SFP,
-        buffers[buffer_index]->block_SFV.get(), layout_SFV },
+      {
+        { buffers[buffer_index]->block_Q.get(), stride_Q,
+          buffers[buffer_index]->block_K.get(), stride_K,
+          buffers[buffer_index]->block_V.get(), stride_V,
+          buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
+          buffers[buffer_index]->block_SFK.get(), layout_SFK,
+          buffers[buffer_index]->block_SFP.get(), layout_SFP,
+          buffers[buffer_index]->block_SFV.get(), layout_SFV },
+        0.0f,
+        1.0f, 1.0f, 1.0f,
+        1.0f
+      },
 #else
       { buffers[buffer_index]->block_Q.get(), stride_Q,
         buffers[buffer_index]->block_SFQ.get(), layout_SFQ,
@@ -1600,12 +1570,9 @@ void run_fwd_128(Mask fusion, Options const & options, cutlass::KernelHardwareIn
 
   using HeadDim = _128;
 #if defined(MXFP8_N128)
-#if defined(FMHA_2CTA)
-  // [2-CTA] M=256 super-tile, split across the 2-CTA cluster (each CTA owns M=128).
-  using CtaM = _256;
-#else
+  // op6 2SM N128 launches per-CTA M=128 tiles; the cooperative M=256 work
+  // sharing is expressed by ClusterShape<2,1,1> inside the mainloop/kernel.
   using CtaM = _128;
-#endif
 #else
   using CtaM = _256;
 #endif

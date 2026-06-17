@@ -126,51 +126,102 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
   foreach(PREC mxfp8)
     string(TOUPPER "${PREC}" PREC_MACRO)
 
+    set(BASE_TARGET 1ctab200_blackwell_fmha_${PREC})
+    set(OP6_STATIC_2SM_TARGET op6static2sm_b200_blackwell_fmha_${PREC})
+
     # 使用 cutlass 提供的函数创建可执行文件
     # （会自动设置 CUDA 编译选项和 gencode 标志）
     cutlass_add_executable(
-        sb200_blackwell_fmha_${PREC}
+        ${BASE_TARGET}
         b200_blackwell_fmha.cu
     )
 
     # [重要] 链接 CUTLASS (header-only)、工具库和 CUDA 运行时
     # cutlass_add_executable 只创建 target, 需要手动链接
     # cutlass_tools_util_includes 提供 cutlass/util/command_line.h 等工具头文件
-    target_link_libraries(sb200_blackwell_fmha_${PREC} PRIVATE
+    target_link_libraries(${BASE_TARGET} PRIVATE
       CUTLASS
       cutlass_tools_util_includes
       cuda
     )
 
     # 添加自己的头文件路径 (collective/, kernel/, reference/, ...)
-    target_include_directories(sb200_blackwell_fmha_${PREC} PRIVATE
+    target_include_directories(${BASE_TARGET} PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
     # 设置精度宏 (MXFP8)
-    target_compile_definitions(sb200_blackwell_fmha_${PREC} PRIVATE ${PREC_MACRO} MXFP8_N128)
+    target_compile_definitions(${BASE_TARGET} PRIVATE
+      ${PREC_MACRO}
+      MXFP8_N128
+      MXFP8_PSTATIC
+      MXFP8_PSTATIC_EXP=0
+    )
 
     # [2-CTA] 通过 -DFMHA_2CTA_FLAG=1 配置开启 2-SM cluster 前向路径（默认关，保留 1-CTA 基线）
     if(FMHA_2CTA_FLAG)
-      target_compile_definitions(sb200_blackwell_fmha_${PREC} PRIVATE FMHA_2CTA)
+      target_compile_definitions(${BASE_TARGET} PRIVATE FMHA_2CTA)
     endif()
 
     # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
     # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
-    target_compile_options(sb200_blackwell_fmha_${PREC} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_compile_options(${BASE_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # op6-style 2SM static-P profile used for the 1350 TFLOPS target.
+    cutlass_add_executable(
+        ${OP6_STATIC_2SM_TARGET}
+        b200_blackwell_fmha.cu
+    )
+
+    target_link_libraries(${OP6_STATIC_2SM_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+
+    target_include_directories(${OP6_STATIC_2SM_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_compile_definitions(${OP6_STATIC_2SM_TARGET} PRIVATE
+      ${PREC_MACRO}
+      FMHA_2CTA
+      MXFP8_FULL
+      MXFP8_OP6_STATIC_2SM
+      MXFP8_N128
+      MXFP8_KV_STAGES=12
+      MXFP8_AMAXFUSE
+      MXFP8_PSF_VEC16
+      MXFP8_PSTATIC
+      MXFP8_PSTATIC_EXP=0
+      MXFP8_2SM_CREL
+      MXFP8_E2RSF
+      MXFP8_2SM_EXITDB
+      MXFP8_2SM_N128SINGLE
+      MXFP8_2SM_VPREFETCH
+      MXFP8_M2_COMBO
+      MXFP8_G_COMBO
+      MXFP8_R15_ORVLOG
+      MXFP8_WS_REGSM
+      MXFP8_REGSM_SOFTMAX=184
+    )
+
+    target_compile_options(${OP6_STATIC_2SM_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
   endforeach()
 
   # 一键编译所有 target
   add_custom_target(b200_blackwell_fmha_all
     DEPENDS
-      b200_blackwell_fmha_mxfp8
+      1ctab200_blackwell_fmha_mxfp8
+      op6static2sm_b200_blackwell_fmha_mxfp8
   )
 
   # 打印使用说明
   message(STATUS "========================================")
   message(STATUS "构建完成! 运行方式:")
-  message(STATUS "  ./b200_blackwell_fmha_mxfp8/sb200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/1ctab200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/op6static2sm_b200_blackwell_fmha_mxfp8 --b=1 --h=40 --q=170100 --k=170100 --d=128 --mask=no --iterations=3")
   message(STATUS "========================================")
 
 endif()
