@@ -8,6 +8,7 @@
 |---|---|---|
 | FP16 FA | `flash-attention/agent_space/flash_fwd_sm100_b1_h40_q170100_d128.ncu-rep` | `flash-attention/flash_attn/cute/flash_fwd_sm100.py` |
 | MXFP8 staticQuantmxfp | `staticQuant/Benchmark/FA/build/staticQuantmxfp.ncu-rep` | `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha.cu` |
+| MXFP8 staticReport | `staticQuant/Benchmark/FA/build/staticReport.ncu-rep` | `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha.cu` |
 | MXFP8 1182 | `staticQuant/Benchmark/FA/build/1182report.ncu-rep` | `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha.cu` |
 | MXFP8 stage6 | `6stage/Benchmark/FA/build/stage6report.ncu-rep` | `6stage/Benchmark/FA/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha.cu` |
 | MXFP8 1314 | `staticQuant_mxfp8/1300/Benchmark/FA/build/1314report.ncu-rep` | `staticQuant_mxfp8/1300/Benchmark/FA/b200_blackwell_fmha_mxfp8/b200_blackwell_fmha.cu` |
@@ -29,6 +30,7 @@
 |---|---:|---:|---:|---:|---:|---:|---:|
 | FP16 | 498.38 ms | 70.88% | 70.88% | 49.10% | 56.01% | 0.587 | 0.726 |
 | staticQuantmxfp | 2198.8 ms | 39.86% | 39.95% | 38.43% | 38.51% | 0.524 | 0.525 |
+| staticReport | 941.68 ms | 47.16% | 47.79% | 41.03% | 41.58% | 0.579 | 0.588 |
 | 1182 | 795.69 ms | 55.15% | 56.04% | 40.14% | 40.81% | 0.603 | 0.616 |
 | stage6 | 788.66 ms | 55.71% | 56.46% | 39.86% | 40.30% | 0.566 | 0.578 |
 | 1314 | 715.42 ms | 61.26% | 62.21% | 40.85% | 43.00% | 0.613 | 0.659 |
@@ -37,6 +39,7 @@
 从表中可以看到：
 
 - staticQuantmxfp 的 XU 只有约 40%，同时 issue active 和 eligible warp 也最低。
+- staticReport 的 XU 约 47.8%，比 staticQuantmxfp 好，但仍明显低于 1182/stage6，说明 SFP/shared 等待仍然重。
 - 1182/stage6 的 XU 回到约 56%，但 issue active 仍只有约 40%，说明流水仍被等待限制。
 - scaleno1 的 issue active 和 eligible warp 明显提高，因此 XU 利用率也提高，kernel 时间反而下降。
 - FP16 的 Tensor/TMEM 很高，同时 softmax 非 Tensor 指令也连续执行，所以 XU 最高。
@@ -46,6 +49,7 @@
 | 版本 | Shared bank conflicts | Local spilling requests | Long scoreboard | Short scoreboard | Barrier | MIO throttle | Wait |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | staticQuantmxfp | 108.62B | 283.02M | 4.85 | 0.89 | 0.79 | 0.37 | 1.15 |
+| staticReport | 33.82B | 265.43M | 4.12 | 0.44 | 0.49 | 0.91 | 1.27 |
 | 1182 | 2.32B | 106.21M | 3.79 | 0.42 | 0.64 | 0.88 | 1.49 |
 | stage6 | 7.10B | 601.13M | 3.76 | 0.47 | 0.42 | 0.98 | 1.92 |
 | 1314 | 178.80M | 124.01M | 3.58 | 0.29 | 0.34 | 0.98 | 1.56 |
@@ -69,7 +73,32 @@ staticQuantmxfp 的 XU max 只有约 39.95%，但这不是因为 softmax 中没�
 
 **SFP/shared-memory 路径把 softmax/PV 流水卡住，warp 经常等待 SFP 或 shared/TMEM 相关数据，导致 `exp2/fmax/convert` 等 XU 指令不能持续发射。**
 
-## 6. 1182 为什么 XU 约 56%
+## 6. staticReport: XU 介于 staticQuantmxfp 和 1182 之间
+
+`staticReport.ncu-rep` 的主 kernel 时间约 941.68 ms，XU max 约 47.79%，issue active avg 约 41.03%，eligible warp avg 约 0.579。它比 staticQuantmxfp 的 2198.8 ms / 39.95% XU 明显好，但仍慢于 1182 的 795.69 ms / 56.04% XU。
+
+这个版本的关键特征是：
+
+- shared bank conflicts 仍有 33.82B，远高于 1182 的 2.32B；
+- local spilling requests 为 265.43M，也高于 1182 的 106.21M；
+- long scoreboard 为 4.12，高于 1182 的 3.79；
+- XU 只有 47.79%，说明 softmax/P 生成的 `exp2/fmax/convert` 仍然没有被连续喂饱。
+
+所以 staticReport 应该被看作一个中间状态：
+
+**它已经比 staticQuantmxfp 减少了部分等待，因此 issue active 和 XU 回升；但 SFP/shared-memory 路径仍然很重，shared conflict 和 spill 仍然把大量 warp 卡在等待状态，导致 XU 不能达到 1182/stage6 的 56% 水平。**
+
+从代码路径看，staticReport 仍落在 `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8` 这一套早期 mainloop 上，主要风险点仍是：
+
+- SFP smem allocation 和 SFP TMEM copy；
+- PV 前 SFP staging；
+- softmax 在线 P scale/SFP 生成；
+- `fence_view_async_tmem_store` 后接 PV；
+- P 量化和 SFP 写入 shared。
+
+这解释了为什么 staticReport 的 issue active 虽略高于 staticQuantmxfp，但 duration 仍接近 1 秒，且 XU 只有约 48%。
+
+## 7. 1182 为什么 XU 约 56%
 
 1182 主 kernel 的 XU max 为 56.04%，比 staticQuantmxfp 高很多，但 issue active 仍只有约 40%。这说明它比 staticQuantmxfp 更能推进 softmax/P 生成，但仍没有充分跑满。
 
@@ -82,7 +111,7 @@ staticQuantmxfp 的 XU max 只有约 39.95%，但这不是因为 softmax 中没�
 
 因此 1182 的 XU 较 staticQuantmxfp 更高，是因为等待有所减少，softmax 的 XU 指令可以更连续地发射；但 barrier、scoreboard、shared conflict 和 spill 仍然明显，所以 issue active 仍低。
 
-## 7. stage6 为什么并没有明显更低的 XU
+## 8. stage6 为什么并没有明显更低的 XU
 
 stage6 的 XU max 是 56.46%，和 1182 的 56.04% 基本相同，甚至略高。因此如果使用 `sm__inst_executed_pipe_xu.max.pct_of_peak_sustained_elapsed` 作为 XU 峰值，不能说 stage6 比 1182 更低。
 
@@ -119,7 +148,7 @@ bias_g0 = -row_max_scale - float(int(sfp_e0) - 127);
 
 **SFP 搬运和 SFP 依赖贴近 softmax/PV 临界路径，造成 shared/TMEM/UTCCP 和 spill 压力，使 warp ready 度下降。**
 
-## 8. 1314 为什么 XU 升高
+## 9. 1314 为什么 XU 升高
 
 1314 的 XU max 提高到 62.21%，duration 也从 1182 的 795.69 ms 降到 715.42 ms。它的 shared bank conflicts 从 2.32B 降到 178.80M，说明 shared 路径明显改善。
 
@@ -129,7 +158,7 @@ bias_g0 = -row_max_scale - float(int(sfp_e0) - 127);
 
 **原先等待中的周期被更多 softmax/P 生成相关指令填上了，XU-heavy 指令流更连续。**
 
-## 9. scaleno1 为什么 XU 更高但性能更好
+## 10. scaleno1 为什么 XU 更高但性能更好
 
 scaleno1 的 XU max 达到 65.55%，高于 1314，但 duration 进一步下降到 681.27 ms。它的 issue active avg 从 1314 的 40.85% 提高到 47.02%，eligible warp avg 从 0.613 提高到 0.720。
 
@@ -144,7 +173,7 @@ scaleno1 的 XU max 达到 65.55%，高于 1314，但 duration 进一步下降�
 
 **XU 更高是因为等待减少后，softmax/P 生成路径被更充分地执行；它不是 XU 瓶颈恶化，而是指令发射效率提高。**
 
-## 10. FP16 为什么 XU 最高
+## 11. FP16 为什么 XU 最高
 
 FP16 的 Tensor/TMEM 利用率很高：
 
@@ -156,7 +185,7 @@ FP16 softmax 路径包含 `row_max` reduce、scale/subtract rowmax、`exp2`、ro
 
 FP16 没有 MXFP8 的 P scale/SFP/P quantization 复杂路径，因此它的 softmax 非 Tensor 指令可以和 Tensor/TMEM 主流水更稳定地交错执行。XU 高表示 softmax 相关的非 Tensor 计算也被持续推进。
 
-## 11. MUFU 与 XU 的关系
+## 12. MUFU 与 XU 的关系
 
 可以这样表述：
 
@@ -164,11 +193,11 @@ FP16 没有 MXFP8 的 P scale/SFP/P quantization 复杂路径，因此它的 sof
 
 但不能把全部 XU 都等同于 MUFU。XU 还可能包括非 Tensor 的执行、转换、控制、部分特殊指令等。当前 report 没有明确导出完整 MUFU 指令计数，所以只能说 `exp2` 是 XU 高的重要贡献者，不能说 XU 全部来自 MUFU。
 
-## 12. 代码级原因映射
+## 13. 代码级原因映射
 
 这一节把上面的性能现象映射到具体代码路径。
 
-### 12.1 FP16: XU 高来自连续 softmax 数学路径
+### 13.1 FP16: XU 高来自连续 softmax 数学路径
 
 FP16 版本的 softmax 主流程在 `flash_fwd_sm100.py` 的 `softmax_step` 中：
 
@@ -194,9 +223,9 @@ softmax.update_row_sum(...)
 
 这条路径主要是 rowmax、scale、exp2、row_sum、correction rescale，没有 MXFP8 的 SFP 搬运和 P scale 更新，所以 XU 指令更连续。FP16 的 XU 高不是因为等待多，而是 softmax 数学操作本身持续执行。
 
-### 12.2 staticQuantmxfp: SFP 搬运贴近 PV 临界路径
+### 13.2 staticQuantmxfp / staticReport: SFP 搬运贴近 PV 临界路径
 
-staticQuantmxfp 的早期 mainloop 有明显的 per-tile SFP staging。代码中为 SFP 配置 smem 和 TMEM copy：
+staticQuantmxfp 和 staticReport 都来自 `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8` 这一套早期 mainloop。它们都有明显的 per-tile SFP staging。代码中为 SFP 配置 smem 和 TMEM copy：
 
 - `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:114`
 - `staticQuant/Benchmark/FA/b200_blackwell_fmha_mxfp8/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:152`
@@ -226,11 +255,11 @@ gemm_zero_acc(mma_pv, ..., tCtSFP0, tCtSFV0);
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:802`
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:807`
 
-这解释了 staticQuantmxfp 的超高 shared conflict 和低 issue active：SFP 不是一次性常量，而是作为 PV block-scaled MMA 的 scale operand 被频繁搬运，并贴近 PV 的关键路径。warp 很容易在 SFP smem/TMEM copy、fence、PV consumer dependency 上等待。
+这解释了 staticQuantmxfp 和 staticReport 的高 shared conflict 和低 issue active：SFP 不是一次性常量，而是作为 PV block-scaled MMA 的 scale operand 被频繁搬运，并贴近 PV 的关键路径。warp 很容易在 SFP smem/TMEM copy、fence、PV consumer dependency 上等待。
 
-### 12.3 staticQuantmxfp: 动态 P scale 生成增加 softmax 侧 shared 写入
+### 13.3 staticQuantmxfp / staticReport: 动态 P scale 生成增加 softmax 侧 shared 写入
 
-staticQuantmxfp softmax 中不仅计算 P，还在线生成 P 的 scale factor。代码里先读取 score，做 rowmax：
+staticQuantmxfp/staticReport 的 softmax 中不仅计算 P，还在线生成 P 的 scale factor。代码里先读取 score，做 rowmax：
 
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:948`
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:964`
@@ -248,9 +277,9 @@ staticQuantmxfp softmax 中不仅计算 P，还在线生成 P 的 scale factor�
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:1095`
 - `staticQuant/.../sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:1100`
 
-这条路径会产生大量 shared 写入和后续读取。它解释了为什么 staticQuantmxfp 的 shared bank conflicts 达到 108.62B：softmax 不只是 `exp2`，还承担了在线 P scale 生成、SFP 写入、P 量化和同步。
+这条路径会产生大量 shared 写入和后续读取。它解释了为什么 staticQuantmxfp 和 staticReport 的 shared bank conflicts 都远高于 1182：softmax 不只是 `exp2`，还承担了在线 P scale 生成、SFP 写入、P 量化和同步。
 
-### 12.4 1182: 固定 SFP 后减少动态 scale，但仍有 softmax/P 生成等待
+### 13.4 1182: 固定 SFP 后减少动态 scale，但仍有 softmax/P 生成等待
 
 1182 的 mainloop 使用固定 SFP 方案，避免了 staticQuantmxfp 那种在线 per-block P scale 生成。对应代码中有固定 scale：
 
@@ -259,7 +288,7 @@ staticQuantmxfp softmax 中不仅计算 P，还在线生成 P 的 scale factor�
 - `staticQuant/.../sm100_fmha_fwd_mainloop_mxfp8_n128_pvmx.hpp:594`
 - `staticQuant/.../sm100_fmha_fwd_mainloop_mxfp8_n128_pvmx.hpp:691`
 
-因此 1182 的 XU 从 staticQuantmxfp 的约 40% 回到约 56%，shared conflict 也大幅下降。
+因此 1182 的 XU 从 staticQuantmxfp 的约 40% / staticReport 的约 48% 回到约 56%，shared conflict 也大幅下降。
 
 但是 1182 仍然有 per-tile softmax barrier 和 P done barrier：
 
@@ -276,7 +305,7 @@ softmax 中仍有 `fmax`、`fast_exp2f`、P convert、row_sum：
 
 所以 1182 的低 issue active 主要来自：固定 SFP 降低了动态 scale 开销，但 softmax/P 生成仍被 barrier、TMEM load/store、P conversion 和 row_sum reduce 打断。
 
-### 12.5 stage6: 每个 K/V tile 带 SFP，并在 PV 前 load_sfp
+### 13.5 stage6: 每个 K/V tile 带 SFP，并在 PV 前 load_sfp
 
 stage6 代码更直接地解释了 SFP 等待问题。它把 SFP 加进 K/V transaction：
 
@@ -312,7 +341,7 @@ softmax 也直接从 `smem_sfp` 读 SFP exponent，并放进 softmax bias：
 
 因此 stage6 的 issue active 低，可以具体归因到：SFP TMA 增大 K/V load 事务，SFP smem->TMEM UTCCP 贴近 PV 临界路径，softmax 对 SFP smem load 有直接依赖。warp 等 SFP ready 时，XU 的 `fast_exp2f` 和 convert 就发不连续。
 
-### 12.6 stage6: split-N barrier 让 softmax 两组 warp 锁步
+### 13.6 stage6: split-N barrier 让 softmax 两组 warp 锁步
 
 stage6 的 softmax 是 split-N cooperative softmax。代码注释说明 stage 0/1 各处理 64 列，然后通过 shared exchange 和 NamedBarrier 合并：
 
@@ -326,7 +355,7 @@ stage6 的 softmax 是 split-N cooperative softmax。代码注释说明 stage 0/
 
 这些 barrier 会把两个 softmax group 锁步。如果其中一组因为 SFP/shared/TMEM 慢，另一组也要等。profile 中 stage6 的 eligible warp 比 1182 更低，和这个结构一致。
 
-### 12.7 1314 / scaleno1: 用 2CTA/2SM、lazy chain、E2RSF 和 PSTATIC 减少等待
+### 13.7 1314 / scaleno1: 用 2CTA/2SM、lazy chain、E2RSF 和 PSTATIC 减少等待
 
 后续 `staticQuant_mxfp8` 版本的代码不再只是简单搬 SFP，而是围绕减少等待做了多处重排。
 
@@ -362,7 +391,7 @@ stage6 的 softmax 是 split-N cooperative softmax。代码注释说明 stage 0/
 
 这些代码改动对应 profile 中的现象是：barrier stall 明显下降，eligible warp 增加，issue active 增加，XU 利用率升高但 kernel 时间下降。
 
-### 12.8 汇总: 哪些代码最容易导致低 issue active
+### 13.8 汇总: 哪些代码最容易导致低 issue active
 
 按影响类型归纳：
 
@@ -376,7 +405,7 @@ stage6 的 softmax 是 split-N cooperative softmax。代码注释说明 stage 0/
 | 大量 P conversion + exp2 | `NumericArrayConverter` + `fast_exp2f` | XU/ALU 工作多；如果数据 ready 则 XU 高，如果等待多则 XU 低 |
 | register pressure / spill | profile 中 local spilling 高，stage6 601M | local memory 访问导致 scoreboard 等待 |
 
-## 13. 最终判断
+## 14. 最终判断
 
 这些版本的性能现象可以总结为：
 
