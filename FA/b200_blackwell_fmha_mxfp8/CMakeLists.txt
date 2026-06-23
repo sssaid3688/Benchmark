@@ -155,7 +155,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
       ${PREC_MACRO}
       MXFP8_N128
       MXFP8_PSTATIC
-      MXFP8_PSTATIC_EXP=-9
+      MXFP8_PSTATIC_EXP=0
     )
 
     # [2-CTA] 通过 -DFMHA_2CTA_FLAG=1 配置开启 2-SM cluster 前向路径（默认关，保留 1-CTA 基线）
@@ -183,7 +183,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    target_compile_definitions(${OP6_STATIC_2SM_TARGET} PRIVATE
+    set(OP6_STATIC_2SM_DEFS
       ${PREC_MACRO}
       FMHA_2CTA
       MXFP8_FULL
@@ -193,7 +193,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
       MXFP8_AMAXFUSE
       MXFP8_PSF_VEC16
       MXFP8_PSTATIC
-      MXFP8_PSTATIC_EXP=-9
+      MXFP8_PSTATIC_EXP=0
       MXFP8_2SM_CREL
       MXFP8_E2RSF
       MXFP8_2SM_EXITDB
@@ -206,7 +206,57 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
       MXFP8_REGSM_SOFTMAX=184
     )
 
+    target_compile_definitions(${OP6_STATIC_2SM_TARGET} PRIVATE
+      ${OP6_STATIC_2SM_DEFS}
+    )
+
     target_compile_options(${OP6_STATIC_2SM_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    function(add_op6_static_2sm_ablation ABLATION_NAME)
+      set(ABLATION_TARGET op6static2sm_${ABLATION_NAME}_b200_blackwell_fmha_${PREC})
+      set(ABLATION_DEFS ${OP6_STATIC_2SM_DEFS})
+      foreach(REMOVED_DEF IN LISTS ARGN)
+        list(REMOVE_ITEM ABLATION_DEFS ${REMOVED_DEF})
+      endforeach()
+
+      cutlass_add_executable(
+          ${ABLATION_TARGET}
+          b200_blackwell_fmha.cu
+      )
+
+      target_link_libraries(${ABLATION_TARGET} PRIVATE
+        CUTLASS
+        cutlass_tools_util_includes
+        cuda
+      )
+
+      target_include_directories(${ABLATION_TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+
+      target_compile_definitions(${ABLATION_TARGET} PRIVATE
+        ${ABLATION_DEFS}
+      )
+
+      target_compile_options(${ABLATION_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      set(OP6_STATIC_2SM_ABLATION_TARGETS
+          ${OP6_STATIC_2SM_ABLATION_TARGETS} ${ABLATION_TARGET}
+          PARENT_SCOPE)
+    endfunction()
+
+    add_op6_static_2sm_ablation(no_crel MXFP8_2SM_CREL)
+    add_op6_static_2sm_ablation(no_e2rsf MXFP8_E2RSF)
+    add_op6_static_2sm_ablation(no_exitdb MXFP8_2SM_EXITDB)
+    add_op6_static_2sm_ablation(no_n128single MXFP8_2SM_N128SINGLE)
+    add_op6_static_2sm_ablation(no_vprefetch MXFP8_2SM_VPREFETCH)
+    add_op6_static_2sm_ablation(no_m2_combo MXFP8_M2_COMBO)
+    add_op6_static_2sm_ablation(no_g_combo MXFP8_G_COMBO)
+    add_op6_static_2sm_ablation(no_r15_orvlog MXFP8_R15_ORVLOG)
+    add_op6_static_2sm_ablation(kv_default MXFP8_KV_STAGES=12)
+    add_op6_static_2sm_ablation(regsm_default MXFP8_WS_REGSM MXFP8_REGSM_SOFTMAX=184)
+    add_op6_static_2sm_ablation(no_2cta FMHA_2CTA)
+    add_op6_static_2sm_ablation(no_amaxfuse MXFP8_AMAXFUSE)
+    add_op6_static_2sm_ablation(no_psf_vec16 MXFP8_PSF_VEC16)
 
   endforeach()
 
@@ -215,6 +265,7 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     DEPENDS
       1ctab200_blackwell_fmha_mxfp8
       op6static2sm_b200_blackwell_fmha_mxfp8
+      ${OP6_STATIC_2SM_ABLATION_TARGETS}
   )
 
   # 打印使用说明

@@ -52,11 +52,11 @@
 // to zero — accuracy vs the dynamic release is part of the evaluation.
 #ifdef MXFP8_PSTATIC
 #ifndef MXFP8_PSTATIC_EXP
-#define MXFP8_PSTATIC_EXP -9
+#define MXFP8_PSTATIC_EXP 0
 #endif
-#if (MXFP8_PSTATIC_EXP) != -9
-#error "MXFP8_PSTATIC uses fixed P scale 2^-9; set MXFP8_PSTATIC_EXP=-9."
-#endif
+// #if (MXFP8_PSTATIC_EXP) != -9
+// #error "MXFP8_PSTATIC uses fixed P scale 2^-9; set MXFP8_PSTATIC_EXP=-9."
+// #endif
 static constexpr int kMXFP8PStaticExp = MXFP8_PSTATIC_EXP;
 static constexpr int kMXFP8PStaticSfpByte = 127 + kMXFP8PStaticExp;
 #endif

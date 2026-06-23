@@ -1,0 +1,2 @@
+###### B 1 H 40 H_K 40 Q 170100 K 170100 D 128 Forward None #SM 148
+ [--] tma ws n128 acc fp32 individual  : 1532.97 TFLOPS/s

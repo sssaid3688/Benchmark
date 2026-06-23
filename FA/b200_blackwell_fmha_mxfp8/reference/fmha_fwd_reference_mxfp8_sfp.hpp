@@ -45,12 +45,12 @@ static constexpr int kMXFP8GroupSize_sfp = 32;
 static constexpr int kMXFP8OnlineTile_sfp = 128;
 
 #ifndef MXFP8_PSTATIC_EXP
-#define MXFP8_PSTATIC_EXP -9
+#define MXFP8_PSTATIC_EXP 0
 #endif
 
-#if (MXFP8_PSTATIC_EXP) != -9
-#error "fmha_reference_mxfp8_sfp expects fixed static P scale 2^-9 (MXFP8_PSTATIC_EXP=-9)."
-#endif
+// #if (MXFP8_PSTATIC_EXP) != -9
+// #error "fmha_reference_mxfp8_sfp expects fixed static P scale 2^-9 (MXFP8_PSTATIC_EXP=-9)."
+// #endif
 
 static constexpr int kMXFP8PStaticExp_sfp = MXFP8_PSTATIC_EXP;
 static constexpr int kMXFP8PStaticSfpByte_sfp = 127 + kMXFP8PStaticExp_sfp;

@@ -11,3 +11,5 @@ make.log
 nohup.out
 FA/build1cta
 FA/build2cta
+FA/build_ablation
+.agents
