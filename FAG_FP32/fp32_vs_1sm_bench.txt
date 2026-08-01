@@ -1,0 +1,98 @@
+########## fag_bwd_fp8_1sm ##########
+===== N=4096 =====
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1026.9 TFLOPS/s
+       t=0.334597ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1026.3 TFLOPS/s
+       t=0.334792ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1026.8 TFLOPS/s
+       t=0.334629ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1025.61 TFLOPS/s
+       t=0.335017ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1026.96 TFLOPS/s
+       t=0.334576ms, smem=133316b
+===== N=8192 =====
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1275.61 TFLOPS/s
+       t=1.07744ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1275.54 TFLOPS/s
+       t=1.0775ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1275.57 TFLOPS/s
+       t=1.07747ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1275.28 TFLOPS/s
+       t=1.07771ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1275.61 TFLOPS/s
+       t=1.07744ms, smem=133316b
+===== N=16384 =====
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1334.28 TFLOPS/s
+       t=4.12023ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1334.28 TFLOPS/s
+       t=4.12025ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1334.46 TFLOPS/s
+       t=4.11969ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1334.45 TFLOPS/s
+       t=4.11971ms, smem=133316b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1334.48 TFLOPS/s
+       t=4.11964ms, smem=133316b
+########## fag_stage_regalloc ##########
+===== N=4096 =====
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1236.82 TFLOPS/s
+       t=0.277808ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1236.26 TFLOPS/s
+       t=0.277934ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1236.47 TFLOPS/s
+       t=0.277886ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1235.08 TFLOPS/s
+       t=0.278199ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 4096 K 4096 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1235.69 TFLOPS/s
+       t=0.27806ms, smem=141572b
+===== N=8192 =====
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1560.94 TFLOPS/s
+       t=0.880487ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1561.77 TFLOPS/s
+       t=0.88002ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1557.97 TFLOPS/s
+       t=0.882165ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1557.03 TFLOPS/s
+       t=0.882701ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 8192 K 8192 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1555.53 TFLOPS/s
+       t=0.883552ms, smem=141572b
+===== N=16384 =====
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1635.81 TFLOPS/s
+       t=3.36075ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1636.77 TFLOPS/s
+       t=3.35878ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1633.81 TFLOPS/s
+       t=3.36488ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1638.19 TFLOPS/s
+       t=3.35587ms, smem=141572b
+###### B 1 H 16 H_K 16 Q 16384 K 16384 D 128 D_VO 128 Backward Full #SM 148
+ [--] tma                              : 1636.73 TFLOPS/s
+       t=3.35887ms, smem=141572b
