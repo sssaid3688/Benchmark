@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(FA_abl LANGUAGES CUDA CXX)
+get_filename_component(FA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+add_subdirectory(${FA_ROOT}/../cutlass cutlass_build_abl EXCLUDE_FROM_ALL)
+add_subdirectory(${FA_ROOT}/b200_blackwell_fmha_mxfp8_ablation b200_blackwell_fmha_mxfp8_ablation)

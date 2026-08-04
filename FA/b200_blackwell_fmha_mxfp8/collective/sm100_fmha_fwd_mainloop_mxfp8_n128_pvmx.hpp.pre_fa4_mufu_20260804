@@ -354,9 +354,6 @@ __device__ __forceinline__ float fast_exp2f_poly(float x) {
 
 #include "collective/fmha_common.hpp"
 #include "collective/fmha_fusion.hpp"
-#if defined(MXFP8_FA4_MUFU_SPLIT)
-#include "collective/fa4_mufu_split_sm100.hpp"
-#endif
 #include "sm100_fmha_load_tma_mxfp8_n128.hpp"                // [MXFP8 N128] single-Q SF-aware load
 
 #ifdef MXFP8_DBG
@@ -2333,11 +2330,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         ? int(decltype(size(tTMEM_LOADrS))::value)
         : int(decltype(size(tTMEM_LOADrS))::value) - (MXFP8_E2OFFLOAD_C);
     static_assert((kE2Keep % 8) == 0 && kE2Keep > 0, "E2OFFLOAD keep-range must stay a multiple of 8 (E2RSF accumulator dispatch)");
-#else
-    constexpr int kE2Keep = int(decltype(size(tTMEM_LOADrS))::value);
-#endif
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kE2Keep; i += kExpConversionsPerStep) {
+    for (int i = 0; i < kE2Keep; i += 2) {
+#else
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tTMEM_LOADrS); i += kExpConversionsPerStep) {
+#endif
       float2 in = make_float2(tTMEM_LOADrS(i+0), tTMEM_LOADrS(i+1));
 #ifdef MXFP8_LCFUSE
       lc_lmax0 = ::fmax(lc_lmax0, in.x);
@@ -2345,14 +2343,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
       float2 out;
       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-#if defined(MXFP8_FA4_MUFU_SPLIT)
-      float2 exp_out = fa4_mufu_split::dispatch_ex2_pair(i / 2, out);
-      tTMEM_LOADrS(i+0) = exp_out.x;
-      tTMEM_LOADrS(i+1) = exp_out.y;
-#else
       tTMEM_LOADrS(i+0) = EXP2_SOFTMAX_PSEL(i, out.x);
       tTMEM_LOADrS(i+1) = EXP2_SOFTMAX_PSEL(i, out.y);
-#endif
 #if defined(MXFP8_AMAXFUSE) && defined(MXFP8_AMAXLAG) && !defined(MXFP8_PSTATIC)
       // [2SM AMAXLAG, ported from base v5] consume the EX2 outputs 8 elements
       // (4 iters) behind — breaks the MUFU-latency dependent stall on the fmax

@@ -128,8 +128,6 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
 
     set(BASE_TARGET 1ctab200_blackwell_fmha_${PREC})
     set(OP6_STATIC_2SM_TARGET op6static2sm_b200_blackwell_fmha_${PREC})
-    set(OP6_FA4_MUFU_TARGET op6static2sm_fa4mufu_b200_blackwell_fmha_${PREC})
-    set(OP6_FA4_MUFU_NO_E2RSF_TARGET op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_${PREC})
 
     # 使用 cutlass 提供的函数创建可执行文件
     # （会自动设置 CUDA 编译选项和 gencode 标志）
@@ -214,91 +212,6 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
 
     target_compile_options(${OP6_STATIC_2SM_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
-    # Independent FA4-style MUFU/FMA split target.  Keeping this separate makes
-    # the baseline and optimized binaries directly comparable from one build.
-    cutlass_add_executable(
-        ${OP6_FA4_MUFU_TARGET}
-        b200_blackwell_fmha.cu
-    )
-    target_link_libraries(${OP6_FA4_MUFU_TARGET} PRIVATE
-      CUTLASS
-      cutlass_tools_util_includes
-      cuda
-    )
-    target_include_directories(${OP6_FA4_MUFU_TARGET} PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    target_compile_definitions(${OP6_FA4_MUFU_TARGET} PRIVATE
-      ${OP6_STATIC_2SM_DEFS}
-      MXFP8_FA4_MUFU_SPLIT
-      MXFP8_FA4_MUFU_BEGIN_PAIR=8
-      MXFP8_FA4_MUFU_END_PAIR=24
-      MXFP8_FA4_MUFU_PERIOD=8
-      MXFP8_FA4_MUFU_SLOT=0
-    )
-    target_compile_options(${OP6_FA4_MUFU_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-
-    # Interaction target: remove the lagged row-sum filler from the softmax
-    # burst, then apply the same compile-time MUFU/FMA split policy.  This keeps
-    # the experiment orthogonal to both the baseline and the single ablations.
-    set(OP6_FA4_MUFU_NO_E2RSF_DEFS ${OP6_STATIC_2SM_DEFS})
-    list(REMOVE_ITEM OP6_FA4_MUFU_NO_E2RSF_DEFS MXFP8_E2RSF)
-    cutlass_add_executable(
-        ${OP6_FA4_MUFU_NO_E2RSF_TARGET}
-        b200_blackwell_fmha.cu
-    )
-    target_link_libraries(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
-      CUTLASS
-      cutlass_tools_util_includes
-      cuda
-    )
-    target_include_directories(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    target_compile_definitions(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
-      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
-      MXFP8_FA4_MUFU_SPLIT
-      # Retained winner: 6 / 32 float2 pairs = 18.75% emulation.
-      MXFP8_FA4_MUFU_BEGIN_PAIR=4
-      MXFP8_FA4_MUFU_END_PAIR=28
-      MXFP8_FA4_MUFU_PERIOD=4
-      MXFP8_FA4_MUFU_SLOT=0
-    )
-    target_compile_options(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-
-    function(add_no_e2rsf_mufu_variant VARIANT_NAME BEGIN_PAIR END_PAIR PERIOD SLOT)
-      set(VARIANT_TARGET op6static2sm_no_e2rsf_fa4mufu${VARIANT_NAME}_b200_blackwell_fmha_${PREC})
-      cutlass_add_executable(
-          ${VARIANT_TARGET}
-          b200_blackwell_fmha.cu
-      )
-      target_link_libraries(${VARIANT_TARGET} PRIVATE
-        CUTLASS
-        cutlass_tools_util_includes
-        cuda
-      )
-      target_include_directories(${VARIANT_TARGET} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-      )
-      target_compile_definitions(${VARIANT_TARGET} PRIVATE
-        ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
-        MXFP8_FA4_MUFU_SPLIT
-        MXFP8_FA4_MUFU_BEGIN_PAIR=${BEGIN_PAIR}
-        MXFP8_FA4_MUFU_END_PAIR=${END_PAIR}
-        MXFP8_FA4_MUFU_PERIOD=${PERIOD}
-        MXFP8_FA4_MUFU_SLOT=${SLOT}
-      )
-      target_compile_options(${VARIANT_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-      set(OP6_NO_E2RSF_MUFU_VARIANT_TARGETS
-          ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS} ${VARIANT_TARGET}
-          PARENT_SCOPE)
-    endfunction()
-
-    # Ratios are relative to the 32 float2 pairs owned by one softmax group.
-    add_no_e2rsf_mufu_variant(12p5  8 24 4 0)  # 4 / 32 pairs
-    add_no_e2rsf_mufu_variant(18p75 4 28 4 0)  # 6 / 32 pairs
-    add_no_e2rsf_mufu_variant(25    8 24 2 0)  # 8 / 32 pairs
-
     function(add_op6_static_2sm_ablation ABLATION_NAME)
       set(ABLATION_TARGET op6static2sm_${ABLATION_NAME}_b200_blackwell_fmha_${PREC})
       set(ABLATION_DEFS ${OP6_STATIC_2SM_DEFS})
@@ -352,9 +265,6 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     DEPENDS
       1ctab200_blackwell_fmha_mxfp8
       op6static2sm_b200_blackwell_fmha_mxfp8
-      op6static2sm_fa4mufu_b200_blackwell_fmha_mxfp8
-      op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_mxfp8
-      ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS}
       ${OP6_STATIC_2SM_ABLATION_TARGETS}
   )
 
