@@ -101,14 +101,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
   }
 
   struct RegisterAllocation {
-#if defined(FAG_REGALLOC_P144)
-    // P-softmax scheduling probe: keep the 512-register warpgroup pool exact,
-    // but move eight registers from the reduction and MMA driver groups to
-    // each of the two compute warpgroups.  No arithmetic or data type changes.
-    static constexpr int kWarpgroup0 = 128;
-    static constexpr int kWarpgroup1 = 144;
-    static constexpr int kWarpgroup2 = 96;
-#elif defined(FAG_REGALLOC_RED144_COMP136)
+#if defined(FAG_REGALLOC_RED144_COMP136)
     // Keep the polynomial-exp compute allocation while returning the load/MMA
     // group's extra registers to the now-critical dQ writer.
     static constexpr int kWarpgroup0 = 144;
@@ -141,8 +134,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     static constexpr int kReduce = kWarpgroup0;
     static constexpr int kCompute = kWarpgroup1;
     static constexpr int kMma = kWarpgroup2;
-#if defined(FAG_REGALLOC_P144) || defined(FAG_REGALLOC_RED144_COMP136) || \
-    defined(FAG_REGALLOC_RED148_COMP134) || \
+#if defined(FAG_REGALLOC_RED144_COMP136) || defined(FAG_REGALLOC_RED148_COMP134) || \
     defined(FAG_REGALLOC_RED152_COMP132) || defined(FAG_REGALLOC_COMP140) || \
     defined(FAG_REGALLOC_FA4_CURRENT)
     static constexpr int kEmpty = 24;
@@ -327,14 +319,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
   using PipelineComputeMmaP = PipelineUmmaConsumerAsync<1, AtomThrShape_MNK>;
   using PipelineComputeMmaDS = PipelineUmmaConsumerAsync<kStagesComputeSmem, AtomThrShape_MNK>;
   using PipelineMmaComputeDKDV = PipelineUmmaAsync<2, AtomThrShape_MNK>;
-#if defined(FAG_DQ_BATCHED_TMA)
-  // Keep four independent FP32 dQ publication buffers resident so the reduce
-  // warps can acquire and populate the complete 64x128 tile behind one pair of
-  // barriers.  The four reduce-add operations and all data types are unchanged.
-  static constexpr int kStagesReduceTmaStore = 4;
-#else
   static constexpr int kStagesReduceTmaStore = 2;
-#endif
   using PipelineReduceTmaStore = PipelineTmaStore<kStagesReduceTmaStore>;
 
   struct PipelineStorage {
@@ -376,18 +361,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
   using SmemLayoutDST = decltype(restage(typename CollectiveMmaDSQ::SmemLayoutA{}, Int<kStagesComputeSmem>{}));
   using SmemLayoutDOT = decltype(restage(typename CollectiveMmaPDO::SmemLayoutB{}, _1{}));
 
-#if defined(FAG_DQ_STORE_TILE_128)
-  // Fixed-shape experiment: stage the complete 64x128 FP32 dQ tile so each
-  // iteration needs one TMA reduce-add store instead of four.  This changes
-  // only the store staging granularity; the accumulator and output types stay
-  // FP32 and FP8 respectively.
-  using TileShapeDQ = std::conditional_t<int(TileShapeDQK{}) == 128, _128, _64>;
-#elif defined(FAG_DQ_STORE_TILE_64)
-  // Two 64-column stages, halving the TMA-store/barrier cadence.
-  using TileShapeDQ = _64;
-#else
   using TileShapeDQ = _32;
-#endif
   using SmemAtomDQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
       cute::UMMA::Major::K, ElementAcc, TileShapeQ, TileShapeDQ
   >());
@@ -419,21 +393,42 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     alignas(16) cute::array<ElementAcc, cute::cosize_v<SmemLayoutSumOdO>> smem_sum_odo;
     alignas(16) cutlass::arch::ClusterTransactionBarrier ds_full;
     alignas(16) cutlass::arch::ClusterBarrier ds_leader;
-#if defined(FAG_SPLIT_DK_DQ_READY)
-    alignas(16) cutlass::arch::ClusterBarrier dk_ready;
-#endif
   };
 
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
+#endif
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadQT = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQT{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadQT = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQT{})) * cute::sizeof_bits_v<Element>);
+#endif
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadKT = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutKT{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadKT = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutKT{})) * cute::sizeof_bits_v<Element>);
+#endif
   static constexpr int kTransactionsBytesDSExchange = cutlass::bits_to_bytes(
       cute::cosize_v<SmemLayoutDSHalf> * cute::sizeof_bits_v<Element>);
   static_assert(kTransactionsBytesDSExchange == 8192);
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadDO = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutDO{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadDO = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutDO{})) * cute::sizeof_bits_v<Element>);
+#endif
 
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
+#endif
+#if defined(FAG_PROBE_HALFTX)
+  static constexpr int kTransactionsBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>) / 2;
+#else
   static constexpr int kTransactionsBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
+#endif
 
   struct SharedStorage {
     TensorStorage tensors;
@@ -748,23 +743,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         : "r"(dst_addr), "r"(src_addr), "r"(mbar_addr), "r"(bytes)
         : "memory");
   }
-
-#if defined(FAG_DS_DIRECT_DSMEM)
-  // Store one already-quantized 16-byte dS vector directly into the peer CTA's
-  // distributed shared memory.  The address is the same local shared-memory
-  // offset mapped to peer_rank; no numeric conversion or layout change occurs.
-  static CUTLASS_DEVICE void store_shared_cluster_128(
-      void* dst, uint4 const& value, uint32_t peer_rank) {
-    uint32_t dst_addr = cute::set_block_rank(
-        cute::cast_smem_ptr_to_uint(dst), peer_rank);
-    asm volatile(
-        "st.shared::cluster.v4.b32 [%0], {%1, %2, %3, %4};"
-        :
-        : "r"(dst_addr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
-        : "memory");
-  }
-#endif
-
 
 
   template<class BlkCoord, class BlkOffset, class ProblemShape_>
@@ -1281,9 +1259,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::Zero;
     tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::Zero;
     uint32_t ds_leader_phase = 0;
-#if defined(FAG_SPLIT_DK_DQ_READY)
-    uint32_t dk_ready_phase = 0;
-#endif
 
     Tensor tSTtST =  partition_fragment_C(tiled_mma_kq, select<0,1>(TileShapeKQ{}));
     tSTtST.data() = TmemAllocation::kS;
@@ -1312,14 +1287,18 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d post-s-acquire (issuing S gemm)\n", blockIdx.x);
 #endif
 
-    // S = Q*K   S^T = Q*K^T 存储的是转置
+    // S = Q*K
     tiled_mma_kq.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
       cute::gemm(tiled_mma_kq,
                  tSTrK(_,_,k_block,_0{}),
                  tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                  tSTtST);
+#endif
       tiled_mma_kq.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1338,14 +1317,18 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 
     pipeline_mma_compute_dp.producer_acquire(pipeline_mma_compute_dp_producer_state);
 
-    // dP = dO*V   dP^T = dO*V^T 存储的是转置
+    // dP = dO*V
     tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
       cute::gemm(tiled_mma_vdo,
                  tDPTrV(_,_,k_block,_0{}),
                  tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                  tDPTtDPT);
+#endif
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1360,13 +1343,17 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d post-P-wait (issuing dV gemm)\n", blockIdx.x);
 #endif
 
-    // dV = P*dO   dV = P^T*dO 
+    // dV = P*dO
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
       cute::gemm(tiled_mma_pdo,
                  tDVrP(_,_,k_block),
                  tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                  tDVtDV);
+#endif
       tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1406,10 +1393,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_kq.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_kq,
                    tSTrK(_,_,k_block,_0{}),
                    tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                    tSTtST);
+#endif
         tiled_mma_kq.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1421,12 +1412,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 #ifdef BWD_2SM_DEBUG
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d iter-loop pre-ds-wait\n", blockIdx.x);
 #endif
-#if defined(FAG_SPLIT_DK_DQ_READY)
-    shared_tensors.dk_ready.wait(dk_ready_phase);
-    dk_ready_phase ^= 1;
-#else
     pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
-#endif
 #ifdef BWD_2SM_DEBUG
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d iter-loop post-ds-wait\n", blockIdx.x);
 #endif
@@ -1442,10 +1428,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       pipeline_load_mma_qt.consumer_wait(pipeline_load_mma_qt_consumer_state);
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_dsq,
                    tDKrDST(_,_,k_block),
                    tDKrQT(_,_,k_block,pipeline_load_mma_qt_consumer_state.index()),
                    tDKtDK);
+#endif
         tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_load_mma_qt.consumer_release(pipeline_load_mma_qt_consumer_state);
@@ -1458,31 +1448,34 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_vdo,
                    tDPTrV(_,_,k_block,_0{}),
                    tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDPTtDPT);
+#endif
         tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
       ++pipeline_mma_compute_dp_producer_state;
 #endif
 
-      // dQ = dS*K (SMEM dS; writes the TMEM region only after dK completed).   dQ=dS*K^T
-#if defined(FAG_SPLIT_DK_DQ_READY)
-      // Unlike dK, dQ must wait until Compute has loaded S(next), because its
-      // accumulator aliases the upper half of that S/P TMEM allocation.
-      pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
-#endif
+      // dQ = dS*K (SMEM dS; writes the TMEM region only after dK completed).
       shared_tensors.ds_leader.wait(ds_leader_phase);
       ds_leader_phase ^= 1;
       tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_dsk,
                    tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
                    tDQrKT(_,_,k_block,_0{}),
                    tDQtDQ);
+#endif
         tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1500,10 +1493,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_vdo,
                    tDPTrV(_,_,k_block,_0{}),
                    tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDPTtDPT);
+#endif
         tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
@@ -1521,10 +1518,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // dV = P*dO
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
         cute::gemm(tiled_mma_pdo,
                    tDVrP(_,_,k_block),
                    tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDVtDV);
+#endif
         tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1556,12 +1557,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d tail post-dkdv-acq2\n", blockIdx.x);
 #endif
 
-#if defined(FAG_SPLIT_DK_DQ_READY)
-    shared_tensors.dk_ready.wait(dk_ready_phase);
-    dk_ready_phase ^= 1;
-#else
     pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
-#endif
 #ifdef BWD_2SM_DEBUG
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d tail post-ds-wait\n", blockIdx.x);
 #endif
@@ -1570,10 +1566,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     pipeline_load_mma_qt.consumer_wait(pipeline_load_mma_qt_consumer_state);
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
       cute::gemm(tiled_mma_dsq,
                  tDKrDST(_,_,k_block),
                  tDKrQT(_,_,k_block,pipeline_load_mma_qt_consumer_state.index()),
                  tDKtDK);
+#endif
       tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
     }
     pipeline_load_mma_qt.consumer_release(pipeline_load_mma_qt_consumer_state);
@@ -1588,18 +1588,19 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
 
     // dQ = dS*K
-#if defined(FAG_SPLIT_DK_DQ_READY)
-    pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
-#endif
     shared_tensors.ds_leader.wait(ds_leader_phase);
     ds_leader_phase ^= 1;
     tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
+#if defined(FAG_PROBE_STUB_ALLGEMM) || defined(FAG_PROBE_STUB_EVERYTHING)
+      // [probe] skip GEMM body
+#else
       cute::gemm(tiled_mma_dsk,
                  tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
                  tDQrKT(_,_,k_block,_0{}),
                  tDQtDQ);
+#endif
       tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1826,22 +1827,10 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     // there are two compute wg's that cooperatively compute softmax
     // they are striped by this tmem atom, i.e. wg0 has 16 elems, then wg1 etc
 
-    auto load_op = []() {
-#if defined(FAG_TMEM_LOAD_32X)
-      return SM100_TMEM_LOAD_32dp32b32x{};
-#else
-      return SM100_TMEM_LOAD_32dp32b16x{};
-#endif
-    }();
+    auto load_op = SM100_TMEM_LOAD_32dp32b16x{};
     auto store_op = []() {
       if constexpr (sizeof(Element) == 1) {
-#if defined(FAG_TMEM_STORE_16X)
-        return SM100_TMEM_STORE_32dp32b16x{};
-#elif defined(FAG_TMEM_STORE_8X)
-        return SM100_TMEM_STORE_32dp32b8x{};
-#else
         return SM100_TMEM_STORE_32dp32b4x{};
-#endif
       }
       else {
         return SM100_TMEM_STORE_32dp32b8x{};
@@ -1915,35 +1904,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     auto tRT_cST_p = thread_r2t.partition_S(tDVcST);
     auto tRT_cST = split_wg(tRT_cST_p);
 
-#if defined(FAG_DEBUG_TMEM_MAP)
-    // Diagnostic only: verify whether the S TMEM-load ownership and P
-    // TMEM-store ownership are identical for every element handled by a
-    // compute thread.  If they differ, the full compute named barrier between
-    // the load and store is required to prevent one thread from overwriting
-    // another thread's still-pending S load.
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-        (dp_idx == 0 || dp_idx == 1)) {
-      int mismatches = 0;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(tTR_cST); ++i) {
-        auto load_coord = tTR_cST(i);
-        auto store_coord = tRT_cST(i);
-        bool same = int(get<0>(load_coord)) == int(get<0>(store_coord)) &&
-                    int(get<1>(load_coord)) == int(get<1>(store_coord));
-        mismatches += !same;
-        if (!same && mismatches <= 8) {
-          printf("[TMEM_MAP] rank=%d wg=%d dp=%d i=%d load=(%d,%d) store=(%d,%d)\n",
-                 int(cute::block_rank_in_cluster()), wg_idx, dp_idx, i,
-                 int(get<0>(load_coord)), int(get<1>(load_coord)),
-                 int(get<0>(store_coord)), int(get<1>(store_coord)));
-        }
-      }
-      printf("[TMEM_MAP_SUMMARY] rank=%d wg=%d dp=%d elems=%d mismatches=%d\n",
-             int(cute::block_rank_in_cluster()), wg_idx, dp_idx,
-             int(size(tTR_cST)), mismatches);
-    }
-#endif
-
     // FA4 Stage A: register-to-TMEM store view for quantized dS. The destination
     // layout is exactly the TS dK MMA's A fragment, so no SMEM reinterpretation
     // or implicit transpose is involved.
@@ -1981,15 +1941,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       pipeline_compute_mma_p.producer_acquire(pipeline_compute_mma_p_producer_state);
       // wait for LSE
       pipeline_load_compute_lse.consumer_wait(pipeline_load_compute_lse_consumer_state);
-
-#if defined(FAG_PREFETCH_DP)
-      // dP for this tile is already produced by the asynchronous MMA path.
-      // Issue its TMEM load before the independent softmax arithmetic so the
-      // register scoreboard latency can overlap EX2.  The same FP32 fragment is
-      // consumed below; only instruction scheduling changes.
-      pipeline_mma_compute_dp.consumer_wait(pipeline_mma_compute_dp_consumer_state);
-      cute::copy(tiled_t2r, tTR_tDPT, tTR_rDPT);
-#endif
 
       auto dispatch_bool = [](bool b, auto fn) {
         if (b) {
@@ -2045,10 +1996,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         softmax_scale_log2_e.x = mainloop_args.softmax_scale * log2_e;
         softmax_scale_log2_e.y = mainloop_args.softmax_scale * log2_e;
 
-#if defined(FAG_EX2_TWO_PHASE) || defined(FAG_EX2_HW_FIRST)
-        // Preserve the exact FP32 FMA and exp2 inputs, but finish all argument
-        // formation before issuing the transcendental operations.  This
-        // shortens the immediate dependency chain seen by the MUFU scheduler.
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tTR_rST); i += 2) {
           float2 acc;
@@ -2059,32 +2006,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           lse.x = sLSE(get<1>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
           lse.y = sLSE(get<1>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
           cute::fma(out, softmax_scale_log2_e, acc, lse);
-          tTR_rST(i) = out.x;
-          tTR_rST(i+1) = out.y;
-        }
-
-#if defined(FAG_EX2_HW_FIRST)
-        // Issue every independent hardware EX2 before the polynomial groups;
-        // the packed FP32 FMA work can then cover MUFU result latency.
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTR_rST); i += 2) {
-          if ((i / 2) % FAG_EX2_EMU_STRIDE != FAG_EX2_EMU_STRIDE - 1) {
-            tTR_rST(i) = ::exp2f(tTR_rST(i));
-            tTR_rST(i+1) = ::exp2f(tTR_rST(i+1));
-          }
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTR_rST); i += 2) {
-          if ((i / 2) % FAG_EX2_EMU_STRIDE == FAG_EX2_EMU_STRIDE - 1) {
-            float2 emu = ex2_emulation_2(tTR_rST(i), tTR_rST(i+1));
-            tTR_rST(i) = emu.x;
-            tTR_rST(i+1) = emu.y;
-          }
-        }
-#else
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTR_rST); i += 2) {
-          float2 out = make_float2(tTR_rST(i), tTR_rST(i+1));
 #ifdef FAG_EX2_EMU_STRIDE
           static_assert(FAG_EX2_EMU_STRIDE == 1 || FAG_EX2_EMU_STRIDE == 2 ||
                         FAG_EX2_EMU_STRIDE == 4 || FAG_EX2_EMU_STRIDE == 8 ||
@@ -2106,64 +2027,15 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           tTR_rST(i+1) = ::exp2f(out.y);
 #endif
         }
-#endif
-#else
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTR_rST); i += 2) {
-          float2 acc;
-          float2 lse;
-          float2 out;
-          acc.x = tTR_rST(i);
-          acc.y = tTR_rST(i + 1);
-          lse.x = sLSE(get<1>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
-          lse.y = sLSE(get<1>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
-          cute::fma(out, softmax_scale_log2_e, acc, lse);
-#ifdef FAG_EX2_EMU_STRIDE
-          static_assert(FAG_EX2_EMU_STRIDE == 1 || FAG_EX2_EMU_STRIDE == 2 ||
-                        FAG_EX2_EMU_STRIDE == 4 || FAG_EX2_EMU_STRIDE == 8 ||
-                        FAG_EX2_EMU_STRIDE == 16,
-                        "supported software-ex2 fractions are 100%, 50%, 25%, 12.5%, and 6.25%");
-          if ((i / 2) % FAG_EX2_EMU_STRIDE == FAG_EX2_EMU_STRIDE - 1) {
-            float2 emu = ex2_emulation_2(out.x, out.y);
-            tTR_rST(i) = emu.x;
-            tTR_rST(i+1) = emu.y;
-          } else {
-            tTR_rST(i) = ::exp2f(out.x);
-            tTR_rST(i+1) = ::exp2f(out.y);
-          }
-#else
-          tTR_rST(i) = ::exp2f(out.x);
-          tTR_rST(i+1) = ::exp2f(out.y);
-#endif
-        }
-#endif
 
         auto tRT_rST = quantize(tTR_rST);
         auto tRT_rST_reshaped = make_tensor(tRT_rST.data(), shape(tRT_cST));
 
         cutlass::arch::fence_view_async_tmem_load();
-#if defined(FAG_P_WG_BARRIERS)
-        // Test whether the two compute warpgroups can independently complete
-        // their disjoint P fragments.  Each group still synchronizes all 128
-        // of its threads before any of them overwrites S in the aliased TMEM
-        // region; only cross-warpgroup waiting is removed.
-        if (wg_idx == 0) {
-          cutlass::arch::NamedBarrier(
-            4 * NumThreadsPerWarp,
-            cutlass::arch::ReservedNamedBarriers::TransformBarrier
-          ).arrive_and_wait();
-        } else {
-          cutlass::arch::NamedBarrier(
-            4 * NumThreadsPerWarp,
-            cutlass::arch::ReservedNamedBarriers::StreamkBarrier0
-          ).arrive_and_wait();
-        }
-#elif !defined(FAG_P_SELF_OWNED_TMEM)
         cutlass::arch::NamedBarrier(
           kNumComputeWarps * NumThreadsPerWarp,
           cutlass::arch::ReservedNamedBarriers::TransformBarrier
         ).arrive_and_wait();
-#endif
 
         cute::copy(tiled_r2t, tRT_rST_reshaped, tRT_tP);
       });
@@ -2185,25 +2057,13 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       pipeline_load_compute_lse.consumer_release(pipeline_load_compute_lse_consumer_state);
       ++pipeline_load_compute_lse_consumer_state;
 
-#if defined(FAG_PREFETCH_DP_AFTER_P)
-      // P has now been published, so the MMA producer can make forward
-      // progress without forming the dependency cycle of FAG_PREFETCH_DP.
-      // Load the already-FP32 dP fragment before waiting on OdO so TMEM load
-      // completion can overlap that independent producer wait.  Arithmetic,
-      // storage types, and pipeline release order are unchanged.
-      pipeline_mma_compute_dp.consumer_wait(pipeline_mma_compute_dp_consumer_state);
-      cute::copy(tiled_t2r, tTR_tDPT, tTR_rDPT);
-#endif
-
       // wait for OdO
       pipeline_load_compute_sum_odo.consumer_wait(pipeline_load_compute_sum_odo_consumer_state);
-#if !defined(FAG_PREFETCH_DP) && !defined(FAG_PREFETCH_DP_AFTER_P)
       // wait for dP
       pipeline_mma_compute_dp.consumer_wait(pipeline_mma_compute_dp_consumer_state);
 
       // compute dS = dsoftmax(P, dP, sum_OdO)
       cute::copy(tiled_t2r, tTR_tDPT, tTR_rDPT);
-#endif
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tTR_rDPT); i += 2) {
@@ -2226,13 +2086,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       }
 
       auto tTR_rDST = quantize(tTR_rDPT);
-#if defined(FAG_DS_RECAST_PACK)
-      // NumericArrayConverter already materializes each four adjacent FP8
-      // values as one 32-bit register group.  Recast that exact bit pattern
-      // instead of rebuilding it with twelve scalar shift/or instructions.
-      // This is bitwise-only: no arithmetic or precision is changed.
-      auto tTR_rDST_u32 = recast<uint32_t>(tTR_rDST);
-#endif
 
       // release dP
       cutlass::arch::fence_view_async_tmem_load();
@@ -2256,11 +2109,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         int q_strip_base = (strip % 2) * 32 + wg_idx * 16;
         bool store_own = strip / 2 == cta_rank;
         int src = strip * 16;
-#if defined(FAG_DS_RECAST_PACK)
-        uint4 lane_q16 = {
-            tTR_rDST_u32(src / 4 + 0), tTR_rDST_u32(src / 4 + 1),
-            tTR_rDST_u32(src / 4 + 2), tTR_rDST_u32(src / 4 + 3)};
-#else
         auto pack4 = [&](int i) {
           return uint32_t(tTR_rDST(i + 0).storage)       |
                  (uint32_t(tTR_rDST(i + 1).storage) << 8)  |
@@ -2269,19 +2117,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         };
         uint4 lane_q16 = {
             pack4(src + 0), pack4(src + 4), pack4(src + 8), pack4(src + 12)};
-#endif
 
         if (store_own) {
           *reinterpret_cast<uint4*>(&sDS_own(q_strip_base, dp_idx)) = lane_q16;
         }
         else {
-#if defined(FAG_DS_DIRECT_DSMEM)
-          store_shared_cluster_128(
-              reinterpret_cast<void*>(&sDS_own(q_strip_base, dp_idx)),
-              lane_q16, uint32_t(cta_rank ^ 1));
-#else
           *reinterpret_cast<uint4*>(&sDS_xchg(q_strip_base, dp_idx)) = lane_q16;
-#endif
         }
       }
 
@@ -2299,28 +2140,10 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         cutlass::arch::fence_view_async_tmem_store();
       }
 
-#if defined(FAG_SPLIT_DK_DQ_READY)
-      // Each warp executes one uniform TMEM-store sequence.  Publish one
-      // arrival per compute warp after its async-view fence, instead of adding
-      // a second 512-thread UMMA pipeline barrier.  dQ lifetime is still owned
-      // by the original delayed dS pipeline.
-      __syncwarp();
-      if ((threadIdx.x & (NumThreadsPerWarp - 1)) == 0) {
-        shared_tensors.dk_ready.arrive(uint32_t(0), uint32_t(1));
-      }
-#endif
-
       // Send the Q half owned by the peer. The destination K-half is selected by
       // the sender rank, yielding peer-local [K0|K1] reduction order.
       if (dp_idx == 0 && wg_idx == 0) {
         uint32_t peer_rank = uint32_t(cta_rank ^ 1);
-#if defined(FAG_DS_DIRECT_DSMEM)
-        // The compute named barrier above has joined all dS stores in this CTA.
-        // Publish them at cluster scope before signaling the peer's completion
-        // barrier.  The relay/MMA wait chain remains unchanged.
-        asm volatile("fence.acq_rel.cluster;" ::: "memory");
-        shared_tensors.ds_full.arrive(peer_rank);
-#else
         shared_tensors.ds_full.arrive_and_expect_tx(
             kTransactionsBytesDSExchange, peer_rank);
         asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
@@ -2330,7 +2153,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
             &shared_tensors.ds_full,
             kTransactionsBytesDSExchange,
             peer_rank);
-#endif
       }
 
       // Do not notify MMA yet: dQ aliases S/P at kS + D/2.  The next loop
@@ -2468,70 +2290,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // stages (0:32, 32:64, 64:96, 96:128).
       static_assert(int(TileShapeDQK{}) % int(TileShapeDQ{}) == 0);
       constexpr int kNumDQStoreTiles = int(TileShapeDQK{}) / int(TileShapeDQ{});
-#if defined(FAG_DQ_BATCHED_TMA)
-      static_assert(int(TileShapeDQK{}) == 128 && int(TileShapeDQ{}) == 32);
-      static_assert(kNumDQStoreTiles == 4);
-      static_assert(kStagesReduceTmaStore == kNumDQStoreTiles);
-
-      // Preserve both index and phase for all four outstanding buffers.  Four
-      // advances return the index to zero and toggle the phase for the next
-      // dQ tile exactly as the serial path does.
-      auto store_state_0 = pipeline_reduce_tma_store_producer_state;
-      ++pipeline_reduce_tma_store_producer_state;
-      auto store_state_1 = pipeline_reduce_tma_store_producer_state;
-      ++pipeline_reduce_tma_store_producer_state;
-      auto store_state_2 = pipeline_reduce_tma_store_producer_state;
-      ++pipeline_reduce_tma_store_producer_state;
-      auto store_state_3 = pipeline_reduce_tma_store_producer_state;
-      ++pipeline_reduce_tma_store_producer_state;
-
-      if (lane_predicate) {
-        pipeline_reduce_tma_store.producer_acquire(store_state_0);
-        pipeline_reduce_tma_store.producer_acquire(store_state_1);
-        pipeline_reduce_tma_store.producer_acquire(store_state_2);
-        pipeline_reduce_tma_store.producer_acquire(store_state_3);
-      }
-      cutlass::arch::NamedBarrier(
-          kNumReduceWarps * NumThreadsPerWarp,
-          cutlass::arch::ReservedNamedBarriers::TransposeBarrier
-      ).arrive_and_wait();
-
-      int dq_row = reduce_thread_idx % 64;
-      int dq_half = reduce_thread_idx / 64;
-      auto stage_to_smem = [&](auto const& store_state, auto stage_c) {
-        constexpr int i = decltype(stage_c)::value;
-        if (dq_half == i / 2) {
-          copy_aligned(
-              tTR_rDQ(_, _, i % 2),
-              sDQ(dq_row, _, store_state.index()));
-        }
-      };
-      stage_to_smem(store_state_0, Int<0>{});
-      stage_to_smem(store_state_1, Int<1>{});
-      stage_to_smem(store_state_2, Int<2>{});
-      stage_to_smem(store_state_3, Int<3>{});
-
-      cutlass::arch::fence_view_async_shared();
-      cutlass::arch::NamedBarrier(
-          kNumReduceWarps * NumThreadsPerWarp,
-          cutlass::arch::ReservedNamedBarriers::TransposeBarrier
-      ).arrive_and_wait();
-
-      if (lane_predicate) {
-        auto launch_store = [&](auto& store_state, auto stage_c) {
-          constexpr int i = decltype(stage_c)::value;
-          copy(mainloop_params.tma_red_dq,
-               tDQsDQ(_, _, _0{}, store_state.index()),
-               tDQgDQ(_, _, i, iter_index * kClusterSize + cta_rank,
-                       blk_coord_batch));
-          pipeline_reduce_tma_store.producer_commit(store_state);
-        };
-        launch_store(store_state_0, Int<0>{});
-        launch_store(store_state_1, Int<1>{});
-        launch_store(store_state_2, Int<2>{});
-        launch_store(store_state_3, Int<3>{});
-      }
-#else
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < kNumDQStoreTiles; i++) {
         if (lane_predicate) {
@@ -2574,7 +2332,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 
         ++pipeline_reduce_tma_store_producer_state;
       }
-#endif
 
       iter_count -= 1;
       iter_index += 1;
@@ -2800,9 +2557,6 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       shared_storage.pipelines.tmem_alloc_ready.init(1);
       shared_storage.tensors.ds_full.init(1);
       shared_storage.tensors.ds_leader.init(2);
-#if defined(FAG_SPLIT_DK_DQ_READY)
-      shared_storage.tensors.dk_ready.init(kClusterSize * kNumComputeWarps);
-#endif
       cutlass::arch::fence_barrier_init();
     }
 

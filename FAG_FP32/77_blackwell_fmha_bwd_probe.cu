@@ -96,7 +96,7 @@
 
 #include "collective/fmha_fusion.hpp"
 #ifdef BWD_2SM
-#include "device/fmha_device_bwd_2sm.hpp"
+#include "device/fmha_device_bwd_2sm_probe.hpp"
 #else
 #include "device/fmha_device_bwd.hpp"
 #endif
@@ -1980,18 +1980,6 @@ int main_single(int argc, char const **args) {
   std::cout << "Backward" << " " << (options.causal ? "Causal" : "Full") << " ";
   std::cout << "#SM " << hw_info.sm_count << std::endl;
 
-#if defined(FAG_FIXED_D128_FULL)
-  if (options.causal || options.residual || options.varlen ||
-      options.d != 128 || options.d_vo != 128) {
-    std::cerr << "This fixed-shape optimization target supports only full, "
-                 "non-varlen d=d_vo=128 problems.\n";
-    return -1;
-  }
-  using FixedShape = Shape<_128, _128, _128, _128>;
-  BwdRunner<false, false, FixedShape, KernelCoop, NoMask> runner;
-  auto result = runner.run(options, hw_info);
-  print_result("tma", result, options.verbose);
-#else
   auto with_causal = [&](auto fn) {
     if (options.causal) {
       fn(CausalForBackwardMask{});
@@ -2018,7 +2006,6 @@ int main_single(int argc, char const **args) {
       std::cout << "No kernel instantiated for d=" << options.d << std::endl;
     }
   });
-#endif
 #endif
 
   return main_result;
