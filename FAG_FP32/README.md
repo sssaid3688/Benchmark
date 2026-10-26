@@ -39,3 +39,33 @@ $BIN --b=1 --h=16 --d=128 --d_vo=128 \
 ```
 
 Run on an otherwise idle GPU for representative measurements.
+
+## Reproduce the main-kernel nsys measurement
+
+The following sequence measures the fused 2-SM backward main kernel. The `fag3_reduce` target is a timing-only dQ-reduce ablation: it deliberately removes the reduce data path and must not be used as a correctness or final-performance target.
+
+```bash
+nvidia-smi -lgc 1965,1965
+
+cd FAG_FP32
+cmake --build build --target \
+  fag_cand_colloop fag3_reduce fag3_reduce_tma fag3_pack \
+  fag3_softmax fag3_corner fag3_bulk fag3_floor fag3_opt_noex2 \
+  -- -j 16
+
+nsys profile --force-overwrite=true -o /tmp/fag_colloop \
+  ./build/fag_cand_colloop \
+  --b=1 --h=16 --q=16384 --k=16384 \
+  --d=128 --d_vo=128 --iterations=20 --mask=no
+nsys stats -r cuda_gpu_kern_sum --format csv /tmp/fag_colloop.nsys-rep
+
+nsys profile --force-overwrite=true -o /tmp/fag_reduce \
+  ./build/fag3_reduce \
+  --b=1 --h=16 --q=16384 --k=16384 \
+  --d=128 --d_vo=128 --iterations=20 --mask=no
+nsys stats -r cuda_gpu_kern_sum --format csv /tmp/fag_reduce.nsys-rep
+```
+
+In `cuda_gpu_kern_sum`, select the row named `Sm100FmhaBwdKernelTma2SmWarpSpecialized`; its `Med (ns)` is the main-kernel median. Ignore initialization, reference, conversion, and SumOdO rows when reporting this metric.
+
+After the measurement, check the actual clock under load. A configured 1965 MHz application clock can still be reduced by power or thermal limits.
