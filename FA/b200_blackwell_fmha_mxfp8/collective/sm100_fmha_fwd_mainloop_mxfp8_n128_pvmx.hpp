@@ -316,6 +316,24 @@ __device__ __forceinline__ float fast_exp2f_poly(float x) {
 #define EXP2_SOFTMAX_PSEL(idx, x) EXP2_SOFTMAX_MIX(idx, x)
 #endif
 
+// ── [Ablation probes (perf-only, NUMERICS WRONG)] Each macro neutralizes ONE
+// instruction class on top of MXFP8_NOEXP_ADD, to rank the next bottleneck after
+// the softmax exp2 is removed. All default off => bit-identical to the noexp build.
+#if defined(MXFP8_ABLATE_FMUL)
+  // P2: O normalize/rescale packed mul (FMUL2) -> identity. Keeps the O load and
+  // store live; the per-tile scale prep (RCP / rescale exp2) may then DCE — that
+  // is visible in the per-probe SASS audit.
+  #define MXFP8_O_MUL(out, sc, in) do { (out).x = (in).x; (out).y = (in).y; } while (0)
+#else
+  #define MXFP8_O_MUL(out, sc, in) cute::mul(out, sc, in)
+#endif
+#if defined(MXFP8_ABLATE_MUFU)
+  // P5: rescale MUFU.EX2 -> arg + 1.0f (keeps the scale*(old-new) argument live).
+  #define MXFP8_RESCALE_EXP2(x) ((x) + 1.0f)
+#else
+  #define MXFP8_RESCALE_EXP2(x) ::exp2f(x)
+#endif
+
 #if defined(MXFP8_2SM_DECOUPLE_PERF)
 // [2SM DECOUPLE PROBE — NUMERICS WRONG, FLOPs identical] the 2SM mirror of
 // the 1SM MXFP8_DUALTILE_PERF decouple ceiling (1047 there, vs coupled 976).
@@ -354,7 +372,20 @@ __device__ __forceinline__ float fast_exp2f_poly(float x) {
 
 #include "collective/fmha_common.hpp"
 #include "collective/fmha_fusion.hpp"
+#if defined(MXFP8_FA4_MUFU_SPLIT)
+#include "collective/fa4_mufu_split_sm100.hpp"
+#endif
 #include "sm100_fmha_load_tma_mxfp8_n128.hpp"                // [MXFP8 N128] single-Q SF-aware load
+
+#ifndef MXFP8_REPEAT_QK
+#define MXFP8_REPEAT_QK 1
+#endif
+#ifndef MXFP8_REPEAT_PV
+#define MXFP8_REPEAT_PV 1
+#endif
+#ifndef MXFP8_REPEAT_SF_UTCCP
+#define MXFP8_REPEAT_SF_UTCCP 1
+#endif
 
 #ifdef MXFP8_DBG
 // Debug: capture the SF smem the MMA warp sees after the TMA load.
@@ -412,6 +443,14 @@ __device__ float   g_dbg_corr_new[8];
 __device__ int     g_dbg_corr_n;
 #endif
 
+#if defined(MXFP8_TIMELINE_PROBE)
+// One-cluster, performance-only timeline.  Each slot is a raw clock64 stamp;
+// only block (0,0,0) writes, so no atomics or cross-block ordering are needed.
+__device__ unsigned long long g_tl_qk[64][4];
+__device__ unsigned long long g_tl_pv[64][8];
+__device__ unsigned long long g_tl_sm[2][64][8];
+#endif
+
 namespace cutlass::fmha::collective {
 
 using namespace cute;
@@ -424,6 +463,36 @@ using namespace cute;
 #define BCN(val) do { if (cute::elect_one_sync()) { unsigned _r = cute::block_rank_in_cluster(); if (_r < 4) { atomicMax(&g_bcn[_r*16], (unsigned)(val)); __threadfence_system(); } } } while(0)
 #else
 #define BCN(val) do {} while(0)
+#endif
+
+#if defined(MXFP8_TIMELINE_PROBE)
+CUTE_DEVICE unsigned long long mxfp8_timeline_clock() {
+  unsigned long long value;
+  asm volatile("mov.u64 %0, %%clock64;" : "=l"(value) :: "memory");
+  return value;
+}
+#define MXFP8_TL_QK(tile_, slot_) do {                                      \
+  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&              \
+      (tile_) < 64 && cute::elect_one_sync()) {                              \
+    g_tl_qk[(tile_)][(slot_)] = mxfp8_timeline_clock();                       \
+  }                                                                          \
+} while (0)
+#define MXFP8_TL_PV(tile_, slot_) do {                                      \
+  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&              \
+      (tile_) < 64 && cute::elect_one_sync()) {                              \
+    g_tl_pv[(tile_)][(slot_)] = mxfp8_timeline_clock();                       \
+  }                                                                          \
+} while (0)
+#define MXFP8_TL_SM(stage_, tile_, slot_) do {                              \
+  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&              \
+      thread_idx == 0 && (tile_) < 64) {                                     \
+    g_tl_sm[int(stage_)][(tile_)][(slot_)] = mxfp8_timeline_clock();          \
+  }                                                                          \
+} while (0)
+#else
+#define MXFP8_TL_QK(tile_, slot_) do {} while (0)
+#define MXFP8_TL_PV(tile_, slot_) do {} while (0)
+#define MXFP8_TL_SM(stage_, tile_, slot_) do {} while (0)
 #endif
 
 // [MXFP8] block-scaled QK gemm helper — like fmha_common.hpp gemm_zero_acc, but
@@ -465,30 +534,54 @@ CUTE_DEVICE void tcgen05_mma_pv_mxfp8_block_scale_ts(
     uint32_t idesc_hi,
     uint32_t scaleC,
     uint32_t sfp_tmem,
-    uint32_t sfv_tmem) {
+    uint32_t sfv_tmem,
+    bool skip_mma = false) {
 #if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
   if (cute::elect_one_sync()) {
-    if constexpr (kIs2Sm) {
-      asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
-        "}\n"
-        :
-        : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
+    // Compile-time + runtime skip dispatch:
+    //   MXFP8_ABLATE_PV_MMA          → always skip (compile-time true)
+    //   MXFP8_ABLATE_PV_AFTER_FIRST  → runtime skip_mma (real PV for first tiles,
+    //                                   skip after — O retains realistic values
+    //                                   so correction runs on real data, not zeros)
+    //   neither                       → never skip
+    bool const do_skip =
+#if defined(MXFP8_ABLATE_PV_MMA)
+      true;
+#elif defined(MXFP8_ABLATE_PV_AFTER_FIRST)
+      skip_mma;
+#else
+      false;
+#endif
+    if (do_skip) {
+      // Volatile fence: keeps all 7 inputs live (no DCE of callers), but
+      // issues zero MMA instructions.  O in TMEM is unchanged.
+      asm volatile("" ::
+          "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
           "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
     }
     else {
-      asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
-        "}\n"
-        :
-        : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
-          "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
+      if constexpr (kIs2Sm) {
+        asm volatile(
+          "{\n\t"
+          ".reg .pred p;\n\t"
+          "setp.ne.b32 p, %4, 0;\n\t"
+          "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
+          "}\n"
+          :
+          : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
+            "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
+      }
+      else {
+        asm volatile(
+          "{\n\t"
+          ".reg .pred p;\n\t"
+          "setp.ne.b32 p, %4, 0;\n\t"
+          "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
+          "}\n"
+          :
+          : "r"(d_tmem), "r"(p_tmem), "l"(v_desc), "r"(idesc_hi),
+            "r"(scaleC), "r"(sfp_tmem), "r"(sfv_tmem));
+      }
     }
   }
 #else
@@ -505,7 +598,8 @@ CUTE_DEVICE void issue_pv_mxfp8_blockscaled_ts(
     TO&& tO,
     TSFP const& tSFP,
     TSFV const& tSFV,
-    bool bcn_pv = false) {
+    bool bcn_pv = false,
+    bool skip_mma = false) {
   using TOBase = std::remove_reference_t<TO>;
   static_assert(cute::is_rmem<typename TV::engine_type>::value,
                 "SM100 MXFP8 PV expects V as an SMEM descriptor fragment.");
@@ -542,7 +636,8 @@ CUTE_DEVICE void issue_pv_mxfp8_blockscaled_ts(
         idesc_hi,
         uint32_t(atom.accumulate_),
         atom_k.tsfa_addr_,
-        atom_k.tsfb_addr_);
+        atom_k.tsfb_addr_,
+        skip_mma);
 
     if (bcn_pv) BCN_PV(85 + 2 * k_block);
     atom.accumulate_ = ScaleOut::One;
@@ -836,11 +931,34 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     SFP1 = SFP0 + kSizeSF,       // [PVMX 2b] P-SF, buffer 1
     SFV0 = SFP1 + kSizeSF,       // [PVMX 2a.1b] V-SF (PV SFB), buffer 0 — double-buffered per-tile
     SFV1 = SFV0 + kSizeSF,       // [PVMX 2a.1b] V-SF, buffer 1
-    kEnd = SFV1 + kSizeSF,       // = 496 <= 512
+    // [Physical double-O] O1 occupies the final 128 TMEM columns.
+    // The SF symbols deliberately keep their legacy addresses inside O1: this
+    // perf-only experiment treats scale-factor storage as nonexistent.
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+    O1 = O0 + kSizeO,            // 384..511
+    kEnd = O1 + kSizeO,          // = 512
+#else
     O1 = O0,                     // [N128] alias (single O; *_1 never live)
+    kEnd = SFV1 + kSizeSF,       // = 496 <= 512
+#endif
     SFA1 = SFA0
   };
+#if defined(MXFP8_PHYSICAL_ODEPTH2) && !defined(MXFP8_ODEPTH2)
+#error "MXFP8_PHYSICAL_ODEPTH2 requires MXFP8_ODEPTH2"
+#endif
+#if defined(MXFP8_PHYSICAL_ODEPTH2) && (defined(MXFP8_OSPLIT) || defined(MXFP8_SM12))
+#error "MXFP8_PHYSICAL_ODEPTH2 does not support the OSPLIT/SM12 O0-only paths"
+#endif
   static_assert(uint32_t(TmemAllocation::kEnd) <= 512, "TMEM 512-col budget exceeded");
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+  static_assert(uint32_t(TmemAllocation::O0) == 256);
+  static_assert(uint32_t(TmemAllocation::O1) == 384);
+  static_assert(uint32_t(TmemAllocation::O0) + uint32_t(TmemAllocation::kSizeO)
+                    == uint32_t(TmemAllocation::O1),
+                "physical O0 and O1 must be adjacent and non-overlapping");
+  static_assert(uint32_t(TmemAllocation::O1) + uint32_t(TmemAllocation::kSizeO) == 512,
+                "physical O1 must occupy the final 128 TMEM columns");
+#endif
 
   // indices for V0 / V1
   enum : int {
@@ -883,14 +1001,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   using PipelineC = cutlass::PipelineAsync<1>;
 
   // from mma to correction
-  // [MXFP8 N128] depth 1, NOT 2. The dual-stage design has TWO O accumulators
-  // (O0/O1, one per M=128 subtile) so depth-2 PipelineO ⟺ 2 physical buffers.
-  // The single-stage variant has ONE O accumulator (TmemAllocation::O0, with O1
-  // aliased to it). With depth 2 the mma producer runs 2 PVs ahead: PV(i+1)'s
-  // producer_acquire only waits for correction to release O #(i-1), so PV(i+1)
-  // accumulates into the single O before correction has rescaled/consumed
-  // PV(i)'s result — a WAR race on O (~1% corrupted outputs). Depth 1 forces
-  // PV(i+1) to wait until correction has consumed PV(i)'s O.
+  // [MXFP8 N128] Default depth 1 owns one physical O. The NOEXP_RAW+ODEPTH2
+  // experiment below owns two complete buffers; other ODEPTH2 targets retain
+  // the legacy single-O handshake behavior.
 #ifdef MXFP8_OSPLIT
   // [刀12 OSPLIT] depth 2, ONE pipeline: stage index == O half index. Per tile the
   // producer (PV) does acquire/commit TWICE (h0 then h1), the consumer (correction)
@@ -899,6 +1012,20 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // double-buffer-free (acquire(h,t) waits release(h,t-1)) so the WAR race that
   // killed plain depth-2 (single shared O buffer) CANNOT occur: the two stages
   // protect two PHYSICALLY DISJOINT 64-col halves.
+  using PipelineO = cutlass::PipelineUmmaAsync<2, typename CollectiveMmaQK::AtomThrShapeMNK>;
+#elif defined(MXFP8_ODEPTH2)
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+  // [Physical double-O] Pipeline stage 0 owns O0=256..383 and stage
+  // 1 owns O1=384..511. PV writes and correction/epilogue reads use the same
+  // state index, so release(k) protects the exact physical buffer reused by
+  // acquire(k+2). O1 intentionally aliases every legacy SF slot.
+#else
+  // [EXPERIMENT: double-O handshake, single physical O] Same 128-col O0 (unchanged),
+  // but PipelineO uses depth-2 so producer_acquire(k) waits release(k-2) instead of
+  // release(k-1). This UNBLOCKS PV(k) from correction(k-1) — testing whether the
+  // depth-1 "O release gates the next PV" reaction chain is the bottleneck. Accepts
+  // the WAR race (~1% corrupted output) since we only measure performance, not correctness.
+#endif
   using PipelineO = cutlass::PipelineUmmaAsync<2, typename CollectiveMmaQK::AtomThrShapeMNK>;
 #else
   using PipelineO = cutlass::PipelineUmmaAsync<1, typename CollectiveMmaQK::AtomThrShapeMNK>;  // [2SM M2] 2-SM-aware UMMA pipeline
@@ -932,7 +1059,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // [刀27 N128SINGLE] SmemLayoutK is now ONE slot = full per-CTA 64-N K tile,
   // so cosize already covers the whole stage (drop the QK64 2x sub-slot factor).
   // Same byte total as the OFF path (2 x 32-N == 64-N). (oyhj mainloop:351.)
-  static const int TransactionBytesLoadK_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
+  static const int TransactionBytesLoadK_data =
+#if defined(MXFP8_DROP_KV_TMA)
+      0;
+#else
+      cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
+#endif
 #else
   static const int TransactionBytesLoadK_data = 2 * cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
 #endif
@@ -940,9 +1072,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   // [刀12 OSPLIT] a V stage = TWO 32-D-row V sub-tiles (same total bytes; K mirror).
   static const int TransactionBytesLoadV_data = 2 * cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
 #else
-  static const int TransactionBytesLoadV_data = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
+  static const int TransactionBytesLoadV_data =
+#if defined(MXFP8_DROP_KV_TMA)
+      0;
+#else
+      cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
 #endif
-  static const int TransactionBytesLoadSFK   = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
+#endif
+  static const int TransactionBytesLoadSFK   =
+#if defined(MXFP8_DROP_SF_TMA) || defined(MXFP8_DROP_KV_TMA)
+      0;
+#else
+      cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
+#endif
   static const int TransactionBytesLoadK     = TransactionBytesLoadK_data + TransactionBytesLoadSFK;
   static const int TransactionBytesLoadV     = TransactionBytesLoadV_data + TransactionBytesLoadSFK;
 
@@ -1305,19 +1447,53 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       cute::print("[SFGEO3] sfv1_s2t_dst.layout="); cute::print(sfv1_s2t_dst.layout()); cute::print("\n");
     }
 #endif
+    bool sfp_once_initialized = false;
     // [PVMX 2b] per-tile P-SF UTCCP (mirror load_sfb): smem_sfp[buf] -> SFP[buf] TMEM.
     auto load_sfp = [&](int buf) {
-      if (cute::elect_one_sync()) {
-        if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,0), sfp0_s2t_dst);
-        else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,1), sfp1_s2t_dst);
+#if !defined(MXFP8_DROP_PV_SFP_UTCCP) && !defined(MXFP8_DROP_SF_UTCCP)
+#if defined(MXFP8_SFP_CONST_GUARD) || defined(MXFP8_SFP_CONST_ONCE)
+      if (!sfp_once_initialized) {
+        if (cute::elect_one_sync()) {
+          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,0), sfp0_s2t_dst);
+          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,1), sfp1_s2t_dst);
+        }
+        sfp_once_initialized = true;
       }
+#endif
+#ifndef MXFP8_SFP_CONST_ONCE
+      if (cute::elect_one_sync()) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int rep = 0; rep < MXFP8_REPEAT_SF_UTCCP; ++rep) {
+          if (buf == 0) copy(utccp_SFP, sfp_s2t_src(_,_,_,_,0), sfp0_s2t_dst);
+          else          copy(utccp_SFP, sfp_s2t_src(_,_,_,_,1), sfp1_s2t_dst);
+        }
+      }
+#endif
+#endif
     };
+    bool sfv_once_initialized = false;
     // [PVMX 2a.1b] per-tile V-SF UTCCP: smem_sfv[vidx] -> SFV[buf] TMEM.
     auto load_sfv = [&](int vidx, int buf) {
-      if (cute::elect_one_sync()) {
-        if (buf == 0) copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv0_s2t_dst);
-        else          copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv1_s2t_dst);
+#if !defined(MXFP8_DROP_PV_SFV_UTCCP) && !defined(MXFP8_DROP_SF_UTCCP)
+#if defined(MXFP8_SFV_CONST_GUARD) || defined(MXFP8_SFV_CONST_ONCE)
+      if (!sfv_once_initialized) {
+        if (cute::elect_one_sync()) {
+          copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv0_s2t_dst);
+          copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv1_s2t_dst);
+        }
+        sfv_once_initialized = true;
       }
+#endif
+#ifndef MXFP8_SFV_CONST_ONCE
+      if (cute::elect_one_sync()) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int rep = 0; rep < MXFP8_REPEAT_SF_UTCCP; ++rep) {
+          if (buf == 0) copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv0_s2t_dst);
+          else          copy(utccp_SFV, sfv_s2t_src(_,_,_,_,vidx), sfv1_s2t_dst);
+        }
+      }
+#endif
+#endif
     };
     // ===================================================================
 
@@ -1348,17 +1524,40 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // all KV tiles, so a single SFA0 slot is reused — re-copying it per QK
     // would race the in-flight QK that reads it once QK tiles overlap.
     auto load_sfa = [&]() {
-      if (cute::elect_one_sync())
-        copy(utccp_SFA, sfq_s2t_src(_,_,_,_,q_index), sfa0_s2t_dst);
+#if !defined(MXFP8_DROP_QK_SFA_UTCCP) && !defined(MXFP8_DROP_SF_UTCCP)
+      if (cute::elect_one_sync()) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int rep = 0; rep < MXFP8_REPEAT_SF_UTCCP; ++rep) {
+          copy(utccp_SFA, sfq_s2t_src(_,_,_,_,q_index), sfa0_s2t_dst);
+        }
+      }
+#endif
     };
     // SFB (K scale factors) ping-pongs by buf — QK(k)/QK(k+1) overlap, so the
     // K scale-factor TMEM operand must double-buffer like S. One UTCCP per
     // tile: the 512B SFK smem slot already holds the FULL 128-row SF atom.
+    bool sfb_once_initialized = false;
     auto load_sfb = [&](int kidx, int buf) {
-      if (cute::elect_one_sync()) {
-        if (buf == 0) copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb0_s2t_dst);
-        else          copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb1_s2t_dst);
+#if !defined(MXFP8_DROP_QK_SFB_UTCCP) && !defined(MXFP8_DROP_SF_UTCCP)
+#if defined(MXFP8_SFB_CONST_GUARD) || defined(MXFP8_SFB_CONST_ONCE)
+      if (!sfb_once_initialized) {
+        if (cute::elect_one_sync()) {
+          copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb0_s2t_dst);
+          copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb1_s2t_dst);
+        }
+        sfb_once_initialized = true;
       }
+#endif
+#ifndef MXFP8_SFB_CONST_ONCE
+      if (cute::elect_one_sync()) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int rep = 0; rep < MXFP8_REPEAT_SF_UTCCP; ++rep) {
+          if (buf == 0) copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb0_s2t_dst);
+          else          copy(utccp_SFB, sfk_s2t_src(_,_,_,_,kidx), sfb1_s2t_dst);
+        }
+      }
+#endif
+#endif
     };
     // [M3 sub-tile] issue QK sub-MMA (M256xN64): KV-stage kidx, sub-tile sub
     // (0 = kv cols 0-63, 1 = 64-127), S buffer buf. S column base lands exactly
@@ -1393,7 +1592,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
           + warp_uniform(uint32_t(buf ? TmemAllocation::SFB1 : TmemAllocation::SFB0));
 #endif
       load_sfb(kidx, buf);
-      gemm_bs(mma_qk, /*zero_acc=*/true, tSrQ0, tSrK(_,_,_, kidx), tStSk, tCtSFA0, tCtSFBk);
+#if defined(MXFP8_ABLATE_QK_MMA)
+      // Performance-only QK ablation. Keep the TMEM/SF addresses and the
+      // surrounding K/S pipeline protocol live, but issue no tcgen05 QK MMA.
+      asm volatile("" ::
+          "r"(tStSk.data().get()), "r"(tCtSFBk.data().get()),
+          "r"(tCtSFA0.data().get()), "r"(kidx) : "memory");
+#else
+      CUTLASS_PRAGMA_UNROLL
+      for (int rep = 0; rep < MXFP8_REPEAT_QK; ++rep) {
+        gemm_bs(mma_qk, /*zero_acc=*/true, tSrQ0, tSrK(_,_,_, kidx), tStSk, tCtSFA0, tCtSFBk);
+      }
+#endif
     };
 #else
     auto do_qk = [&](int kidx, int sub, int buf) {
@@ -1407,8 +1617,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
                          + uint32_t(sub) * 2u);
       if (sub == 0) load_sfb(kidx, buf);   // one UTCCP serves both sub-MMAs
       // K data smem sub-slot index (K stays 2 sub-slots per stage; SF does not).
+#if defined(MXFP8_ABLATE_QK_MMA)
+      asm volatile("" ::
+          "r"(tStSk.data().get()), "r"(tCtSFBk.data().get()),
+          "r"(tCtSFA0.data().get()), "r"(kidx), "r"(sub) : "memory");
+#else
       gemm_bs(mma_qk, /*zero_acc=*/true, tSrQ0, tSrK(_,_,_, 2*kidx + sub), tStSk, tCtSFA0, tCtSFBk);
+#endif
     };
+#endif
+#if defined(MXFP8_ABLATE_PV_AFTER_FIRST)
+    // [PV-after-first ablation] Do real PV-MMA for the first PV_FILL_TILES tiles
+    // to fill both O pipeline slots with realistic data.  Skip PV-MMA after —
+    // O retains realistic values so correction runs on real data, not zeros.
+    int pv_fill_count = 0;
+    constexpr int PV_FILL_TILES = 2;
 #endif
 #ifdef MXFP8_OSPLIT
     // [刀12 OSPLIT] PV(t) issues as 2 x (M256xN64) sub-MMAs along D: sub h writes
@@ -1416,7 +1639,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // reads smem sub-slot 2*vidx+h; SFV: sub1 reads SFV[buf] at +2 columns (the
     // proven sfb_parity trick — the 128-D-row SF atom holds the odd 64 rows' SF
     // at col offset 2). first_pv zero-inits each half's own columns.
-    auto do_pv = [&](int vidx, int buf, bool first_pv, int sub) {
+    auto do_pv = [&](int vidx, int buf, bool first_pv, int sub, bool skip_mma = false) {
 #ifdef MXFP8_DBG
       if (blockIdx.x==0 && blockIdx.y==0 && blockIdx.z==0 && cute::elect_one_sync() && g_dbg_npv < 8) {
         g_dbg_pv_vidx[g_dbg_npv] = vidx; g_dbg_pv_buf[g_dbg_npv] = buf; g_dbg_pv_first[g_dbg_npv] = first_pv?1:0; g_dbg_npv = g_dbg_npv + 1;
@@ -1435,13 +1658,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       issue_pv_mxfp8_blockscaled_ts<kPV64Is2Sm>(
           mma_pv, /*zero_acc=*/first_pv, p_tmem_base,
           tOrV(_,_,_, 2*vidx + sub), tOtOk, tCtSFPk, tCtSFVk,
-          /*bcn_pv=*/true);
+          /*bcn_pv=*/true, skip_mma);
     };
 #else
     // [M3-2 LAZY-MAX] PV is WHOLE-TILE again: both P halves share one scale
     // w_k, so P[buf] x V(tile) issues as one block-scaled MMA with a single
     // per-tile correction rescale. first_pv zero-inits O.
-    auto do_pv = [&](int vidx, int buf, bool first_pv) {
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+    bool o1_first_pv = true;
+#endif
+    auto do_pv = [&](int vidx, int buf, bool first_pv, int o_buf, bool skip_mma = false) {
 #ifdef MXFP8_DBG
       if (blockIdx.x==0 && blockIdx.y==0 && blockIdx.z==0 && cute::elect_one_sync() && g_dbg_npv < 8) {
         g_dbg_pv_vidx[g_dbg_npv] = vidx; g_dbg_pv_buf[g_dbg_npv] = buf; g_dbg_pv_first[g_dbg_npv] = first_pv?1:0; g_dbg_npv = g_dbg_npv + 1;
@@ -1452,10 +1678,28 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       tCtSFPk.data() = tCtSFP.data().get() + warp_uniform(uint32_t(buf ? TmemAllocation::SFP1 : TmemAllocation::SFP0));
       Tensor tCtSFVk = tCtSFV;
       tCtSFVk.data() = tCtSFV.data().get() + warp_uniform(uint32_t(buf ? TmemAllocation::SFV1 : TmemAllocation::SFV0));
-      issue_pv_mxfp8_blockscaled_ts<kPVIs2Sm>(
-          mma_pv, /*zero_acc=*/first_pv, p_tmem_base,
-          tOrV(_,_,_,vidx), tOtO0, tCtSFPk, tCtSFVk,
-          /*bcn_pv=*/true);
+      Tensor tOtOk = tOtO;
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+      tOtOk.data() = tOtO.data().get()
+          + warp_uniform(uint32_t(o_buf ? TmemAllocation::O1 : TmemAllocation::O0));
+#else
+      (void)o_buf;
+      tOtOk.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
+#endif
+      bool zero_acc = first_pv;
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+      // Each physical accumulator must be initialized on its own first use.
+      // Thereafter a stage only reuses its O after release of that same stage.
+      zero_acc = first_pv || (o_buf != 0 && o1_first_pv);
+      if (o_buf != 0) { o1_first_pv = false; }
+#endif
+      CUTLASS_PRAGMA_UNROLL
+      for (int rep = 0; rep < MXFP8_REPEAT_PV; ++rep) {
+        issue_pv_mxfp8_blockscaled_ts<kPVIs2Sm>(
+            mma_pv, /*zero_acc=*/zero_acc, p_tmem_base,
+            tOrV(_,_,_,vidx), tOtOk, tCtSFPk, tCtSFVk,
+            /*bcn_pv=*/true, skip_mma);
+      }
     };
 #endif
     // ------------------------------------------------------------------
@@ -1463,7 +1707,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // ---- prologue: QK0 -> S0 -----------------------------------------
     // wait K0
     k_index = pipeline_kv_consumer_state.index();
+    MXFP8_TL_QK(0, 0);  // K-ready wait begin
+#if !defined(MXFP8_DROP_KV_PIPE)
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+#endif
+    MXFP8_TL_QK(0, 1);  // K-ready wait end
     ++pipeline_kv_consumer_state;
 
 #ifdef MXFP8_DBG
@@ -1523,11 +1771,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       qk_sfb_uaddr = warp_uniform(uint32_t(buf ? TmemAllocation::SFB1 : TmemAllocation::SFB0));
 #endif
 #if defined(MXFP8_2SM_N128SINGLE)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+#endif
+      MXFP8_TL_QK(0, 2);  // QK issue begin
       do_qk(k_index, buf);                                   // QK0 -> S[0:128)
       BCN(5);   // [2SM] past first QK 2-SM MMA (do_qk)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
+#endif
       ++pipeline_s0_producer_state;
+      MXFP8_TL_QK(0, 3);  // QK commit complete
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
@@ -1553,17 +1807,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     // wait V0 (held until PV0 in loop iter 1)
     int v_index_prev = pipeline_kv_consumer_state.index();
+#if !defined(MXFP8_DROP_KV_PIPE)
     pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+#endif
     ++pipeline_kv_consumer_state;
 
     // release K0  (KV release order == slot order: K0,V0,K1,V1,...)
+#if !defined(MXFP8_DROP_KV_PIPE)
     pipeline_kv.consumer_release(pipeline_kv_release_state);
+#endif
     ++pipeline_kv_release_state;
 
     // acquire S sub-slots (buffer 1) for QK1 (loop iter 1). depth-2 acquire #2
     // is granted immediately (no prior occupant of buffer 1).
 #if defined(MXFP8_2SM_N128SINGLE)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+#endif
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
@@ -1596,13 +1856,21 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       // wait K(k)
       k_index = pipeline_kv_consumer_state.index();
+      MXFP8_TL_QK(k, 0);
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+#endif
+      MXFP8_TL_QK(k, 1);
       ++pipeline_kv_consumer_state;
 
 #if defined(MXFP8_2SM_N128SINGLE)
+      MXFP8_TL_QK(k, 2);
       do_qk(k_index, qk_buf);
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
+#endif
       ++pipeline_s0_producer_state;
+      MXFP8_TL_QK(k, 3);
 #else
       // QK(k).sub0 -> S[k%2][0:64), commit s0; .sub1 -> [64:128), commit s1
       do_qk(k_index, 0, qk_buf);
@@ -1619,9 +1887,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       // wait V(k) (held until PV(k) next iter)
       v_index = pipeline_kv_consumer_state.index();
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+#endif
       ++pipeline_kv_consumer_state;
-#if defined(MXFP8_M2_UTCCP) || defined(MXFP8_M2_COMBO)
+#if (defined(MXFP8_M2_UTCCP) || defined(MXFP8_M2_COMBO)) && !defined(MXFP8_DISABLE_SFV_HOIST)
       // [M2-A UTCCP-HOIST] issue the per-tile V-SF UTCCP NOW (smem_sfv ready
       // since the V-wait above returned; SFV[pv_buf] TMEM free since tile k-3).
       // Pure reorder: independent of the corr/s0 barrier-spins below, so its
@@ -1633,16 +1903,22 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
       // PV(k-1): P[(k-1)%2] * V(k-1) -> O
       BCN(8);   // [2SM] loop: before pipeline_corr.producer_acquire (PipelineO mma->corr)
+      MXFP8_TL_PV(k - 1, 0);  // O-slot acquire begin
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);   // [OSPLIT: h0 of O]
+      MXFP8_TL_PV(k - 1, 1);  // O-slot acquire end
       BCN(80);  // [2SM] loop: past corr acquire, before PipelineS sub-slot acquires
+      MXFP8_TL_PV(k - 1, 2);  // P/S-slot acquire begin
 #if defined(MXFP8_2SM_N128SINGLE)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+#endif
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);   // g0 released sub0(k-1): P half0 ready
       pipeline_s1.producer_acquire(pipeline_s1_producer_state);   // g1 released sub1(k-1): P half1 ready
 #endif
 #endif
+      MXFP8_TL_PV(k - 1, 3);  // P complete and buffer ownership returned
       BCN(81);  // [2SM] loop: P ready, about to PV-SF UTCCP
 #ifdef MXFP8_PSTATIC
       // [PSTATIC] one-shot constant SFP: both TMEM slots filled at the first
@@ -1652,38 +1928,55 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #else
       load_sfp(pv_buf);                // [PVMX 2b] stage P-SF[pv_buf] -> SFP[pv_buf]
 #endif
-#if !defined(MXFP8_M2_UTCCP) && !defined(MXFP8_M2_COMBO)
+#if (!defined(MXFP8_M2_UTCCP) && !defined(MXFP8_M2_COMBO)) || defined(MXFP8_DISABLE_SFV_HOIST)
       load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] stage V-SF[v_index_prev] -> SFV[pv_buf]
 #endif
+      MXFP8_TL_PV(k - 1, 4);  // scale-factor staging complete
       BCN(82);  // [2SM] loop: PV-SF UTCCP done, about to do_pv (PV 2-SM MMA)
+#if defined(MXFP8_ABLATE_PV_AFTER_FIRST)
+      bool skip_pv = (pv_fill_count >= PV_FILL_TILES);
+#else
+      bool skip_pv = false;
+#endif
 #ifdef MXFP8_OSPLIT
       // [刀12 OSPLIT] PV0(k-1) -> O[0:64) on stage h0, PV1(k-1) -> O[64:128) on h1.
       // The acquire(h1) between the two sub-issues waits correction's h1 release of
       // tile k-2, which overlaps PV0's UMMA execution — corr work is NOT serially
       // sandwiched between the sub-PVs (the M3-2 死因), it pipelines half-a-tile ahead.
-      do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/0);
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/0);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);   // h0 in flight
       ++pipeline_corr_producer_state;
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);  // h1 (corr released k-2's h1)
-      do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/1);
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/1);
       BCN(92);   // [2SM] loop: past do_pv return (before corr producer_commit)
       first_pv = false;
       pipeline_corr.producer_commit(pipeline_corr_producer_state);   // h1 in flight
       ++pipeline_corr_producer_state;
 #else
       // [M3-2 LAZY-MAX] whole-tile PV (P halves share scale w_k).
-      do_pv(v_index_prev, pv_buf, first_pv);
+      MXFP8_TL_PV(k - 1, 5);  // PV issue begin
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv,
+            pipeline_corr_producer_state.index());
+      MXFP8_TL_PV(k - 1, 6);  // PV issue end
       BCN(92);   // [2SM] loop: past do_pv return (before corr producer_commit)
       first_pv = false;
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
+      MXFP8_TL_PV(k - 1, 7);  // O-full commit complete
+#endif
+#if defined(MXFP8_ABLATE_PV_AFTER_FIRST)
+      ++pv_fill_count;
 #endif
       BCN(100);  // [2SM] loop: past PV producer_commit (PipelineO)
 
       // release V(k-1) then K(k)  (slot order)
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
+#endif
       ++pipeline_kv_release_state;
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
+#endif
       ++pipeline_kv_release_state;
 
       v_index_prev = v_index;
@@ -1698,9 +1991,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       // loop iteration (no QK follows); then acquire #(n+2) on each
       // sub-pipeline waits g0/g1 release #n ⟹ both P halves of tile n-1 ready.
 #if defined(MXFP8_2SM_N128SINGLE)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
+#endif
       ++pipeline_s0_producer_state;
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+#endif
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
@@ -1731,28 +2028,38 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
       load_sfv(v_index_prev, pv_buf);  // [PVMX 2a.1b] tail: stage V-SF[v_index_prev] -> SFV[pv_buf]
       BCN(102);  // [2SM] tail: before tail do_pv
+#if defined(MXFP8_ABLATE_PV_AFTER_FIRST)
+      bool skip_pv = (pv_fill_count >= PV_FILL_TILES);
+#else
+      bool skip_pv = false;
+#endif
 #ifdef MXFP8_OSPLIT
-      do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/0);
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/0);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);   // h0
       ++pipeline_corr_producer_state;
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);  // h1
-      do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/1);
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv, /*sub=*/1);
       pipeline_corr.producer_commit(pipeline_corr_producer_state);   // h1
       ++pipeline_corr_producer_state;
 #else
-      do_pv(v_index_prev, pv_buf, first_pv);
+      if (!skip_pv) do_pv(v_index_prev, pv_buf, first_pv,
+            pipeline_corr_producer_state.index());
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
 #endif
       BCN(103);  // [2SM] tail: past tail PV producer_commit
 
       // release V(n-1)
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_release(pipeline_kv_release_state);
+#endif
       ++pipeline_kv_release_state;
 
       // final balancing commits (match the trailing producer_acquires)
 #if defined(MXFP8_2SM_N128SINGLE)
+#ifndef MXFP8_2SM_DECOUPLE_PERF
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
+#endif
       ++pipeline_s0_producer_state;
 #else
 #ifndef MXFP8_2SM_DECOUPLE_PERF
@@ -1798,9 +2105,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_consumer_state) {
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     for (int k = 0; k < mask_tile_count; ++k) {
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);   // K(k) full
+#endif
       ++pipeline_kv_consumer_state;
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.consumer_wait(pipeline_kv_consumer_state);   // V(k) full
+#endif
       ++pipeline_kv_consumer_state;
     }
   }
@@ -1858,6 +2169,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // → index == k%2 → buffer k%2, exactly the buffer QK(k) wrote. group 1
     // mirrors group 0's pipeline-state ++ so this index stays in lockstep.
     int sbuf = pipeline_s_consumer_state.index();
+#if defined(MXFP8_TIMELINE_PROBE)
+    uint32_t timeline_tile = pipeline_s_consumer_state.count();
+#endif
 
     // Build the full (128,128) C fragment exactly as the single-group variant,
     // then compose down to this group's 64-col half (the proven sub-view path
@@ -1945,7 +2259,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // of S directly — the B_SREADY cross-group NamedBarrier is GONE. g0 starts
     // on sub0 while the MMA is still computing sub1.
 #ifndef MXFP8_2SM_DECOUPLE_PERF
+    MXFP8_TL_SM(stage, timeline_tile, 0);  // S-ready wait begin
     pipeline_s.consumer_wait(pipeline_s_consumer_state);
+    MXFP8_TL_SM(stage, timeline_tile, 1);  // S-ready wait end
 #endif
 
     // read all of S from tmem into reg mem
@@ -1953,7 +2269,98 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // a 200us peer delay left peer S = exact 0. So the cta_group::2 MMA genuinely does
     // NOT write the peer's TMEM (not a read-before-write race). See M2 续19u.
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+#if defined(MXFP8_SOFTMAX_ONEADD)
+    // DCE guard for the one-add probe.  The value is connected below to the
+    // existing row-max/statistics -> correction -> O -> HBM path.  An empty
+    // inline-asm operand is not sufficient: ptxas can discard both the add and
+    // the S LDTM when the asm has no observable output.
+    ElementQK softmax_oneadd_guard = 0.0f;
+#endif
+#if !defined(MXFP8_DROP_TMEM_LDST) && !defined(MXFP8_DROP_S_LDTM)
+    // [DROP_TMEM_LDST] skip the S-load LDTM entirely (the compiler does NOT DCE a
+    // tcgen05.ld even when its destination is unused, so we gate it explicitly).
+    // Under this probe nothing reads tTMEM_LOADrS (the add uses a runtime param,
+    // burst/row_sum are continue'd, convert writes a constant). The consumer_wait
+    // on S-ready still runs, so the QK-MMA -> softmax ordering is preserved.
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
+#if defined(MXFP8_REPEAT_S_LDTM)
+    static_assert(MXFP8_REPEAT_S_LDTM == 2 || MXFP8_REPEAT_S_LDTM == 4,
+                  "MXFP8_REPEAT_S_LDTM must be 2 or 4");
+    // [TC bandwidth probe, perf-only] Load into distinct register fragments and
+    // retain a small runtime checksum.  This prevents ptxas from merging loads
+    // that overwrite the same destination while leaving the real softmax input,
+    // pipeline handshakes, MMA descriptors and TMEM addresses unchanged.
+    uint32_t repeat_s_ldtm_guard = 0;
+    Tensor tTMEM_LOADrS_probe = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int rep = 1; rep < MXFP8_REPEAT_S_LDTM; ++rep) {
+      // The predicate is false for the benchmark's normal scale_output=1, so
+      // the effective address is exactly the baseline S address.  It remains
+      // runtime-dependent to ptxas, preventing common-subexpression merging of
+      // the tcgen05.ld operations.  The loop stays rolled so every iteration
+      // reuses one 64-register destination fragment (no x4 live-range spill).
+      uint32_t runtime_zero = params.scale_output == float(4096 + rep)
+                            ? uint32_t(rep) : 0u;
+      Tensor tTMEM_LOADtS_probe = tTMEM_LOADtS;
+      tTMEM_LOADtS_probe.data() = tTMEM_LOADtS.data().get()
+                                + warp_uniform(runtime_zero);
+      copy(tiled_tmem_load, tTMEM_LOADtS_probe, tTMEM_LOADrS_probe);
+      repeat_s_ldtm_guard ^= __float_as_uint(tTMEM_LOADrS_probe(0));
+    }
+    // Connect the checksum to the existing output path (one FP32 mantissa bit,
+    // numerics intentionally irrelevant for this performance-only target).
+    // An otherwise dead empty-asm input is not enough to defeat ptxas DCE.
+    tTMEM_LOADrS(0) = __uint_as_float(
+        __float_as_uint(tTMEM_LOADrS(0)) ^ (repeat_s_ldtm_guard & 1u));
+#endif
+#if defined(MXFP8_REPEAT_S_LDTM_CONTROL)
+    static_assert(MXFP8_REPEAT_S_LDTM_CONTROL == 2,
+                  "MXFP8_REPEAT_S_LDTM_CONTROL must be 2");
+    // Instruction-overhead control for the x2 probe: preserve its runtime
+    // predicate, rolled-loop and checksum-to-output path, but omit only the
+    // extra tcgen05.ld.  Use an existing loaded score so the control remains
+    // live without adding a new TMEM operation.
+    uint32_t repeat_s_ldtm_guard = 0;
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int rep = 1; rep < MXFP8_REPEAT_S_LDTM_CONTROL; ++rep) {
+      uint32_t runtime_zero = params.scale_output == float(4096 + rep)
+                            ? uint32_t(rep) : 0u;
+      repeat_s_ldtm_guard ^= __float_as_uint(tTMEM_LOADrS(runtime_zero));
+    }
+    tTMEM_LOADrS(0) = __uint_as_float(
+        __float_as_uint(tTMEM_LOADrS(0)) ^ (repeat_s_ldtm_guard & 1u));
+#endif
+#elif defined(MXFP8_DROP_S_LDTM)
+    // Clean zero-S-LDTM upper-bound probe: keep the complete downstream
+    // noexp-raw softmax/correction path live using a runtime value instead of
+    // leaving the fragment uninitialized.  Numerics are intentionally wrong.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tTMEM_LOADrS); ++i) {
+      tTMEM_LOADrS(i) = params.scale_softmax_log2;
+    }
+#endif
+    MXFP8_TL_SM(stage, timeline_tile, 2);  // S LDTM issued / register result path entered
+#if defined(MXFP8_EARLY_S_RELEASE) && !defined(MXFP8_2SM_DECOUPLE_PERF)
+    // Perf-only lifetime probe. Valid only when P STTM and PV are disabled:
+    // after LDTM, softmax owns a register copy of S, so the S buffer itself can
+    // be returned immediately. A real kernel needs a distinct P buffer/pipeline.
+    pipeline_s.consumer_release(pipeline_s_consumer_state);
+#endif
+#if defined(MXFP8_SOFTMAX_ONEADD)
+    // [ONEADD probe — NUMERICS WRONG, perf-only] the entire softmax is replaced by
+    // this single add on the TMEM-loaded data. The rowmax pass, the exp/add burst,
+    // and the row_sum accumulation are all skipped (gated below). The LDTM atom
+    // is one instruction regardless of how many lanes are read, so its cost stays.
+    {
+#if defined(MXFP8_DROP_TMEM_LDST) || defined(MXFP8_DROP_S_LDTM)
+      // [DROP_TMEM_LDST] add uses a runtime param (NOT the LDTM result) so the
+      // whole tTMEM_LOADrS tile goes unused -> the LDTM (S load) is DCE'd.
+      softmax_oneadd_guard = params.scale_softmax_log2 + params.scale_softmax_log2;
+#else
+      softmax_oneadd_guard = tTMEM_LOADrS(0) + tTMEM_LOADrS(1);
+#endif
+    }
+#endif
 
 #ifdef MXFP8_DBG
     // [续19d] Dump raw QK scores for q-row 0, first KV tile — BOTH groups.
@@ -2127,6 +2534,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       row_max = ::fmax(row_max, ::fmax(blk_max_score[0], blk_max_score[1]));
       (void)row_max_0; (void)row_max_1; (void)row_max_2; (void)row_max_3;
 #else
+#if defined(MXFP8_SOFTMAX_ONEADD)
+      // [ONEADD] skip the rowmax pass entirely and keep the original finite
+      // constant, so the correction/O-rescale control flow is unchanged.
+      row_max = 0.0f;
+      (void)row_max_0; (void)row_max_1; (void)row_max_2; (void)row_max_3;
+#elif defined(MXFP8_ABLATE_FMAX)
+      // [P4 ablation] collapse the 64-element rowmax sweep to a single read so
+      // row_max stays live (chain/stats still publish) but ~63 fmax are gone.
+      // Ceiling for the whole rowmax pass (also drops its loads).
+      row_max = ::fmax(row_max, tTMEM_LOADrS(0));
+      (void)row_max_0; (void)row_max_1; (void)row_max_2; (void)row_max_3;
+#else
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
         row_max_0  = ::fmax(row_max_0, tTMEM_LOADrS(i));
@@ -2137,6 +2556,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       row_max = ::fmax(row_max_0, row_max_1);
       row_max = ::fmax(row_max, row_max_2);
       row_max = ::fmax(row_max, row_max_3);
+#endif
 #endif
     }
 
@@ -2245,6 +2665,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 
     float2 scale_fp32x2 = make_float2(scale, scale);
     float2 minus_row_max_scale_fp32x2 = make_float2(-row_max_scale, -row_max_scale);
+#if defined(MXFP8_NOEXP_ADD)
+    // [NOEXP probe] packed row_max_safe for the exp2(out) -> out + row_max_safe
+    // substitution below. Lives only in this probe build.
+    float2 row_max_safe_fp32x2 = make_float2(row_max_safe, row_max_safe);
+#if defined(MXFP8_NOEXP_FMA)
+    // [NOEXP_FMA] addend for the exp approx scale*(S-row_max)+1: (1 - row_max_scale),
+    // folded into the FMA. Depends on row_max_scale -> row-max reduction chain stays live.
+    float2 plus1_minus_rowmax_scale_fp32x2 = make_float2(1.0f - row_max_scale, 1.0f - row_max_scale);
+#endif
+#endif
 
     Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
@@ -2305,7 +2735,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     static_assert((MXFP8_E2RSF_LAG % 8) == 0 && MXFP8_E2RSF_LAG >= 8,
                   "E2RSF lag must be a positive multiple of 8 (keeps (j&7) accumulator dispatch identical)");
     {
-      ElementQK rsf_acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
+      ElementQK rsf_acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * MXFP8_RESCALE_EXP2(scale * (old_row_max - row_max_safe));
       row_sum *= rsf_acc_scale;
     }
     float2 rsf_acc0 = make_float2(row_sum, row_sum);
@@ -2330,11 +2760,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         ? int(decltype(size(tTMEM_LOADrS))::value)
         : int(decltype(size(tTMEM_LOADrS))::value) - (MXFP8_E2OFFLOAD_C);
     static_assert((kE2Keep % 8) == 0 && kE2Keep > 0, "E2OFFLOAD keep-range must stay a multiple of 8 (E2RSF accumulator dispatch)");
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kE2Keep; i += 2) {
 #else
+    constexpr int kE2Keep = int(decltype(size(tTMEM_LOADrS))::value);
+#endif
+    MXFP8_TL_SM(stage, timeline_tile, 3);  // exp burst begin (all pre-exp work complete)
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tTMEM_LOADrS); i += kExpConversionsPerStep) {
+    for (int i = 0; i < kE2Keep; i += kExpConversionsPerStep) {
+#if defined(MXFP8_SOFTMAX_ONEADD)
+      continue;  // [ONEADD] skip the entire exp/add burst; only the post-LDTM add runs
 #endif
       float2 in = make_float2(tTMEM_LOADrS(i+0), tTMEM_LOADrS(i+1));
 #ifdef MXFP8_LCFUSE
@@ -2342,9 +2775,55 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       lc_lmax1 = ::fmax(lc_lmax1, in.y);
 #endif
       float2 out;
+#if defined(MXFP8_ABLATE_FFMA)
+      // [P3 ablation] FMA -> ADD: keeps `in` and the row_max addend live (so the
+      // row-max reduction chain survives), drops the scale multiply (a param).
+      cute::add(out, in, minus_row_max_scale_fp32x2);
+#else
       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+#endif
+#if defined(MXFP8_NOEXP_ADD)
+      // [NOEXP probe — NUMERICS WRONG, perf-only] replace the softmax P exp2 with
+      // a single packed add: exp2(out) -> out + row_max_safe. This still consumes
+      // `out` (keeps the scale*s - row_max_scale FMA live) and `row_max_safe`
+      // (keeps the row-max fmax reduction chain live), so the compiler cannot
+      // dead-code-eliminate any other computation — only exp2 is removed.
+      float2 exp_out;
+#if defined(MXFP8_NOEXP_RAW)
+      // [NOEXP_RAW] P = scale*(S-row_max) directly — the raw exponent argument,
+      // no exp, no +1, no add. Just the FMA result (out). row_sum NOT gated (runs normally).
+      exp_out = out;
+#elif defined(MXFP8_NOEXP_FMA)
+      // [NOEXP_FMA] exp approx: scale*(S-row_max)+1, via one FMA with addend (1-row_max_scale).
+      // exp2(scale*(S-row_max)) -> scale*S + (1 - row_max_scale) = scale*(S-row_max)+1.
+      // One FMA per pair; old out-FMA DCE'd, 32 burst FADD2 eliminated, FFMA2 unchanged.
+      // row_max_scale (hence row_max reduction) kept live via the addend. Numerics wrong. Perf-only.
+      cute::fma(exp_out, scale_fp32x2, in, plus1_minus_rowmax_scale_fp32x2);
+#elif defined(MXFP8_ABLATE_FADD)
+      // [FADD ablation] drop the per-element (out + row_max_safe) add; keep `out`
+      // (the scale*s FMA) live so only the FADD2 is removed, not the FMA/loads.
+      exp_out = out;
+#elif defined(MXFP8_NOEXP_FIRST2)
+      // [FIRST2] only the first element-pair gets the + row_max_safe add; the
+      // other 31 pairs skip it (exp_out = out). Issues 1 FADD2 instead of 32 —
+      // the point: doing the add on all 64 elements adds FP/ALU pipe pressure
+      // for no algorithmic reason (perf probe). Loop is #pragma unroll so the
+      // (i == 0) test folds at compile time per iteration. Perf-only, numerics wrong.
+      if (i == 0) { cute::add(exp_out, out, row_max_safe_fp32x2); }
+      else        { exp_out = out; }
+#else
+      cute::add(exp_out, out, row_max_safe_fp32x2);
+#endif
+      tTMEM_LOADrS(i+0) = exp_out.x;
+      tTMEM_LOADrS(i+1) = exp_out.y;
+#elif defined(MXFP8_FA4_MUFU_SPLIT)
+      float2 exp_out = fa4_mufu_split::dispatch_ex2_pair(i / 2, out);
+      tTMEM_LOADrS(i+0) = exp_out.x;
+      tTMEM_LOADrS(i+1) = exp_out.y;
+#else
       tTMEM_LOADrS(i+0) = EXP2_SOFTMAX_PSEL(i, out.x);
       tTMEM_LOADrS(i+1) = EXP2_SOFTMAX_PSEL(i, out.y);
+#endif
 #if defined(MXFP8_AMAXFUSE) && defined(MXFP8_AMAXLAG) && !defined(MXFP8_PSTATIC)
       // [2SM AMAXLAG, ported from base v5] consume the EX2 outputs 8 elements
       // (4 iters) behind — breaks the MUFU-latency dependent stall on the fmax
@@ -2376,6 +2855,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       }
 #endif
     }
+    MXFP8_TL_SM(stage, timeline_tile, 4);  // exp burst end
 #if (defined(MXFP8_E2OFFLOAD) || defined(MXFP8_E2NULL_PERF)) && defined(MXFP8_LCFUSE)
     // [刀10 E2OFFLOAD × LCFUSE] the fused loop no longer covers the offloaded
     // tail — accumulate its RAW values here so g0's chain w_k stays exact.
@@ -2486,6 +2966,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     constexpr int kPConversionsPerWord = 4;
     Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kPConversionsPerWord>>(tTMEM_STORErS_x4);
     NumericArrayConverter<Element, ElementQK, kPConversionsPerWord> convert_p;
+#ifdef MXFP8_P_PACK_LIVE_GUARD
+    constexpr int kPGuardWords = size(tTMEM_STORErS_x4);
+    static_assert((kPGuardWords & (kPGuardWords - 1)) == 0,
+                  "P live-guard reduction requires a power-of-two word count");
+    uint32_t p_pack_live_guard[kPGuardWords];
+#endif
 
 #if defined(MXFP8_E2OFFLOAD) || defined(MXFP8_E2NULL_PERF)
     CUTLASS_PRAGMA_UNROLL
@@ -2504,8 +2990,39 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         in_conv[j] = tTMEM_LOADrS(i+j) * scale_inv_b[b];
 #endif
       }
+#if defined(MXFP8_ABLATE_CONVERT)
+      // [P1 ablation] skip the fp32->e4m3 converter: write a constant e4m3 word
+      // (4x 0.25, a safe normal) to TMEM so the PV MMA still gets valid bytes,
+      // and drop in_conv. The upstream softmax burst output stays live because
+      // the standalone row_sum pass below still reads tTMEM_LOADrS — so only the
+      // converter cost is removed, nothing else DCEs. No extra int ops added.
+      {
+        Array<Element, kPConversionsPerWord> _pe;
+        uint32_t _z = 0x3B3B3B3Bu;   // e4m3 0.25 repeated x4
+        memcpy(&_pe, &_z, sizeof(_z));
+        tTMEM_STORErS_x4_e[i / kPConversionsPerWord] = _pe;
+      }
+#else
       tTMEM_STORErS_x4_e[i / kPConversionsPerWord] = convert_p(in_conv);
+#endif
     }
+#ifdef MXFP8_P_PACK_LIVE_GUARD
+    // Five-deep balanced tree for 32 packed words. Its single result is injected
+    // into the final row_sum bit pattern below, hence reaches HBM and prevents
+    // ptxas from deleting any FP32->FP8 producer when P STTM is gated. The same
+    // tree is present in every guarded A/B binary.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tTMEM_STORErS_x4); ++i) {
+      p_pack_live_guard[i] = tTMEM_STORErS_x4(i);
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int stride = kPGuardWords / 2; stride > 0; stride /= 2) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < stride; ++i) {
+        p_pack_live_guard[i] ^= p_pack_live_guard[i + stride];
+      }
+    }
+#endif
     // Phase 5: write e8m0 P-SF to smem_sfp[sbuf]. Group g owns kblocks [g*2, g*2+1].
     // Derived from SmemLayoutAtomSFP probe ((((_32,_4),_1),(_32,_1)),_1,(_4,_1)) with
     // strides (((16,4),512),(0,1)),_0,(1,512):
@@ -2547,25 +3064,35 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     }
 #endif
 
+    MXFP8_TL_SM(stage, timeline_tile, 5);  // P conversion / scale-factor work complete
     // [PVMX] write packed e4m3 P directly to TMEM P0/P1. The PV MMA reads this
     // TMEM tile as operand A, so the former smem_p STS path is no longer used.
 #if defined(MXFP8_E2OFFLOAD) || defined(MXFP8_E2NULL_PERF)
 #error "MXFP8_E2OFFLOAD/E2NULL still write their P tail to smem_p; port that tail to TMEM before using TMEM-P PV."
 #endif
+#if !defined(MXFP8_DROP_TMEM_LDST) && !defined(MXFP8_DROP_P_STTM)
+    // [DROP_TMEM_LDST] skip the P-store STTM entirely; keep the fence + release
+    // below so the pipeline ordering (QK-MMA -> softmax -> PV-MMA) is unchanged.
+    // The PV MMA then reads stale TMEM P0/P1 — still a real tensor-core op (not
+    // DCE-able, output flows to HBM), and it still runs strictly after the QK MMA
+    // because it waits on this consumer_release.
     copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4);
+#endif
 #ifdef MXFP8_DBG
     // smem_p no longer mirrors P; keep g_dbg_Pdq disabled rather than reporting
     // stale smem data.
 #endif
 
     cutlass::arch::fence_view_async_tmem_store();
+    MXFP8_TL_SM(stage, timeline_tile, 6);  // P STTM + async-view fence issued
     // [M3 sub-tile] each group releases ITS OWN S sub-slot once its half of P
     // (+SFP) is written and fenced. The MMA's next QK sub-MMA only reuses THIS
     // group's 64 cols (gated by this release), and PV acquires BOTH
     // sub-pipelines so it still sees the full 128-wide P + SFP.
-#ifndef MXFP8_2SM_DECOUPLE_PERF
+#if !defined(MXFP8_2SM_DECOUPLE_PERF) && !defined(MXFP8_EARLY_S_RELEASE)
     pipeline_s.consumer_release(pipeline_s_consumer_state);
 #endif
+    MXFP8_TL_SM(stage, timeline_tile, 7);  // S/P stage released
 #if defined(MXFP8_2SM_BEACON)
     if (is_g0 && cute::elect_one_sync()) { unsigned _r=cute::block_rank_in_cluster(); if(_r<4){ atomicMax(&g_bcn[_r*16+5], 3u); __threadfence_system(); } }   // [2SM] softmax did consumer_release(S)
 #endif
@@ -2581,7 +3108,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     cute::add(rsf_acc0, rsf_acc0, rsf_acc2);
     row_sum = rsf_acc0.x + rsf_acc0.y;
 #else
-    ElementQK acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
+    ElementQK acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * MXFP8_RESCALE_EXP2(scale * (old_row_max - row_max_safe));
     row_sum *= acc_scale;
     // row_sum = sum(reg_S)
     float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
@@ -2595,6 +3122,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #else
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
+#endif
+#if defined(MXFP8_SOFTMAX_ONEADD) || defined(MXFP8_ABLATE_FADD) || defined(MXFP8_ABLATE_RSUM)
+      continue;  // [ONEADD/FADD/RSUM ablation] skip the row_sum accumulation; row_sum -> 0
 #endif
       float2 in = make_float2(tTMEM_LOADrS(i), tTMEM_LOADrS(i+1));
       cute::add(local_row_sum_f32x2, local_row_sum_f32x2, in);
@@ -2614,7 +3144,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     cute::add(local_row_sum_f32x2, local_row_sum_f32x2, local_row_sum_2);
     float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
 
+#if defined(MXFP8_SOFTMAX_ONEADD)
+    // Connect the one add to the existing final row-sum/statistics ->
+    // correction -> O -> HBM path.  This is outside the skipped accumulation
+    // loop, adds no memory operation, and does not perturb row_max/O-rescale.
+    row_sum = softmax_oneadd_guard;
+#else
     row_sum = local_row_sum;
+#endif
+#ifdef MXFP8_P_PACK_LIVE_GUARD
+    // One-bit, finite perturbation makes the balanced guard externally live.
+    // Numerics are already intentionally invalid in the exp->add experiment.
+    row_sum = __uint_as_float(__float_as_uint(row_sum) ^ (p_pack_live_guard[0] & 1u));
+#endif
 #endif
 
     // [M3-3 LAGGED CHAIN v2] g1's end-of-step chain read (rounds k>=1): pick
@@ -3031,7 +3573,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // [刀8 E2RSF] lagged fused row_sum (accumulators shared across pieces;
     // per-piece local lag indices — new association, gated by the sweep).
     {
-      ElementQK rsf_acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
+      ElementQK rsf_acc_scale = (old_row_max == row_max_safe) ? 0.5f : 0.5f * MXFP8_RESCALE_EXP2(scale * (old_row_max - row_max_safe));
       row_sum *= rsf_acc_scale;
     }
     float2 rsf_acc0 = make_float2(row_sum, row_sum);
@@ -3052,7 +3594,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       for (int i = 0; i < W; i += 2) {
         float2 in = make_float2(rS(i+0), rS(i+1));
         float2 out;
-        cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+  #if defined(MXFP8_ABLATE_FFMA)
+      // [P3 ablation] FMA -> ADD: keeps `in` and the row_max addend live (so the
+      // row-max reduction chain survives), drops the scale multiply (a param).
+      cute::add(out, in, minus_row_max_scale_fp32x2);
+#else
+      cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+#endif
         rS(i+0) = EXP2_SOFTMAX_MIX(i, out.x);
         rS(i+1) = EXP2_SOFTMAX_MIX(i, out.y);
         if (i >= MXFP8_E2RSF_LAG) {
@@ -3423,7 +3971,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
   correction_epilogue(
       float scale,
       Stage stage,
-      TensorO const& sO_01) {
+      TensorO const& sO_01,
+      uint32_t tmem_O = uint32_t(TmemAllocation::O0)) {
 
     using ElementOut = typename TensorO::value_type;
 
@@ -3445,6 +3994,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     Tensor tOcO_i = logical_divide(tOcO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
     Tensor tOsO_i = logical_divide(tOsO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
 
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+    // Physical double-O tail selects the accumulator held by the current
+    // PipelineO consumer stage. Existing callers default to O0.
+    tOtO_i.data() = tOtO_i.data().get() + tmem_O;
+#else
     if constexpr (decltype(stage == _0{})::value) {
       tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O0);
     }
@@ -3452,6 +4006,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       static_assert(decltype(stage == _1{})::value, "stage is either 0 or 1");
       tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O1);
     }
+#endif
 
     auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i(make_coord(_, _), _0{}));
     auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
@@ -3483,7 +4038,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       for (int j = 0; j < size(tTMrO); j += 2) {
         float2 in = make_float2(tTMrO(j), tTMrO(j+1));
         float2 out;
-        cute::mul(out, scale_f32x2, in);
+        MXFP8_O_MUL(out, scale_f32x2, in);
         tTMrO(j) = out.x;
         tTMrO(j+1) = out.y;
       }
@@ -3604,7 +4159,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       for (int j = 0; j < size(tTMrO_i); j += 2) {
         float2 in = make_float2(tTMrO_i(j), tTMrO_i(j+1));
         float2 out;
-        cute::mul(out, scale_f32x2, in);
+        MXFP8_O_MUL(out, scale_f32x2, in);
         tTMrO_i(j) = out.x;
         tTMrO_i(j+1) = out.y;
       }
@@ -3733,7 +4288,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         for (int j = 0; j < size(tTMrO_i); j += 2) {
           float2 in = make_float2(tTMrO_i(j), tTMrO_i(j+1));
           float2 out;
-          cute::mul(out, scale_f32x2, in);
+          MXFP8_O_MUL(out, scale_f32x2, in);
           tTMrO_i(j) = out.x;
           tTMrO_i(j+1) = out.y;
         }
@@ -3747,7 +4302,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       for (int j = 0; j < size(tTMrO_i); j += 2) {
         float2 in = make_float2(tTMrO_i(j), tTMrO_i(j+1));
         float2 out;
-        cute::mul(out, scale_f32x2, in);
+        MXFP8_O_MUL(out, scale_f32x2, in);
         tTMrO_i(j) = out.x;
         tTMrO_i(j+1) = out.y;
       }
@@ -4075,6 +4630,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
       ++pipeline_o_consumer_state;
     }
 #else
+      uint32_t corr_tmem_o = uint32_t(TmemAllocation::O0);
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+      corr_tmem_o = pipeline_o_consumer_state.index()
+          ? uint32_t(TmemAllocation::O1) : uint32_t(TmemAllocation::O0);
+#endif
       pipeline_o.consumer_wait(pipeline_o_consumer_state);
 #if defined(MXFP8_2SM_BEACON)
       if (cute::elect_one_sync()) { unsigned _r=cute::block_rank_in_cluster(); if(_r<4){ atomicMax(&g_bcn[_r*16+7], 3u); __threadfence_system(); } }   // [2SM] corr: past loop PipelineO wait
@@ -4094,13 +4654,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
         // common path) and pack. IDENTICAL expression/operands to the stock
         // unconditional site (m2_old_max/m2_new_max are the same kIdxOld/New
         // stats) => the taken-path rescale factor is bit-identical to g_combo.
-        scale = ::exp2f(params.scale_softmax_log2 * (m2_old_max - m2_new_max));
+        scale =
+#if defined(MXFP8_ABLATE_CORR_EXP2)
+            (params.scale_softmax_log2 * (m2_old_max - m2_new_max)) + 1.0f;  // [correction exp2 ablation]
+#else
+            MXFP8_RESCALE_EXP2(params.scale_softmax_log2 * (m2_old_max - m2_new_max));
+#endif
         g_scale_f32x2 = make_float2(scale, scale);
 #endif
 #if defined(MXFP8_G_RSADDR) || defined(MXFP8_G_COMBO)
-        correction_rescale_pp(g_scale_f32x2, uint32_t(TmemAllocation::O0));
+        correction_rescale_pp(g_scale_f32x2, corr_tmem_o);
 #else
-        correction_rescale(scale, uint32_t(TmemAllocation::O0));
+        correction_rescale(scale, corr_tmem_o);
 #endif
         cutlass::arch::fence_view_async_tmem_store();
       }
@@ -4153,6 +4718,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
 #endif
     ++pipeline_s0_c_consumer_state;
 
+    uint32_t epi_tmem_o = uint32_t(TmemAllocation::O0);
 #ifdef MXFP8_OSPLIT
     // [刀12 OSPLIT] the epilogue reads the FULL 128-col O — wait BOTH halves
     // (the two halves tile [O0, O0+128) contiguously; read path unchanged).
@@ -4161,6 +4727,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     ++pipeline_o_consumer_state;
     pipeline_o.consumer_wait(pipeline_o_consumer_state);              // h1 full
 #else
+#if defined(MXFP8_PHYSICAL_ODEPTH2)
+    epi_tmem_o = pipeline_o_consumer_state.index()
+        ? uint32_t(TmemAllocation::O1) : uint32_t(TmemAllocation::O0);
+#endif
     pipeline_o.consumer_wait(pipeline_o_consumer_state);
 #endif
 #if defined(MXFP8_2SM_BEACON)
@@ -4177,9 +4747,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecializedMxfp8 {
     // values are already in the same scale w_{n-1}). Same thread == same row
     // on both sides (32dp atom family), so this is barrier-free.
     const float e2_final_sum = tTMEM_LOADVrS(kIdxFinalRowSum) + corr_sum;
-    correction_epilogue(params.scale_output / e2_final_sum, _0{}, sO);
+    correction_epilogue(params.scale_output / e2_final_sum, _0{}, sO,
+                        epi_tmem_o);
 #else
-    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO,
+                        epi_tmem_o);
 #endif
 
     if (epilogue.params.ptr_LSE != nullptr) {

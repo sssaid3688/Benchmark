@@ -17,3 +17,14 @@ FA/b200_blackwell_fmha_mxfp8/ablation_results_20260622_045904
 FAG/build*
 FAG_FP32/build*
 FA/build*
+Hadamard/nsys_reports/
+FA/b200_blackwell_fmha_mxfp8_ablation
+FA/build*
+FAG/build*
+FAG/build*
+FAG/build*
+FAG/build*
+FAG_0816
+FAG_0816_backup_src
+FAG_0816_fp16skel
+Hadamard/ablation*

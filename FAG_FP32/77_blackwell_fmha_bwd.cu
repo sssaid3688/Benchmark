@@ -949,9 +949,10 @@ struct BwdRunner {
     }
     uint64_t input_hash = strict_input_hash;
     GradientSnapshotHeader header = make_snapshot_header(options, input_hash);
-    if (header.producer != 1) {
+    if (header.producer != 1 && std::getenv("FAG_ALLOW_2SM_DUMP") == nullptr) {
       std::cerr << "Refusing to write a baseline snapshot from a 2-SM build; "
-                   "use the 1-SM executable\n";
+                   "use the 1-SM executable (or set FAG_ALLOW_2SM_DUMP=1 to export "
+                   "a candidate snapshot for offline analysis)\n";
       return false;
     }
     std::vector<Element> dq, dk, dv;

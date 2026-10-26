@@ -45,7 +45,44 @@
 
 #include <cmath>
 
+#if defined(FAG_DQ_BF16_STAGING)
+#include <cuda_bf16.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// FAG_DS_RUN_STORES: FA4-style (FP16-equivalent) dS corner turn.  Implies the
+// fragment-order-consistent TMEM atom pair: the x32 load atom hands every
+// compute thread TWO runs of 32 consecutive Q values at its fixed KV lane
+// (fragment element i <-> Q(i) = 32*(wg + 2*(i/32)) + (i%32)), and the 8x
+// store atom keeps the P/dS RMEM->TMEM fragments in exactly the same order
+// (rest-mode split (2,2) => blocks {wg, wg+2} on both sides).  Each 32-byte
+// run is two adjacent 16-byte blocks inside one swizzled row of the SW64
+// smem atom, so both STS.128 addresses are loop-invariant bases (precomputed
+// once before the mainloop) -- the same ~0-address-ALU store cost model as
+// FA4's autovec_copy path.
+// ---------------------------------------------------------------------------
+#if defined(FAG_DS_RUN_STORES)
+#if !defined(FAG_TMEM_LOAD_32X)
+#define FAG_TMEM_LOAD_32X
+#endif
+#if !defined(FAG_TMEM_STORE_8X)
+#define FAG_TMEM_STORE_8X
+#endif
+#endif
+
 namespace cutlass::fmha::kernel {
+
+#if defined(FAG_CTRL_QUANTPIN) || defined(FAG_ABLATE_QUANT_V2)
+// Device sink for the rigorous-ablation liveness pin. Never written at runtime
+// (the guarding branch is opaque but never taken); its mere presence in the
+// CFG forces both nvcc AND ptxas to keep every instruction producing the
+// pinned values. Unlike an empty `asm volatile("" : "+f")` pin — which emits
+// no PTX instruction and is defeated by ptxas dead-code elimination — this
+// cannot be optimized away at any stage. FAG_CTRL_QUANTPIN keeps the pin AND
+// the converter, so (ctrl - ablate) isolates the converter cost with the pin
+// overhead cancelled out (classic paired-control design).
+__device__ unsigned int fag_ablation_sink = 0;
+#endif
 
 using namespace cutlass::fmha::collective;
 
@@ -332,6 +369,13 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
   // warps can acquire and populate the complete 64x128 tile behind one pair of
   // barriers.  The four reduce-add operations and all data types are unchanged.
   static constexpr int kStagesReduceTmaStore = 4;
+#elif defined(FAG_DQ_DEEP_SERIAL) || defined(FAG_DQ_HALF_SPLIT)
+  // FAG_DQ_DEEP_SERIAL: keep the per-stage serial acquire/STS/TMA issue order
+  // (the 2-stage rotation already software-pipelines TMA(i) under
+  // staging(i+1)) but deepen the rotation to four buffers so no intra-
+  // iteration staging ever waits for an in-flight TMA completion; the waits
+  // move to the next iteration's acquires and overlap the whole mainloop.
+  static constexpr int kStagesReduceTmaStore = 4;
 #else
   static constexpr int kStagesReduceTmaStore = 2;
 #endif
@@ -388,8 +432,19 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 #else
   using TileShapeDQ = _32;
 #endif
+#if defined(FAG_DQ_BF16_STAGING)
+  // FAG_DQ_BF16_STAGING: dQ partial sums are staged to SMEM and reduced into
+  // the gmem workspace in BF16 instead of FP32.  This halves the staging STS
+  // instruction count, SMEM wavefronts and workspace/TMA-reduce traffic of
+  // the #1 exposed bottleneck (the -8.5% STS staging of the dQ drain; see
+  // ABLATION_V3_OPT_BASE.md).  Final dQ is FP8 e4m3 regardless; accuracy is
+  // empirically gated by --verify / --compare-gradients.
+  using ElemDQAcc = cutlass::bfloat16_t;
+#else
+  using ElemDQAcc = ElementAcc;
+#endif
   using SmemAtomDQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-      cute::UMMA::Major::K, ElementAcc, TileShapeQ, TileShapeDQ
+      cute::UMMA::Major::K, ElemDQAcc, TileShapeQ, TileShapeDQ
   >());
   using SmemShapeDQ = Shape<_64, TileShapeDQ, Int<kStagesReduceTmaStore>>;
   using SmemLayoutDQ = decltype(tile_to_shape(SmemAtomDQ{}, SmemShapeDQ{}, Step<_2, _1, _3>{}));
@@ -414,11 +469,17 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     // [dV-axis-fix] Dedicated dO buffer for the dV (PDO) MMA. Lives alongside
     // smem_do (which feeds dP/VDO) so each MMA reads dO laid out for its own N-axis.
     alignas(2048) cute::array<Element, cute::cosize_v<SmemLayoutDOT>> smem_do_dv;
-    alignas(1024) cute::array<ElementAcc, cute::cosize_v<SmemLayoutDQ>> smem_dq;
+    alignas(1024) cute::array<ElemDQAcc, cute::cosize_v<SmemLayoutDQ>> smem_dq;
     alignas(16) cute::array<ElementAcc, cute::cosize_v<SmemLayoutLSE>> smem_lse;
     alignas(16) cute::array<ElementAcc, cute::cosize_v<SmemLayoutSumOdO>> smem_sum_odo;
     alignas(16) cutlass::arch::ClusterTransactionBarrier ds_full;
     alignas(16) cutlass::arch::ClusterBarrier ds_leader;
+#if defined(FAG_OPT_STASYNC_XCHG)
+    // Completion tracking for the st.async exchange-buffer stores (see
+    // stasync_128): replaces the generic->async proxy fence that the plain
+    // STS path needs before the DSMEM bulk copy.
+    alignas(16) cutlass::arch::ClusterTransactionBarrier xchg_tx;
+#endif
 #if defined(FAG_SPLIT_DK_DQ_READY)
     alignas(16) cutlass::arch::ClusterBarrier dk_ready;
 #endif
@@ -465,7 +526,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     const ElementAcc* ptr_sum_odo;
     RowTensorStride stride_sum_odo;
 
-    ElementAcc* ptr_dq_acc;
+    ElemDQAcc* ptr_dq_acc;
     TensorStride stride_dq_acc;
 
     ElementAcc softmax_scale = 1.0f / sqrtf(TileShapeDQK{});
@@ -482,7 +543,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
   using TMA_DO_DV = typename CollectiveMmaPDO::Params::TMA_B;
 
   using TMA_DQ = decltype(make_tma_copy(SM90_TMA_REDUCE_ADD{},
-      make_tensor((const ElementAcc*)nullptr, make_shape(1, 1, make_shape(make_shape(1,1), 1)), TensorStride{}),
+      make_tensor((const ElemDQAcc*)nullptr, make_shape(1, 1, make_shape(make_shape(1,1), 1)), TensorStride{}),
       SmemLayoutDQ{}(_, _, _0{})
   ));
 
@@ -721,12 +782,77 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     auto input_vec = recast<Array<ElementAcc, AlignmentS>>(input);
     auto output_vec = recast<Array<Element, AlignmentS>>(output);
 
+#if defined(FAG_ABLATE_QUANT_V3)
+    // Minimal-instrument quant ablation. Replace the converter with a 3-XOR
+    // bit-reduction of its four FP32 inputs and emit the result as the FP8
+    // pattern: every producer keeps REAL dataflow (nothing DCE-able at any
+    // compiler stage), the output is a RUNTIME value (downstream pack/SMEM/
+    // TMEM consumers do not fold), and no branches, constants, or code bloat
+    // are introduced. Removes exactly the converter chain (F2FP + its
+    // range-scaling FMULs); adds 3 LOP3 per 4-element group.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(input_vec); i++) {
+      Array<ElementAcc, AlignmentS> v = input_vec(i);
+      union { uint32_t u; Array<Element, AlignmentS> a; } bits;
+      bits.u = __float_as_uint(v[0]) ^ __float_as_uint(v[1]) ^
+               __float_as_uint(v[2]) ^ __float_as_uint(v[3]);
+      output_vec(i) = bits.a;
+    }
+#elif defined(FAG_ABLATE_QUANT_V2)
+    // Rigorous quant ablation (fixes the contaminated FAG_ABLATE_QUANT): the
+    // FP32->e4m3 converter is replaced by the same-typed zero pattern, and the
+    // FP32 inputs are pinned by an opaque NEVER-TAKEN branch performing a real
+    // global read-modify-write. blockIdx.x is always < gridDim.x, but neither
+    // is a compile-time constant, so the compiler cannot prove the branch dead
+    // and must retain the full producer chain (exp2, scale-FMA, softmax, and
+    // the converter's own range-scaling FMUL inputs) all the way into SASS.
+    // Hot-path cost: the loop-invariant compare is hoisted; the sink block
+    // never executes.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(input_vec); i++) {
+      Array<ElementAcc, AlignmentS> v = input_vec(i);
+      output_vec(i) = Array<Element, AlignmentS>{};
+      if (blockIdx.x == gridDim.x) {
+        fag_ablation_sink += __float_as_uint(v[0]) ^ __float_as_uint(v[1]) ^
+                             __float_as_uint(v[2]) ^ __float_as_uint(v[3]);
+      }
+    }
+#elif defined(FAG_CTRL_QUANTPIN)
+    // Paired control for FAG_ABLATE_QUANT_V2: the converter is KEPT and the
+    // identical never-taken pin branch is added. Comparing this against the
+    // V2 ablation cancels the pin's own overhead and isolates the converter's
+    // true cost. Base path timing impact = pin overhead only (measured).
+    cutlass::NumericArrayConverter<Element, ElementAcc, AlignmentS> epilogue_op;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(input_vec); i++) {
+      Array<ElementAcc, AlignmentS> v = input_vec(i);
+      output_vec(i) = epilogue_op(input_vec(i));
+      if (blockIdx.x == gridDim.x) {
+        fag_ablation_sink += __float_as_uint(v[0]) ^ __float_as_uint(v[1]) ^
+                             __float_as_uint(v[2]) ^ __float_as_uint(v[3]);
+      }
+    }
+#elif !defined(FAG_ABLATE_QUANT)
     cutlass::NumericArrayConverter<Element, ElementAcc, AlignmentS> epilogue_op;
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(input_vec); i++) {
       output_vec(i) = epilogue_op(input_vec(i));
     }
+#else
+    // FAG_ABLATE_QUANT: skip the FP32->e4m3 cvt (FP8-specific tax). Force each
+    // input group live (zero-cost register asm) so source loads are not DCE'd;
+    // emit a constant FP8 pattern so downstream stores/packs still compile & run.
+    // NOTE: contaminated — the empty asm emits no PTX, so ptxas still removes
+    // the P-chain exp2/scale-FMA (MUFU 192->4, FMUL.FTZ 196->0). Kept only for
+    // comparison; prefer the FAG_ABLATE_QUANT_V2 numbers.
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(input_vec); i++) {
+      Array<ElementAcc, AlignmentS> v = input_vec(i);
+      asm volatile("" : "+f"(v[0]), "+f"(v[1]), "+f"(v[2]), "+f"(v[3]));
+      output_vec(i) = Array<Element, AlignmentS>{};
+    }
+#endif
 
     return output;
   }
@@ -761,6 +887,70 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         "st.shared::cluster.v4.b32 [%0], {%1, %2, %3, %4};"
         :
         : "r"(dst_addr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
+        : "memory");
+  }
+#endif
+
+#if defined(FAG_OPT_STASYNC_XCHG) || defined(FAG_OPT_OWN_LATE) || defined(FAG_DS_RUN_STORES)
+  // Pack four adjacent quantized dS bytes (i..i+3) into one 32-bit word.
+  // Shared by the reordered optimization loops so their arithmetic is
+  // identical to the base path's inline pack4 lambda (base SASS unchanged).
+  template<class TensorDST>
+  static CUTLASS_DEVICE uint32_t pack_u32(TensorDST const& dst, int i) {
+    return uint32_t(dst(i + 0).storage)       |
+           (uint32_t(dst(i + 1).storage) << 8)  |
+           (uint32_t(dst(i + 2).storage) << 16) |
+           (uint32_t(dst(i + 3).storage) << 24);
+  }
+#endif
+
+#if defined(FAG_OPT_STASYNC_XCHG)
+  // Store one already-quantized 16-byte dS vector into the LOCAL exchange
+  // buffer with async-proxy semantics, accounting its bytes on an mbarrier.
+  // The bulk copy then reads async-proxy data: no generic->async proxy fence
+  // is required between these stores and cp.async.bulk (the mbarrier phase
+  // completion provides the ordering), which removes the store-pipe drain the
+  // fence.proxy.async.shared::cluster forced on every iteration.
+  static CUTLASS_DEVICE void stasync_128(
+      void* dst, uint4 const& value,
+      cutlass::arch::ClusterTransactionBarrier* barrier) {
+    uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst);
+    uint32_t bar_addr = cute::cast_smem_ptr_to_uint(
+        reinterpret_cast<uint64_t*>(barrier));
+    asm volatile(
+        "st.async.v4.b32.shared::cta.mbarrier::complete_tx::bytes"
+        " [%0], {%1, %2, %3, %4}, [%5];"
+        :
+        : "r"(dst_addr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w),
+          "r"(bar_addr)
+        : "memory");
+  }
+#endif
+
+#if defined(FAG_DS_STASYNC_CLUSTER)
+  // Store one already-quantized 16-byte dS vector DIRECTLY into the peer CTA's
+  // distributed shared memory through the async proxy, accounting its 16 bytes
+  // on the peer's ds_full transaction barrier (st.async.shared::cluster with
+  // mbarrier::complete_tx::bytes -- the remote analogue of stasync_128 and the
+  // DSMEM equivalent of FA4's copy_utils.store_shared_remote_fp32x4).  512
+  // such stores per iteration (256 threads x 2 strips/runs) replace the ENTIRE
+  // exchange chain: no exchange-buffer STS, no generic->async proxy fence, and
+  // no cp.async.bulk -- the mbarrier tx accounting feeds the unchanged
+  // ds_full/relay/ds_leader wait protocol with identical byte counts.
+  // Addresses are 32-bit SMEM-window byte addresses (as returned by
+  // cast_smem_ptr_to_uint / precomputed swizzled run bases); they are mapped
+  // to the peer CTA here via mapa (set_block_rank).
+  static CUTLASS_DEVICE void stasync_cluster_128(
+      uint32_t dst_smem_addr, uint4 const& value,
+      uint32_t barrier_smem_addr, uint32_t peer_rank) {
+    uint32_t dst_addr = cute::set_block_rank(dst_smem_addr, peer_rank);
+    uint32_t bar_addr = cute::set_block_rank(barrier_smem_addr, peer_rank);
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32"
+        " [%0], {%1, %2, %3, %4}, [%5];"
+        :
+        : "r"(dst_addr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w),
+          "r"(bar_addr)
         : "memory");
   }
 #endif
@@ -1316,10 +1506,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     tiled_mma_kq.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+#ifndef FAG_ABLATE_S
       cute::gemm(tiled_mma_kq,
                  tSTrK(_,_,k_block,_0{}),
                  tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                  tSTtST);
+#endif
       tiled_mma_kq.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1342,10 +1534,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#ifndef FAG_ABLATE_DP
       cute::gemm(tiled_mma_vdo,
                  tDPTrV(_,_,k_block,_0{}),
                  tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                  tDPTtDPT);
+#endif
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1360,13 +1554,15 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     if (cute::elect_one_sync()) printf("[DBG mma-fn] blk=%d post-P-wait (issuing dV gemm)\n", blockIdx.x);
 #endif
 
-    // dV = P*dO   dV = P^T*dO 
+    // dV = P*dO   dV = P^T*dO
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+#ifndef FAG_ABLATE_DV
       cute::gemm(tiled_mma_pdo,
                  tDVrP(_,_,k_block),
                  tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                  tDVtDV);
+#endif
       tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1406,10 +1602,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_kq.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+#ifndef FAG_ABLATE_S
         cute::gemm(tiled_mma_kq,
                    tSTrK(_,_,k_block,_0{}),
                    tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                    tSTtST);
+#endif
         tiled_mma_kq.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1442,10 +1640,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       pipeline_load_mma_qt.consumer_wait(pipeline_load_mma_qt_consumer_state);
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
+#ifndef FAG_ABLATE_DK
         cute::gemm(tiled_mma_dsq,
                    tDKrDST(_,_,k_block),
                    tDKrQT(_,_,k_block,pipeline_load_mma_qt_consumer_state.index()),
                    tDKtDK);
+#endif
         tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_load_mma_qt.consumer_release(pipeline_load_mma_qt_consumer_state);
@@ -1458,10 +1658,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#ifndef FAG_ABLATE_DP
         cute::gemm(tiled_mma_vdo,
                    tDPTrV(_,_,k_block,_0{}),
                    tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDPTtDPT);
+#endif
         tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
@@ -1474,15 +1676,21 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // accumulator aliases the upper half of that S/P TMEM allocation.
       pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
 #endif
+      // Corner-turn sync edge: MMA must not issue dQ before both CTAs' dS
+      // exchange completed (relayed here by the Relay warp).
+#ifndef FAG_ABLATE_CORNER_WAIT
       shared_tensors.ds_leader.wait(ds_leader_phase);
+#endif
       ds_leader_phase ^= 1;
       tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
+#ifndef FAG_ABLATE_DQ
         cute::gemm(tiled_mma_dsk,
                    tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
                    tDQrKT(_,_,k_block,_0{}),
                    tDQtDQ);
+#endif
         tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1500,10 +1708,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+#ifndef FAG_ABLATE_DP
         cute::gemm(tiled_mma_vdo,
                    tDPTrV(_,_,k_block,_0{}),
                    tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDPTtDPT);
+#endif
         tiled_mma_vdo.accumulate_ = UMMA::ScaleOut::One;
       }
       pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
@@ -1521,10 +1731,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // dV = P*dO
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+#ifndef FAG_ABLATE_DV
         cute::gemm(tiled_mma_pdo,
                    tDVrP(_,_,k_block),
                    tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
                    tDVtDV);
+#endif
         tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
       }
 
@@ -1570,10 +1782,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     pipeline_load_mma_qt.consumer_wait(pipeline_load_mma_qt_consumer_state);
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
+#ifndef FAG_ABLATE_DK
       cute::gemm(tiled_mma_dsq,
                  tDKrDST(_,_,k_block),
                  tDKrQT(_,_,k_block,pipeline_load_mma_qt_consumer_state.index()),
                  tDKtDK);
+#endif
       tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
     }
     pipeline_load_mma_qt.consumer_release(pipeline_load_mma_qt_consumer_state);
@@ -1591,15 +1805,20 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 #if defined(FAG_SPLIT_DK_DQ_READY)
     pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
 #endif
+    // Corner-turn sync edge (tail dQ): see FAG_ABLATE_CORNER_WAIT note above.
+#ifndef FAG_ABLATE_CORNER_WAIT
     shared_tensors.ds_leader.wait(ds_leader_phase);
+#endif
     ds_leader_phase ^= 1;
     tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
+#ifndef FAG_ABLATE_DQ
       cute::gemm(tiled_mma_dsk,
                  tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
                  tDQrKT(_,_,k_block,_0{}),
                  tDQtDQ);
+#endif
       tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
     }
 
@@ -1965,8 +2184,59 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     auto sDS_xchg = make_tensor(
         make_smem_ptr(shared_tensors.smem_ds_xchg.begin()), SmemLayoutDSHalf{});
 
+#if defined(FAG_DS_RUN_STORES)
+    // Loop-invariant dS corner-turn store addresses (FAG_DS_RUN_STORES).
+    // With the x32 TMEM-load atom every thread owns two 32-value runs of
+    // consecutive Q at its fixed KV lane dp_idx: fragment element i belongs to
+    // Q(i) = 32*(wg + 2*k) + (i % 32), k = i / 32.  Run k carries the Q-half
+    // owned by CTA rank k (rows [32*wg, 32*wg+32) of that half after rebasing),
+    // so it stores into the own smem_ds half when k == cta_rank and into the
+    // exchange staging buffer otherwise -- ownership is decided once per run,
+    // never per element or per strip.  In SmemLayoutDSHalf the SW64 atom maps
+    // 16-byte row-block b = q>>4 at column kv to physical block b ^ t with
+    // t = (kv & 7) >> 1; the two blocks of a run are (2*wg) and (2*wg + 1),
+    // whose XOR images differ only in bit 4, so the run's second STS.128 lands
+    // at (first address ^ 16).  Both addresses are therefore pure functions of
+    // (wg_idx, dp_idx, cta_rank) and are hoisted out of the mainloop entirely.
+    uint32_t ds_run_addr[2];
+    {
+      uint32_t t_swz = uint32_t(dp_idx & 7) >> 1;
+      uint32_t blk = (uint32_t(2 * wg_idx) ^ t_swz) * 16;
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < 2; ++k) {
+        Element* run_base = (k == cta_rank)
+            ? shared_tensors.smem_ds.begin() + cta_rank * kDSHalfElements
+            : shared_tensors.smem_ds_xchg.begin();
+        ds_run_addr[k] = cute::cast_smem_ptr_to_uint(run_base)
+                       + uint32_t(dp_idx) * 64 + blk;
+      }
+    }
+#endif
+
+#if defined(FAG_DS_STASYNC_CLUSTER)
+    // Loop-invariant SMEM address of this CTA's ds_full barrier; peer-run
+    // st.async stores account their bytes on the PEER's copy (mapped via
+    // set_block_rank inside the helper).  Note the peer destination is the
+    // own-half formula ds_run_addr[cta_rank] (this CTA's slot inside the
+    // peer's smem_ds), not the staging-buffer address.
+    uint32_t ds_full_addr = cute::cast_smem_ptr_to_uint(
+        reinterpret_cast<uint64_t*>(&shared_tensors.ds_full));
+#endif
+
     bool is_residual_k = get<1>(blk_coord) * TileShapeK{} + TileShapeK{} > get<1>(problem_shape);
     bool have_pending_ds = false;
+
+#if defined(FAG_OPT_STASYNC_XCHG)
+    // Arm the first xchg_tx phase before any store can complete. Later phases
+    // are armed one iteration ahead (right after this iteration's wait), which
+    // is ordered before the next iteration's st.async completions by the dS
+    // pipeline round-trip (producer_acquire <- MMA release <- ds_leader <-
+    // relay <- ds_full tx = this iteration's bulk copy completion).
+    uint32_t xchg_phase = 0;
+    if (dp_idx == 0 && wg_idx == 0) {
+      shared_tensors.xchg_tx.expect_transaction(kTransactionsBytesDSExchange);
+    }
+#endif
 
     CUTLASS_PRAGMA_NO_UNROLL
     while (iter_count > 0) {
@@ -2020,7 +2290,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       dispatch_bool(leading_causal_masking || trailing_residual_masking, [&](auto is_masked_tile) {
 
         // compute P = softmax(S, LSE)
+        // FAG_ABLATE_S_LOAD (timing-only): skip the S TMEM->register load
+        // (tcgen05.ld). The downstream mask/FMA/exp2/quantize chain still runs
+        // on the (garbage) fragment, so nothing else is optimized away.
+#ifndef FAG_ABLATE_S_LOAD
         cute::copy(tiled_t2r, tTR_tST, tTR_rST);
+#endif
 
         // FA4 delayed dS publication.  dQ(i-1) aliases the upper half of the
         // S(i) TMEM allocation.  Publish dS(i-1) only after every compute
@@ -2056,8 +2331,15 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           float2 out;
           acc.x = tTR_rST(i);
           acc.y = tTR_rST(i + 1);
+#if defined(FAG_ABLATE_LSE_LOAD)
+          // FAG_ABLATE_LSE_LOAD (timing-only): skip the LSE shared-memory
+          // reads (feeds garbage to the FMA chain, which still runs).
+          lse.x = 0.f;
+          lse.y = 0.f;
+#else
           lse.x = sLSE(get<1>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
           lse.y = sLSE(get<1>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
+#endif
           cute::fma(out, softmax_scale_log2_e, acc, lse);
           tTR_rST(i) = out.x;
           tTR_rST(i+1) = out.y;
@@ -2115,9 +2397,26 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           float2 out;
           acc.x = tTR_rST(i);
           acc.y = tTR_rST(i + 1);
+#if defined(FAG_ABLATE_LSE_LOAD)
+          // FAG_ABLATE_LSE_LOAD (timing-only): skip the LSE shared-memory
+          // reads (feeds garbage to the FMA chain, which still runs).
+          lse.x = 0.f;
+          lse.y = 0.f;
+#else
           lse.x = sLSE(get<1>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
           lse.y = sLSE(get<1>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
+#endif
+#if defined(FAG_ABLATE_SCALE_LSE)
+          // FAG_ABLATE_SCALE_LSE (timing-only): remove BOTH the scale*S+LSE FMA
+          // and every exp2 (hardware MUFU and software emulation), keeping the
+          // S fragment and the LSE shared-memory reads live via zero-cost
+          // register asm. P degenerates to raw S.
+          asm volatile("" : "+f"(acc.x), "+f"(acc.y), "+f"(lse.x), "+f"(lse.y));
+          tTR_rST(i)   = acc.x;
+          tTR_rST(i+1) = acc.y;
+#else
           cute::fma(out, softmax_scale_log2_e, acc, lse);
+#ifndef FAG_ABLATE_EXP2
 #ifdef FAG_EX2_EMU_STRIDE
           static_assert(FAG_EX2_EMU_STRIDE == 1 || FAG_EX2_EMU_STRIDE == 2 ||
                         FAG_EX2_EMU_STRIDE == 4 || FAG_EX2_EMU_STRIDE == 8 ||
@@ -2135,6 +2434,14 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           tTR_rST(i) = ::exp2f(out.x);
           tTR_rST(i+1) = ::exp2f(out.y);
 #endif
+#else
+          // FAG_ABLATE_EXP2: skip exp2 (identity). out = scale*S - LSE is still
+          // produced by the FMA above and consumed here, so the S/LSE input
+          // loads and the FMA stay live; only the exp2 instruction is removed.
+          tTR_rST(i)   = out.x;
+          tTR_rST(i+1) = out.y;
+#endif
+#endif  // FAG_ABLATE_SCALE_LSE
         }
 #endif
 
@@ -2159,13 +2466,29 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
           ).arrive_and_wait();
         }
 #elif !defined(FAG_P_SELF_OWNED_TMEM)
+#if !defined(FAG_ABLATE_COMPUTE_BAR)
         cutlass::arch::NamedBarrier(
           kNumComputeWarps * NumThreadsPerWarp,
           cutlass::arch::ReservedNamedBarriers::TransformBarrier
         ).arrive_and_wait();
 #endif
+#endif
 
+#if defined(FAG_ABLATE_P_STORE)
+        // FAG_ABLATE_P_STORE (timing-only): skip the P register->TMEM store
+        // (tcgen05.st). The quantize feeding it stays live by consuming its
+        // packed u32 output with zero-cost register asm. dV reads stale TMEM.
+        {
+          auto live_u32 = recast<uint32_t>(tRT_rST_reshaped);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(live_u32); ++i) {
+            uint32_t live = live_u32(i);
+            asm volatile("" : "+r"(live));
+          }
+        }
+#else
         cute::copy(tiled_r2t, tRT_rST_reshaped, tRT_tP);
+#endif
       });
 
       // notify for P
@@ -2201,10 +2524,74 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // wait for dP
       pipeline_mma_compute_dp.consumer_wait(pipeline_mma_compute_dp_consumer_state);
 
-      // compute dS = dsoftmax(P, dP, sum_OdO)
+#if defined(FAG_DS_COLUMN_SPLIT)
+      // FAG_DS_COLUMN_SPLIT: FA4-style two-chunk dS phase (requires
+      // FAG_DS_RUN_STORES' x32 fragment order; the two flags share the same
+      // run decomposition i <-> Q(i) = 32*(wg + 2*(i/32)) + (i%32)).  Each
+      // chunk consumes exactly the fp32 P values of one 32-value run -- they
+      // die with the chunk, cutting the transient P-live range in half --
+      // and quantizes its 32 bytes into the same full-order fragment the
+      // downstream stores consume.  The TMEM load stays whole-fragment (the
+      // two warpgroups own different TMEM column blocks, so a sliced tiled
+      // copy cannot express both); chunked math+quantize alone still shortens
+      // the P/dS overlap and spreads F2FP converter groups across the store
+      // chain.  Bytes, fragment order and handshakes unchanged.
+      Tensor tTR_rDST = make_tensor<Element>(shape(tTR_cDPT));
+#ifndef FAG_ABLATE_DP_LOAD
       cute::copy(tiled_t2r, tTR_tDPT, tTR_rDPT);
 #endif
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < 2; ++k) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 32; j += 2) {
+          int i = 32 * k + j;
+          float2 st;
+          st.x = tTR_rST(i);
+          st.y = tTR_rST(i+1);
+          float2 dpt;
+          dpt.x = tTR_rDPT(i);
+          dpt.y = tTR_rDPT(i+1);
+          float2 odo;
+#if defined(FAG_ABLATE_LSE_LOAD)
+          odo.x = 0.f;
+          odo.y = 0.f;
+#else
+          odo.x = sSumOdO(get<1>(tTR_cDPT(i)), pipeline_load_compute_sum_odo_consumer_state.index());
+          odo.y = sSumOdO(get<1>(tTR_cDPT(i+1)), pipeline_load_compute_sum_odo_consumer_state.index());
+#endif
+#ifndef FAG_ABLATE_SOFTMAX
+          float2 dif;
+          // sum odo is negated during preprocess
+          cute::add(dif, dpt, odo);
+          float2 out;
+          cute::mul(out, dif, st);
+          tTR_rDPT(i) = out.x;
+          tTR_rDPT(i+1) = out.y;
+#else
+          asm volatile("" : "+f"(st.x), "+f"(st.y), "+f"(odo.x), "+f"(odo.y));
+          tTR_rDPT(i)   = dpt.x;
+          tTR_rDPT(i+1) = dpt.y;
+#endif
+        }
+        Tensor run_view = make_tensor(tTR_rDPT.data() + 32 * k, Shape<_32>{});
+        auto run_dst = quantize(run_view);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 32; ++j) {
+          tTR_rDST(32 * k + j) = run_dst(j);
+        }
+      }
+#else  // !FAG_DS_COLUMN_SPLIT
+      // compute dS = dsoftmax(P, dP, sum_OdO)
+      // FAG_ABLATE_DP_LOAD (timing-only): skip the dP TMEM->register load.
+      // The softmax add+mul, quantize and pack below still run on the garbage
+      // fragment, so nothing downstream is optimized away.
+#ifndef FAG_ABLATE_DP_LOAD
+      cute::copy(tiled_t2r, tTR_tDPT, tTR_rDPT);
+#endif
+#endif  // FAG_DS_COLUMN_SPLIT
+#endif
 
+#if !defined(FAG_DS_COLUMN_SPLIT)
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tTR_rDPT); i += 2) {
         float2 st;
@@ -2216,6 +2603,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         float2 odo;
         odo.x = sSumOdO(get<1>(tTR_cDPT(i)), pipeline_load_compute_sum_odo_consumer_state.index());
         odo.y = sSumOdO(get<1>(tTR_cDPT(i+1)), pipeline_load_compute_sum_odo_consumer_state.index());
+#ifndef FAG_ABLATE_SOFTMAX
         float2 dif;
         // sum odo is negated during preprocess
         cute::add(dif, dpt, odo);
@@ -2223,9 +2611,18 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         cute::mul(out, dif, st);
         tTR_rDPT(i) = out.x;
         tTR_rDPT(i+1) = out.y;
+#else
+        // FAG_ABLATE_SOFTMAX: skip the add+mul (the dS derivative). Mark st/odo
+        // live with zero-cost register asm so the P/sumOdO loads are NOT DCE'd;
+        // leave dP in place so the downstream quantize still compiles & runs.
+        asm volatile("" : "+f"(st.x), "+f"(st.y), "+f"(odo.x), "+f"(odo.y));
+        tTR_rDPT(i)   = dpt.x;
+        tTR_rDPT(i+1) = dpt.y;
+#endif
       }
 
       auto tTR_rDST = quantize(tTR_rDPT);
+#endif  // !FAG_DS_COLUMN_SPLIT
 #if defined(FAG_DS_RECAST_PACK)
       // NumericArrayConverter already materializes each four adjacent FP8
       // values as one 32-bit register group.  Recast that exact bit pattern
@@ -2244,6 +2641,25 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // aliased dP TMEM input has been released.
       pipeline_compute_mma_ds.producer_acquire(pipeline_compute_mma_ds_producer_state);
 
+#if defined(FAG_DS_STASYNC_CLUSTER)
+      // Arm the PEER's ds_full for this iteration BEFORE any st.async can
+      // complete against it.  producer_acquire above is ordered after the
+      // previous iteration's ds_full phase completed (kStagesComputeSmem == 1:
+      // acquire <- MMA dQ release <- ds_leader <- relay <- ds_full tx), so
+      // this arrive+expect_tx lands in the new phase and provides the single
+      // arrival; the 512 x 16-byte st.async stores below provide exactly
+      // kTransactionsBytesDSExchange of complete_tx.  The named barrier then
+      // orders the arm before every compute thread's st.async (user barrier id
+      // 0 => hardware id 8, unused by this kernel).
+      if (dp_idx == 0 && wg_idx == 0) {
+        shared_tensors.ds_full.arrive_and_expect_tx(
+            kTransactionsBytesDSExchange, uint32_t(cta_rank ^ 1));
+      }
+      cutlass::arch::NamedBarrier(
+        kNumComputeWarps * NumThreadsPerWarp, /*user id*/ 0
+      ).arrive_and_wait();
+#endif
+
       // FP8-specific vector R2S corner turn.  The TMEM load gives each lane one
       // fixed KV column and four 16-row Q strips.  In SmemLayoutDSHalf, groups
       // of four adjacent Q values at a fixed KV coordinate are physically
@@ -2251,10 +2667,133 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       // fall back to four bank-conflicting byte stores.  Ownership is decided
       // once per 16-row strip instead of once per scalar element.
       static_assert(sizeof(Element) == 1, "2-SM FP8 corner turn expects byte elements");
+#if defined(FAG_ABLATE_PACK)
+      // FAG_ABLATE_PACK (timing-only, correctness intentionally broken): drop
+      // the ENTIRE SMEM corner turn — every pack4 chain plus both the own-half
+      // and exchange-half stores. The dQ MMA therefore reads stale SMEM. The
+      // FP32->e4m3 quantize above is kept live by consuming its packed u32
+      // output with zero-cost register asm, so the converter and its dP inputs
+      // are NOT optimized away. The TMEM dS store feeding dK below and every
+      // pipeline/mbarrier handshake are preserved. Zero effect on the base path.
+      {
+        auto live_u32 = recast<uint32_t>(tTR_rDST);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(live_u32); ++i) {
+          uint32_t live = live_u32(i);
+          asm volatile("" : "+r"(live));
+        }
+      }
+#elif defined(FAG_OPT_OWN_LATE)
+      // FAG_OPT_OWN_LATE: issue ONLY the exchange-half stores here so the
+      // generic->async proxy fence below has half as many in-flight stores to
+      // drain. The own-half stores are deferred to after the exchange launch;
+      // the dQ MMA reads them much later, ordered by the iteration-end
+      // fence_view_async_shared (unchanged). Identical bytes and handshakes.
+      CUTLASS_PRAGMA_UNROLL
+      for (int strip = 0; strip < 4; ++strip) {
+        if (strip / 2 == cta_rank) {
+          continue;
+        }
+        int q_strip_base = (strip % 2) * 32 + wg_idx * 16;
+        int src = strip * 16;
+        uint4 lane_q16 = {
+            pack_u32(tTR_rDST, src + 0), pack_u32(tTR_rDST, src + 4),
+            pack_u32(tTR_rDST, src + 8), pack_u32(tTR_rDST, src + 12)};
+        *reinterpret_cast<uint4*>(&sDS_xchg(q_strip_base, dp_idx)) = lane_q16;
+      }
+#elif defined(FAG_DS_RUN_STORES)
+      // FAG_DS_RUN_STORES: FA4-style corner turn.  Two 32-value runs per
+      // thread; each run is two adjacent 16-byte blocks of one swizzled row,
+      // so the stores are STS.128 at a precomputed loop-invariant base and
+      // base^16 -- zero address ALU and zero per-strip ownership branching
+      // inside the mainloop (see ds_run_addr above).  Bytes, destinations and
+      // the exchange handshake are identical to the base path; only the
+      // register->SMEM mapping and its addressing change.
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < 2; ++k) {
+        int src = 32 * k;
+        uint4 lane_q32a = {
+            pack_u32(tTR_rDST, src +  0), pack_u32(tTR_rDST, src +  4),
+            pack_u32(tTR_rDST, src +  8), pack_u32(tTR_rDST, src + 12)};
+        uint4 lane_q32b = {
+            pack_u32(tTR_rDST, src + 16), pack_u32(tTR_rDST, src + 20),
+            pack_u32(tTR_rDST, src + 24), pack_u32(tTR_rDST, src + 28)};
+#if defined(FAG_DS_STASYNC_CLUSTER)
+        // Own run -> plain local STS (visible to the cta_group::2 UMMA via the
+        // iteration-end fence_view_async_shared, as in the base path).  Peer
+        // run -> direct async-proxy store into the peer CTA's smem_ds at THIS
+        // CTA's half offset (= ds_run_addr[cta_rank]'s own-half formula),
+        // accounting 2x16 bytes on the peer's ds_full.  No staging buffer, no
+        // proxy fence, no bulk copy.
+        uint32_t addr = (k == cta_rank) ? ds_run_addr[k] : ds_run_addr[cta_rank];
+        if (k == cta_rank) {
+          asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                       :: "r"(addr),
+                          "r"(lane_q32a.x), "r"(lane_q32a.y),
+                          "r"(lane_q32a.z), "r"(lane_q32a.w)
+                       : "memory");
+          asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                       :: "r"(addr ^ 16),
+                          "r"(lane_q32b.x), "r"(lane_q32b.y),
+                          "r"(lane_q32b.z), "r"(lane_q32b.w)
+                       : "memory");
+        }
+        else {
+          stasync_cluster_128(
+              addr, lane_q32a, ds_full_addr, uint32_t(cta_rank ^ 1));
+          stasync_cluster_128(
+              addr ^ 16, lane_q32b, ds_full_addr, uint32_t(cta_rank ^ 1));
+        }
+#else
+        uint32_t addr = ds_run_addr[k];
+        bool store_run = true;
+#if defined(FAG_ABLATE_CORNER) || defined(FAG_ABLATE_XCHG_STORE)
+        // Timing-only: skip the peer-bound run stores.  ABLATE_XCHG_STORE
+        // keeps the bulk copy below moving the same byte count (isolates the
+        // peer-run STS cost); ABLATE_CORNER additionally replaces the copy
+        // with a no-tx arrive (drops the whole exchange).  The own-run stores
+        // keep the pack chain live in both cases.
+        if (k != cta_rank) {
+          store_run = false;
+        }
+#endif
+#if defined(FAG_ABLATE_OWN_STORE)
+        // Timing-only: skip the locally-owned run stores (the peer-run stores
+        // and every handshake are preserved).
+        if (k == cta_rank) {
+          store_run = false;
+        }
+#endif
+        if (store_run) {
+          asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                       :: "r"(addr),
+                          "r"(lane_q32a.x), "r"(lane_q32a.y),
+                          "r"(lane_q32a.z), "r"(lane_q32a.w)
+                       : "memory");
+          asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                       :: "r"(addr ^ 16),
+                          "r"(lane_q32b.x), "r"(lane_q32b.y),
+                          "r"(lane_q32b.z), "r"(lane_q32b.w)
+                       : "memory");
+        }
+#endif
+      }
+#else
       CUTLASS_PRAGMA_UNROLL
       for (int strip = 0; strip < 4; ++strip) {
         int q_strip_base = (strip % 2) * 32 + wg_idx * 16;
         bool store_own = strip / 2 == cta_rank;
+#if defined(FAG_ABLATE_CORNER)
+        // Ablation (timing-only, correctness intentionally broken): drop the
+        // peer-half dS exchange entirely. Only the locally-owned half is packed
+        // and written to SMEM; the cross-CTA DSMEM bulk copy below is replaced
+        // by a no-tx arrive. The dQ MMA therefore reads garbage for the peer
+        // half, which is expected. Own-half SMEM store + the TMEM dS store that
+        // feeds dK are preserved. Zero effect on the base path.
+        if (!store_own) {
+          continue;
+        }
+#endif
         int src = strip * 16;
 #if defined(FAG_DS_RECAST_PACK)
         uint4 lane_q16 = {
@@ -2272,30 +2811,166 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 #endif
 
         if (store_own) {
+#if !defined(FAG_ABLATE_OWN_STORE)
           *reinterpret_cast<uint4*>(&sDS_own(q_strip_base, dp_idx)) = lane_q16;
+#endif
+#if defined(FAG_PROBE_DBL_STS) && !defined(FAG_ABLATE_OWN_STORE)
+          // LSU competition probe: DUPLICATE the own-half store to the SAME
+          // address with the SAME data. Idempotent (no correctness change).
+          // Occupies one extra LSU slot per execution. If the LSU/TMA
+          // competition hypothesis is correct, this should cost the same as
+          // the ownstore ablation saves (~6%), proving the cost is from the
+          // LSU slot itself, not from the data or address.
+          {
+            uint32_t dup_addr = cute::cast_smem_ptr_to_uint(
+                &sDS_own(q_strip_base, dp_idx));
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
+                         :: "r"(dup_addr), "r"(lane_q16.x), "r"(lane_q16.y),
+                            "r"(lane_q16.z), "r"(lane_q16.w) : "memory");
+          }
+#endif
         }
         else {
-#if defined(FAG_DS_DIRECT_DSMEM)
+#if defined(FAG_DS_STASYNC_CLUSTER)
+          // FAG_DS_STASYNC_CLUSTER (strip form): the peer half goes directly
+          // to the peer CTA's smem_ds slot through the async proxy with tx
+          // accounting on the peer's ds_full (armed just after
+          // producer_acquire).  No staging STS, no proxy fence, no bulk copy.
+          stasync_cluster_128(
+              cute::cast_smem_ptr_to_uint(&sDS_own(q_strip_base, dp_idx)),
+              lane_q16, ds_full_addr, uint32_t(cta_rank ^ 1));
+#elif defined(FAG_DS_DIRECT_DSMEM)
           store_shared_cluster_128(
               reinterpret_cast<void*>(&sDS_own(q_strip_base, dp_idx)),
               lane_q16, uint32_t(cta_rank ^ 1));
-#else
+#elif defined(FAG_OPT_STASYNC_XCHG)
+          // FAG_OPT_STASYNC_XCHG: the exchange half goes through the async
+          // proxy (st.async + mbarrier tx) so the DSMEM bulk copy below needs
+          // no fence.proxy.async.shared::cluster. Own-half stores stay plain
+          // STS and keep their existing fence_view_async_shared ordering.
+          stasync_128(
+              reinterpret_cast<void*>(&sDS_xchg(q_strip_base, dp_idx)),
+              lane_q16, &shared_tensors.xchg_tx);
+#elif !defined(FAG_ABLATE_XCHG_STORE)
+          // FAG_ABLATE_XCHG_STORE (timing-only): keep the pack arithmetic but
+          // skip the exchange-half SMEM store. The bulk copy below still moves
+          // the same byte count (stale data), isolating the STS cost.
           *reinterpret_cast<uint4*>(&sDS_xchg(q_strip_base, dp_idx)) = lane_q16;
 #endif
         }
       }
+#endif  // FAG_ABLATE_PACK
+
+#if defined(FAG_PROBE_DBL_LDS)
+      // LSU competition probe: 2 extra LDS.128 reads from the dS SMEM buffer.
+      // Same LSU pipe as STS but READS don't compete for SMEM WRITE ports
+      // (TMA loads write; our STS writes; LDS only reads). If the cost is
+      // specifically about WRITE port competition with TMA, LDS should be
+      // cheaper than STS per slot.
+      {
+        uint32_t addr = cute::cast_smem_ptr_to_uint(&sDS_own(0, 0));
+        uint32_t d0, d1, d2, d3;
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                     : "r"(addr) : "memory");
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                     : "r"(addr) : "memory");
+        asm volatile("" :: "r"(d0), "r"(d1), "r"(d2), "r"(d3));
+      }
+#endif
+
+#if defined(FAG_PROBE_EXTRA_ALU_24)
+      // Control probe: 24 integer ALU ops (matching the ~24 address
+      // instructions that accompany the 2 own STS.128). These use the ALU
+      // pipe, NOT the LSU pipe. If the LSU hypothesis is correct, these
+      // should cost far less than 2 extra STS (~6%) because ALU slots
+      // don't compete with TMA for SMEM ports.
+      {
+        uint32_t a = uint32_t(dp_idx), b = uint32_t(wg_idx);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 24; ++j) {
+          asm volatile("lop3.b32 %0, %0, %1, %2, 0x78;"
+                       : "+r"(a) : "r"(b), "r"(j));
+        }
+        asm volatile("" :: "r"(a));
+      }
+#endif
 
       // The same quantized dS is also written to TMEM for dK. All compute warps
       // must finish reading the aliased dP region before any warp overwrites it.
       cutlass::arch::fence_view_async_tmem_load();
       cutlass::arch::fence_view_async_shared();
+#if !defined(FAG_ABLATE_COMPUTE_BAR)
+      // FAG_ABLATE_COMPUTE_BAR (timing-only, ordering broken): isolates the
+      // 256-thread join that orders dP TMEM reads before the dS store.
       cutlass::arch::NamedBarrier(
         kNumComputeWarps * NumThreadsPerWarp,
         cutlass::arch::ReservedNamedBarriers::TransformBarrier
       ).arrive_and_wait();
+#endif
+#if defined(FAG_OPT_EARLY_COPY)
+      // FAG_OPT_EARLY_COPY: the barrier above just published every xchg store
+      // of this CTA, which is the only precondition of the DSMEM exchange.
+      // Issuing it here lets the copy engine run concurrently with the TMEM
+      // dS store below (independent sinks) instead of behind its issue chain.
+      // Bit-identical handshake and byte count; base path unchanged.
+      if (dp_idx == 0 && wg_idx == 0) {
+        uint32_t peer_rank = uint32_t(cta_rank ^ 1);
+        shared_tensors.ds_full.arrive_and_expect_tx(
+            kTransactionsBytesDSExchange, peer_rank);
+        asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+        cpasync_bulk_s2cluster(
+            shared_tensors.smem_ds.begin() + cta_rank * kDSHalfElements,
+            shared_tensors.smem_ds_xchg.begin(),
+            &shared_tensors.ds_full,
+            kTransactionsBytesDSExchange,
+            peer_rank);
+      }
+#elif defined(FAG_OPT_OWN_LATE)
+      // FAG_OPT_OWN_LATE: only the exchange-half stores were issued above, so
+      // the generic->async proxy fence below drains half as many in-flight
+      // stores as the base ordering. The deferred own-half stores then overlap
+      // the bulk copy engine; the dQ MMA reads them much later, ordered by the
+      // iteration-end fence_view_async_shared (unchanged). Identical bytes,
+      // addresses and handshakes; base path unchanged.
+      if (dp_idx == 0 && wg_idx == 0) {
+        uint32_t peer_rank = uint32_t(cta_rank ^ 1);
+        shared_tensors.ds_full.arrive_and_expect_tx(
+            kTransactionsBytesDSExchange, peer_rank);
+#if defined(FAG_OPT_FENCE_CTA)
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#else
+        asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+#endif
+        cpasync_bulk_s2cluster(
+            shared_tensors.smem_ds.begin() + cta_rank * kDSHalfElements,
+            shared_tensors.smem_ds_xchg.begin(),
+            &shared_tensors.ds_full,
+            kTransactionsBytesDSExchange,
+            peer_rank);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int strip = 0; strip < 4; ++strip) {
+        if (strip / 2 != cta_rank) {
+          continue;
+        }
+        int q_strip_base = (strip % 2) * 32 + wg_idx * 16;
+        int src = strip * 16;
+        uint4 lane_q16 = {
+            pack_u32(tTR_rDST, src + 0), pack_u32(tTR_rDST, src + 4),
+            pack_u32(tTR_rDST, src + 8), pack_u32(tTR_rDST, src + 12)};
+        *reinterpret_cast<uint4*>(&sDS_own(q_strip_base, dp_idx)) = lane_q16;
+      }
+#endif
       {
         auto tRT_rDST = make_tensor(tTR_rDST.data(), shape(tRT_cDST));
+        // FAG_ABLATE_DS_TMEM_STORE (timing-only): skip the dS register->TMEM
+        // store feeding dK. The quantize output stays live through the SMEM
+        // corner-turn pack above, so the converter is not optimized away.
+#ifndef FAG_ABLATE_DS_TMEM_STORE
         cute::copy(tiled_r2t_ds, tRT_rDST, tRT_tDST);
+#endif
         cutlass::arch::fence_view_async_tmem_store();
       }
 
@@ -2312,18 +2987,79 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
 
       // Send the Q half owned by the peer. The destination K-half is selected by
       // the sender rank, yielding peer-local [K0|K1] reduction order.
+      // (FAG_OPT_EARLY_COPY / FAG_OPT_OWN_LATE moved this exchange block to
+      //  just after the compute named barrier above; nothing remains here in
+      //  those configurations.  FAG_DS_STASYNC_CLUSTER replaces the exchange
+      //  with per-store remote st.async, so the arm/copy block is gone too.)
+#if !defined(FAG_OPT_EARLY_COPY) && !defined(FAG_OPT_OWN_LATE) && !defined(FAG_DS_STASYNC_CLUSTER)
       if (dp_idx == 0 && wg_idx == 0) {
         uint32_t peer_rank = uint32_t(cta_rank ^ 1);
-#if defined(FAG_DS_DIRECT_DSMEM)
+#if defined(FAG_ABLATE_CORNER) || defined(FAG_ABLATE_PACK)
+        // Ablation: peer dS bytes are never exchanged, so do NOT arm a
+        // transaction-byte expectation (that would deadlock the relay wait).
+        // A plain arrive on the peer's ds_full lets its wait complete. No fence
+        // is needed here: there are no peer stores left to order against.
+        shared_tensors.ds_full.arrive(peer_rank);
+#elif defined(FAG_ABLATE_BULK)
+        // Ablation (timing-only): both SMEM stores above still run; only the
+        // DSMEM bulk copy and its transaction-byte handshake are dropped
+        // (plain arrive so the peer's relay wait completes). Isolates the
+        // copy+tx cost from the STS cost. dQ reads a stale peer half.
+        shared_tensors.ds_full.arrive(peer_rank);
+#elif defined(FAG_DS_DIRECT_DSMEM)
         // The compute named barrier above has joined all dS stores in this CTA.
         // Publish them at cluster scope before signaling the peer's completion
         // barrier.  The relay/MMA wait chain remains unchanged.
-        asm volatile("fence.acq_rel.cluster;" ::: "memory");
+        asm volatile("fence.acq.rel.cluster;" ::: "memory");
         shared_tensors.ds_full.arrive(peer_rank);
+#elif defined(FAG_OPT_STASYNC_XCHG)
+        // The exchange half was written by st.async (async proxy) with its
+        // bytes accounted on xchg_tx. Wait for that phase completion instead
+        // of fence.proxy.async.shared::cluster: the bulk copy then reads
+        // async-proxy data with no generic->async proxy transition and no
+        // forced drain of the plain own-half STS still in flight. Re-arm the
+        // next phase BEFORE issuing the copy so the expectation always leads
+        // the next iteration's st.async completions (see the comment at the
+        // xchg_phase declaration for the ordering proof).
+        shared_tensors.xchg_tx.arrive();
+        shared_tensors.xchg_tx.wait(xchg_phase);
+        xchg_phase ^= 1;
+        shared_tensors.xchg_tx.expect_transaction(kTransactionsBytesDSExchange);
+        shared_tensors.ds_full.arrive_and_expect_tx(
+            kTransactionsBytesDSExchange, peer_rank);
+        cpasync_bulk_s2cluster(
+            shared_tensors.smem_ds.begin() + cta_rank * kDSHalfElements,
+            shared_tensors.smem_ds_xchg.begin(),
+            &shared_tensors.ds_full,
+            kTransactionsBytesDSExchange,
+            peer_rank);
 #else
         shared_tensors.ds_full.arrive_and_expect_tx(
             kTransactionsBytesDSExchange, peer_rank);
+#ifndef FAG_ABLATE_FENCE
+        // FAG_ABLATE_FENCE (timing-only, ordering intentionally broken):
+        // isolates the generic->async proxy fence cost from the copy bytes.
+        // FAG_OPT_FENCE_CTA: downgrade the scope from .shared::cluster to
+        // .shared::cta. The accesses being ordered (generic STS and the bulk
+        // engine's SOURCE read) are both in THIS CTA's shared memory; the
+        // peer-side consumption is separately ordered by ds_full. FA4's own
+        // 2-CTA exchange uses exactly the cta-scope fence before the same
+        // cp.async.bulk pattern. If the cluster-scope visibility flush is the
+        // measured -11.7%, this recovers it; if the cost is scope-independent
+        // proxy quiesce, it is neutral (adversarial test of the wall).
+#if defined(FAG_OPT_FENCE_CTA)
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#else
         asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+#endif
+#endif
+#if defined(FAG_ADVERSARIAL_DOUBLE_FENCE)
+        // Adversarial control for the fence attribution: a SECOND identical
+        // fence. If the measured -11.7% is the fence's real pipeline-quiesce
+        // cost, adding one more must ADD a comparable amount; if it was
+        // scheduling perturbation from removing code, doubling is neutral.
+        asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+#endif
         cpasync_bulk_s2cluster(
             shared_tensors.smem_ds.begin() + cta_rank * kDSHalfElements,
             shared_tensors.smem_ds_xchg.begin(),
@@ -2332,6 +3068,7 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
             peer_rank);
 #endif
       }
+#endif  // !FAG_OPT_EARLY_COPY && !FAG_OPT_OWN_LATE
 
       // Do not notify MMA yet: dQ aliases S/P at kS + D/2.  The next loop
       // iteration publishes this dS after loading the following S tile.  The
@@ -2438,7 +3175,12 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
       Tensor tTR_rDQ = make_tensor<ElementAcc>(shape(tTR_cDQ));
 
       // load dQ from tmem to rmem
+      // FAG_ABLATE_REDUCE (timing-only): remove the reduce warpgroup's data
+      // path (TMEM load + SMEM staging + TMA reduce-add store) while keeping
+      // every pipeline handshake below, so the MMA producer side is unchanged.
+#ifndef FAG_ABLATE_REDUCE
       cute::copy(tiled_t2r, tTR_tDQ, tTR_rDQ);
+#endif
 
 #ifdef BWD_2SM_DEBUG
       if (blockIdx.x == 0 &&
@@ -2531,6 +3273,72 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         launch_store(store_state_2, Int<2>{});
         launch_store(store_state_3, Int<3>{});
       }
+#elif defined(FAG_DQ_HALF_SPLIT)
+      // FAG_DQ_HALF_SPLIT: the four 32-column store tiles are data-DISJOINT
+      // between thread halves (tid/64 == tile/2), yet the serial loop joins
+      // all 128 reduce threads around every round's barriers and re-diverges
+      // on the dq_half store guard -- NCU shows 22.4% of all stall samples
+      // parked by the reduce warps, dominated by barrier waits + BSSY
+      // reconvergence (10983 + 5773 samples) rather than the STS themselves.
+      // Here each half runs its two rounds as an independent 64-thread
+      // chain: per-half named barriers (hardware ids 5/6, unused), its own
+      // lane-0 TMA issuer, and NO intra-round divergence (the store guard is
+      // uniform within a half).  The two halves' staging chains execute in
+      // parallel, halving the drain's barrier critical path.  Requires the
+      // four-stage rotation so the halves' buffers never collide.
+      static_assert(kStagesReduceTmaStore == 4, "FAG_DQ_HALF_SPLIT needs 4 stages");
+      {
+        int dq_row = reduce_thread_idx % 64;
+        int dq_half = reduce_thread_idx / 64;
+        bool half_leader = (reduce_thread_idx % 64) == 0;
+        cutlass::arch::ReservedNamedBarriers half_bar_id =
+            (dq_half == 0) ? cutlass::arch::ReservedNamedBarriers::StreamkBarrier1
+                           : cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier;
+        cutlass::arch::NamedBarrier half_barrier(
+            2 * 32 /* two warps per half */, half_bar_id);
+        // PipelineTmaStore is a per-LEADER TMA bulk-group counter (acquire ==
+        // cp.async.bulk.wait_group, commit == commit_group), NOT a per-stage
+        // mbarrier pipeline -- two issuing leaders must therefore track their
+        // OWN group counts.  With two SMEM buffers per half, the safety rule
+        // is: before restaging a buffer, wait until at most one of this
+        // leader's own TMA groups is still in flight (classic 2-deep store
+        // rotation), which restores the serial path's double-buffering.
+        int stage_idx = (int(pipeline_reduce_tma_store_producer_state.index())
+                         + 2 * dq_half) % kStagesReduceTmaStore;
+        uint32_t half_group_count = uint32_t(iter_index) * 2;  // this half's committed groups so far
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 2; ++j) {
+          int tile = 2 * dq_half + j;
+#if !defined(FAG_ABLATE_REDUCE_TMA)
+          if (half_leader && half_group_count + uint32_t(j) > 1) {
+            cute::tma_store_wait<1>();
+          }
+#endif
+          half_barrier.arrive_and_wait();
+#ifndef FAG_ABLATE_REDUCE
+          copy_aligned(
+              tTR_rDQ(_, _, tile % 2),
+              sDQ(dq_row, _, stage_idx));
+#endif
+          cutlass::arch::fence_view_async_shared();
+          half_barrier.arrive_and_wait();
+          if (half_leader) {
+#if !defined(FAG_ABLATE_REDUCE) && !defined(FAG_ABLATE_REDUCE_TMA)
+            copy(mainloop_params.tma_red_dq,
+                 tDQsDQ(_,_,_0{}, stage_idx),
+                 tDQgDQ(_,_,tile,iter_index * kClusterSize + cta_rank,blk_coord_batch));
+#endif
+            cute::tma_store_arrive();
+          }
+          stage_idx = (stage_idx + 1) % kStagesReduceTmaStore;
+        }
+        // Both halves consumed two stages each; advance the shared rotation
+        // by the same four steps in every thread to stay in lockstep.
+        ++pipeline_reduce_tma_store_producer_state;
+        ++pipeline_reduce_tma_store_producer_state;
+        ++pipeline_reduce_tma_store_producer_state;
+        ++pipeline_reduce_tma_store_producer_state;
+      }
 #else
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < kNumDQStoreTiles; i++) {
@@ -2553,22 +3361,55 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
         int dq_row = reduce_thread_idx % 64;
         int dq_half = reduce_thread_idx / 64;
         if (dq_half == i / 2) {
+#if !defined(FAG_ABLATE_REDUCE) && !defined(FAG_ABLATE_REDUCE_STS)
+          // FAG_ABLATE_REDUCE_STS (timing-only): keep the TMEM load, the
+          // tmem-load fence and the consumer_release (the release chain that
+          // serializes consecutive dQ MMAs), skip only the SMEM staging and
+          // the TMA store.  (REDUCE - REDUCE_STS) isolates the staging cost;
+          // REDUCE_STS alone isolates the release-chain / LDTM-latency cost.
+#if defined(FAG_DQ_BF16_STAGING)
+          // FAG_DQ_BF16_STAGING: convert the 32-f32 run to packed BF16 pairs
+          // (F2FP.BF16.PACK) and stage 64B via 2xSTS.128 instead of 128B via
+          // 4xSTS.128 -- half the LSU wavefronts of the #1 bottleneck.
+          Tensor run_f32 = tTR_rDQ(_, _, i % 2);
+          Tensor pack16 = make_tensor<uint32_t>(Shape<Int<size(run_f32) / 2>>{});
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < size(run_f32); e += 2) {
+            __nv_bfloat162 pair = __floats2bfloat162_rn(run_f32(e), run_f32(e + 1));
+            pack16(e / 2) = *reinterpret_cast<uint32_t*>(&pair);
+          }
+          copy_aligned(
+              pack16,
+              recast<uint32_t>(sDQ(dq_row, _, pipeline_reduce_tma_store_producer_state.index())));
+#else
           copy_aligned(
               tTR_rDQ(_, _, i % 2),
               sDQ(dq_row, _, pipeline_reduce_tma_store_producer_state.index()));
+#endif
+#endif
         }
 
         // wait for the stores to all be visible to the TMA
+        // FAG_ABLATE_REDUCE_FENCE (timing-only, ordering broken): isolates
+        // the per-round generic->async proxy fence of the drain staging.
+#ifndef FAG_ABLATE_REDUCE_FENCE
         cutlass::arch::fence_view_async_shared();
+#endif
         cutlass::arch::NamedBarrier(
             kNumReduceWarps * NumThreadsPerWarp,
             cutlass::arch::ReservedNamedBarriers::TransposeBarrier
         ).arrive_and_wait();
         if (lane_predicate) {
           // launch tma store
+          // FAG_ABLATE_REDUCE_TMA (timing-only): keep the TMEM->RMEM load and
+          // the SMEM staging, but skip the TMA reduce-add issue.  (REDUCE -
+          // REDUCE_TMA) then isolates the atomic reduce-add traffic from the
+          // drain (TMEM load + SMEM staging) cost.
+#if !defined(FAG_ABLATE_REDUCE) && !defined(FAG_ABLATE_REDUCE_TMA) && !defined(FAG_ABLATE_REDUCE_STS)
           copy(mainloop_params.tma_red_dq,
                tDQsDQ(_,_,_0{}, pipeline_reduce_tma_store_producer_state.index()),
                tDQgDQ(_,_,i,iter_index * kClusterSize + cta_rank,blk_coord_batch));
+#endif
           pipeline_reduce_tma_store.producer_commit(pipeline_reduce_tma_store_producer_state);
         }
 
@@ -2796,10 +3637,13 @@ struct Sm100FmhaBwdKernelTma2SmWarpSpecialized {
     TmemAllocator tmem_allocator;
 
     // [2SM] init the cross-CTA TMEM-alloc handshake barrier (leader waits for 1).
-    if (threadIdx.x == 0) {
+      if (threadIdx.x == 0) {
       shared_storage.pipelines.tmem_alloc_ready.init(1);
       shared_storage.tensors.ds_full.init(1);
       shared_storage.tensors.ds_leader.init(2);
+#if defined(FAG_OPT_STASYNC_XCHG)
+      shared_storage.tensors.xchg_tx.init(1);
+#endif
 #if defined(FAG_SPLIT_DK_DQ_READY)
       shared_storage.tensors.dk_ready.init(kClusterSize * kNumComputeWarps);
 #endif

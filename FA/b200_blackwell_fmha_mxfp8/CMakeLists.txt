@@ -128,6 +128,12 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
 
     set(BASE_TARGET 1ctab200_blackwell_fmha_${PREC})
     set(OP6_STATIC_2SM_TARGET op6static2sm_b200_blackwell_fmha_${PREC})
+    set(OP6_FA4_MUFU_TARGET op6static2sm_fa4mufu_b200_blackwell_fmha_${PREC})
+    set(OP6_FA4_MUFU_NO_E2RSF_TARGET op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_${PREC})
+    # [NOEXP probe] optimal no_e2rsf_fa4mufu baseline + softmax P exp2 replaced by
+    # a single add (exp2(out) -> out + row_max_safe). Perf-only (numerics wrong);
+    # retained as the exp-removed baseline for future experiments.
+    set(OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET op6static2sm_no_e2rsf_fa4mufu_noexp_b200_blackwell_fmha_${PREC})
 
     # 使用 cutlass 提供的函数创建可执行文件
     # （会自动设置 CUDA 编译选项和 gencode 标志）
@@ -212,6 +218,357 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
 
     target_compile_options(${OP6_STATIC_2SM_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
+    # Independent FA4-style MUFU/FMA split target.  Keeping this separate makes
+    # the baseline and optimized binaries directly comparable from one build.
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+    target_include_directories(${OP6_FA4_MUFU_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_TARGET} PRIVATE
+      ${OP6_STATIC_2SM_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=8
+      MXFP8_FA4_MUFU_END_PAIR=24
+      MXFP8_FA4_MUFU_PERIOD=8
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    target_compile_options(${OP6_FA4_MUFU_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # Interaction target: remove the lagged row-sum filler from the softmax
+    # burst, then apply the same compile-time MUFU/FMA split policy.  This keeps
+    # the experiment orthogonal to both the baseline and the single ablations.
+    set(OP6_FA4_MUFU_NO_E2RSF_DEFS ${OP6_STATIC_2SM_DEFS})
+    list(REMOVE_ITEM OP6_FA4_MUFU_NO_E2RSF_DEFS MXFP8_E2RSF)
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_NO_E2RSF_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+      nvidia-ml
+    )
+    target_include_directories(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      # Retained winner: 6 / 32 float2 pairs = 18.75% emulation.
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+      MXFP8_NVML_ENERGY
+    )
+    target_compile_options(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # WITH-EXP (full softmax, exp kept) + stage each SF to TMEM ONCE then reuse.
+    # Isolates the pure per-tile UTCCP staging cost on the real (exp-present) baseline.
+    set(WITHEXP_SFINCE_TARGET op6static2sm_no_e2rsf_fa4mufu_sfonce_b200_blackwell_fmha_${PREC})
+    cutlass_add_executable(${WITHEXP_SFINCE_TARGET} b200_blackwell_fmha.cu)
+    target_link_libraries(${WITHEXP_SFINCE_TARGET} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+    target_include_directories(${WITHEXP_SFINCE_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${WITHEXP_SFINCE_TARGET} PRIVATE
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+      MXFP8_SFB_CONST_ONCE
+      MXFP8_SFP_CONST_ONCE
+      MXFP8_SFV_CONST_ONCE
+    )
+    target_compile_options(${WITHEXP_SFINCE_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # [NOEXP probe] identical to op6static2sm_no_e2rsf_fa4mufu (E2RSF off + 18.75%
+    # MUFU split) plus MXFP8_NOEXP_ADD, which routes the softmax P-value exp2
+    # through exp2(out) -> out + row_max_safe in the mainloop. Only the softmax
+    # P-value exp is removed; the row_sum/O rescale exp2 stay as hardware MUFU.EX2.
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+    target_include_directories(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+      MXFP8_NOEXP_ADD
+    )
+    target_compile_options(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # ── [Ablation probes] each = noexp baseline (defs below) + one instruction
+    # class neutralized via a MXFP8_ABLATE_* macro. ${ARGN} carries the macro(s).
+    set(NOEXP_DEFS
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+      MXFP8_NOEXP_ADD
+    )
+    function(add_noexp_ablation SUFFIX)
+      set(T op6static2sm_noexp_abl${SUFFIX}_b200_blackwell_fmha_${PREC})
+      cutlass_add_executable(${T} b200_blackwell_fmha.cu)
+      target_link_libraries(${T} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+      target_include_directories(${T} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      target_compile_definitions(${T} PRIVATE ${NOEXP_DEFS} ${ARGN})
+      target_compile_options(${T} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      message(STATUS "  ablation target: ${T}  [+ ${ARGN}]")
+    endfunction()
+    # WITH-EXP (full softmax, exp kept) ablation base — same as op6static2sm_no_e2rsf_fa4mufu.
+    set(FA4_DEFS
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    function(add_fa4_ablation SUFFIX)
+      set(T op6static2sm_fa4_abl${SUFFIX}_b200_blackwell_fmha_${PREC})
+      cutlass_add_executable(${T} b200_blackwell_fmha.cu)
+      target_link_libraries(${T} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+      target_include_directories(${T} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      target_compile_definitions(${T} PRIVATE ${FA4_DEFS} ${ARGN})
+      target_compile_options(${T} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      message(STATUS "  fa4_ablation target: ${T}  [+ ${ARGN}]")
+    endfunction()
+    add_fa4_ablation(_fmax MXFP8_ABLATE_FMAX)   # with-exp + remove rowmax
+    add_fa4_ablation(_rsum MXFP8_ABLATE_RSUM)   # with-exp + remove row_sum
+    # [MMA overlap probes] Repeat a numerically identical QK overwrite or an
+    # additional PV accumulation while preserving the full exp softmax.
+    add_fa4_ablation(_rq2 MXFP8_REPEAT_QK=2)
+    add_fa4_ablation(_rp2 MXFP8_REPEAT_PV=2)
+    add_fa4_ablation(_rb2 MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_fa4_ablation(_timeline MXFP8_TIMELINE_PROBE)
+    # WITH-EXP physical double-O. O1 occupies TMEM[384:512), while all SF
+    # copies remain enabled; SF/O1 overlap is intentionally ignored (perf-only).
+    add_fa4_ablation(_physical_odepth2 MXFP8_ODEPTH2 MXFP8_PHYSICAL_ODEPTH2)
+    add_noexp_ablation(_rsum MXFP8_ABLATE_RSUM) # noexp + remove row_sum (noexp+max already exists as _fmax)
+    # noexp + double-O handshake (depth-2 PipelineO on single O0; ~1% WAR race, perf-only).
+    add_noexp_ablation(_noexp_odepth2 MXFP8_ODEPTH2)
+    # noexp + fold +row_max into the FMA (exp_out = scale*s + row_max, one FMA) —
+    # eliminates the separate burst ADD (32 FADD2) by folding it into the FMA addend.
+    add_noexp_ablation(_noexp_fma MXFP8_NOEXP_FMA)
+    # Exp1: noexp_fma base + remove max / row_sum
+    add_noexp_ablation(_noexp_fma_fmax MXFP8_NOEXP_FMA MXFP8_ABLATE_FMAX)
+    add_noexp_ablation(_noexp_fma_rsum MXFP8_NOEXP_FMA MXFP8_ABLATE_RSUM)
+    # Exp2: noexp_fma base + double-O handshake
+    add_noexp_ablation(_noexp_fma_odepth2 MXFP8_NOEXP_FMA MXFP8_ODEPTH2)
+    # Exp3: noexp_fma base + drop SF UTCCP
+    add_noexp_ablation(_noexp_fma_nosf MXFP8_NOEXP_FMA MXFP8_DROP_SF_UTCCP)
+    # Exp3: with-exp base + drop SF UTCCP
+    add_fa4_ablation(_nosf MXFP8_DROP_SF_UTCCP)
+    # Exp3 (clean): noexp_fma base + stage SF ONCE (real values, no SF=0 artifact)
+    add_noexp_ablation(_noexp_fma_sfonce MXFP8_NOEXP_FMA MXFP8_SFB_CONST_ONCE MXFP8_SFP_CONST_ONCE MXFP8_SFV_CONST_ONCE)
+    # === New base: P = scale*(S-row_max) directly (NOEXP_RAW), no exp/+1/add ===
+    add_noexp_ablation(_noexp_raw MXFP8_NOEXP_RAW)
+    # Matching no-exp-raw probes for the same added TC work.
+    add_noexp_ablation(_noexp_raw_rq2 MXFP8_NOEXP_RAW MXFP8_REPEAT_QK=2)
+    add_noexp_ablation(_noexp_raw_rp2 MXFP8_NOEXP_RAW MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_noexp_raw_rb2 MXFP8_NOEXP_RAW MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_noexp_raw_timeline MXFP8_NOEXP_RAW MXFP8_TIMELINE_PROBE)
+    # [TC bandwidth probes] Change only the score TMEM->RMEM LDTM count while
+    # preserving QK/PV MMA, SF staging, synchronization, and output flow.
+    add_noexp_ablation(_noexp_raw_nosldtm MXFP8_NOEXP_RAW MXFP8_DROP_S_LDTM)
+    add_noexp_ablation(_noexp_raw_sldtm2 MXFP8_NOEXP_RAW MXFP8_REPEAT_S_LDTM=2)
+    add_noexp_ablation(_noexp_raw_sldtm2_ctrl MXFP8_NOEXP_RAW MXFP8_REPEAT_S_LDTM_CONTROL=2)
+    add_noexp_ablation(_noexp_raw_sldtm4 MXFP8_NOEXP_RAW MXFP8_REPEAT_S_LDTM=4)
+    add_noexp_ablation(_noexp_raw_fmax MXFP8_NOEXP_RAW MXFP8_ABLATE_FMAX)
+    add_noexp_ablation(_noexp_raw_rsum MXFP8_NOEXP_RAW MXFP8_ABLATE_RSUM)
+    # Physical double-O: O0=TMEM[256:384), O1=TMEM[384:512). O1 deliberately
+    # overwrites all scale-factor slots; this target is perf-only.
+    add_noexp_ablation(_noexp_raw_odepth2
+      MXFP8_NOEXP_RAW MXFP8_ODEPTH2 MXFP8_PHYSICAL_ODEPTH2)
+    add_noexp_ablation(_noexp_raw_sfonce MXFP8_NOEXP_RAW MXFP8_SFB_CONST_ONCE MXFP8_SFP_CONST_ONCE MXFP8_SFV_CONST_ONCE)
+    add_noexp_ablation(_convert MXFP8_ABLATE_CONVERT)  # P1: F2FP+HFMA2 e4m3 P-quantizer
+    add_noexp_ablation(_fmul    MXFP8_ABLATE_FMUL)     # P2: O normalize/rescale FMUL2
+    add_noexp_ablation(_ffma    MXFP8_ABLATE_FFMA)     # P3: burst scale FFMA2
+    add_noexp_ablation(_fmax    MXFP8_ABLATE_FMAX)     # P4: row-max FMNMX3 reduction
+    add_noexp_ablation(_mufu    MXFP8_ABLATE_MUFU)     # P5: rescale MUFU.EX2
+    add_noexp_ablation(_fadd    MXFP8_ABLATE_FADD)     # P6: softmax FADD2 (exp-replacement add + row_sum accumulation)
+    add_noexp_ablation(_first2  MXFP8_NOEXP_FIRST2)    # exp->add but add only the first pair (1 FADD2, not 32)
+    # Ablations ON TOP of first2 (1 FADD2 base): remove one class each.
+    add_noexp_ablation(_first2_max  MXFP8_NOEXP_FIRST2 MXFP8_ABLATE_FMAX)     # + remove rowmax (FMNMX3)
+    add_noexp_ablation(_first2_rsum MXFP8_NOEXP_FIRST2 MXFP8_ABLATE_RSUM)     # + remove row_sum accumulation
+    add_noexp_ablation(_first2_conv MXFP8_NOEXP_FIRST2 MXFP8_ABLATE_CONVERT)  # + remove P quantizer (F2FP)
+    # Combinations on top of first2.
+    add_noexp_ablation(_first2_max_rsum MXFP8_NOEXP_FIRST2 MXFP8_ABLATE_FMAX MXFP8_ABLATE_RSUM)  # + rowmax + row_sum
+    # C-all: every ablation macro at once = "softmax compute-free" ceiling
+    add_noexp_ablation(_all MXFP8_ABLATE_CONVERT MXFP8_ABLATE_FMUL MXFP8_ABLATE_FFMA MXFP8_ABLATE_FMAX MXFP8_ABLATE_MUFU)
+    # Combination probes (granularity 2): top winners from the single-probe sweep.
+    add_noexp_ablation(_c_top2 MXFP8_ABLATE_FMAX MXFP8_ABLATE_CONVERT)            # rowmax + quantizer
+    add_noexp_ablation(_c_top3 MXFP8_ABLATE_FMAX MXFP8_ABLATE_CONVERT MXFP8_ABLATE_FMUL)  # + O-norm (clean compute ceiling)
+    # [softmax = load + one add] entire softmax compute gutted to a single add on
+    # the TMEM-loaded data; pipeline handshakes + P/stats STTM kept (no deadlock).
+    add_noexp_ablation(_softmax1add MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT)
+    # softmax1add + drop both the S-load (LDTM) and the P-store (STTM); pipeline
+    # handshakes (fence + release) kept so QK-MMA -> softmax -> PV-MMA order holds.
+    add_noexp_ablation(_softmax1add_notmem MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_TMEM_LDST)
+    # noexp (only exp removed) + drop all SF (SFA/SFB/SFP/SFV) SMEM->TMEM UTCCP copies.
+    add_noexp_ablation(_noexp_nosf MXFP8_DROP_SF_UTCCP)
+    # noexp + stage each SF to TMEM ONCE (real random SF), then reuse — isolates the
+    # pure per-tile UTCCP staging cost with NO SF=0 value artifact.
+    add_noexp_ablation(_noexp_sfonce MXFP8_SFB_CONST_ONCE MXFP8_SFP_CONST_ONCE MXFP8_SFV_CONST_ONCE)
+    # User-requested strict three-way A/B on the live softmax->one-add base:
+    # remove every scale-factor SMEM->TMEM copy, with all MMA/P-store/pipelines kept.
+    add_noexp_ablation(_softmax1add_noallsfcp MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_SF_UTCCP)
+    # User-requested strict three-way A/B on the EXP->ADD base (softmax otherwise
+    # intact). All three carry the same P-pack liveness guard so dropping STTM
+    # cannot let ptxas delete the upstream FP32->FP8 conversion.
+    add_noexp_ablation(_expadd_guard MXFP8_P_PACK_LIVE_GUARD)
+    add_noexp_ablation(_expadd_guard_noallsfcp MXFP8_P_PACK_LIVE_GUARD MXFP8_DROP_SF_UTCCP)
+    add_noexp_ablation(_expadd_guard_nopsttm MXFP8_P_PACK_LIVE_GUARD MXFP8_DROP_P_STTM)
+    # [UTCCP mechanism probes] Strict exp->add base.  Component gates separate
+    # one-shot SFA/SFP from per-tile SFB/SFV; repeat grids expose CP/MMA slopes.
+    add_noexp_ablation(_sfprobe_base)
+    add_noexp_ablation(_sfprobe_nosfa MXFP8_DROP_QK_SFA_UTCCP)
+    add_noexp_ablation(_sfprobe_nosfb MXFP8_DROP_QK_SFB_UTCCP)
+    add_noexp_ablation(_sfprobe_nosfp MXFP8_DROP_PV_SFP_UTCCP)
+    add_noexp_ablation(_sfprobe_nosfv MXFP8_DROP_PV_SFV_UTCCP)
+    add_noexp_ablation(_sfprobe_nosfbv MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP)
+    add_noexp_ablation(_sfprobe_noall MXFP8_DROP_SF_UTCCP)
+    add_noexp_ablation(_sfprobe_cp2 MXFP8_REPEAT_SF_UTCCP=2)
+    add_noexp_ablation(_sfprobe_cp4 MXFP8_REPEAT_SF_UTCCP=4)
+    add_noexp_ablation(_sfprobe_mma2 MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_sfprobe_mma4 MXFP8_REPEAT_QK=4 MXFP8_REPEAT_PV=4)
+    add_noexp_ablation(_sfprobe_mma2_noall MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2 MXFP8_DROP_SF_UTCCP)
+    add_noexp_ablation(_sfprobe_mma4_noall MXFP8_REPEAT_QK=4 MXFP8_REPEAT_PV=4 MXFP8_DROP_SF_UTCCP)
+    add_noexp_ablation(_sfprobe_cp2_mma2 MXFP8_REPEAT_SF_UTCCP=2 MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_sfprobe_cp4_mma4 MXFP8_REPEAT_SF_UTCCP=4 MXFP8_REPEAT_QK=4 MXFP8_REPEAT_PV=4)
+    # Same dynamic SFV copy count and operands; only undo the existing hoist so
+    # the copy is issued immediately before PV instead of before barrier spins.
+    add_noexp_ablation(_sfprobe_sfv_late MXFP8_DISABLE_SFV_HOIST)
+    # Constant-scale, same-value control: with host SFK/SFV set to one, compare
+    # per-tile copies against two-slot one-time initialization.  *_const_guard
+    # carries the same once-branch/init code but still performs the normal copy.
+    add_noexp_ablation(_sfprobe_const_guard MXFP8_SFB_CONST_GUARD MXFP8_SFV_CONST_GUARD)
+    add_noexp_ablation(_sfprobe_const_once MXFP8_SFB_CONST_ONCE MXFP8_SFV_CONST_ONCE)
+    add_noexp_ablation(_sfprobe_const_sfb_once MXFP8_SFB_CONST_ONCE MXFP8_SFV_CONST_GUARD)
+    add_noexp_ablation(_sfprobe_const_sfv_once MXFP8_SFB_CONST_GUARD MXFP8_SFV_CONST_ONCE)
+    # Same UTCCP mechanism probes on the user's actual post-softmax base:
+    # the entire softmax is reduced to one live add.  Constant-scale variants
+    # preserve identical MMA scale values while changing only per-tile staging.
+    add_noexp_ablation(_oneadd_sfprobe_base MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT)
+    add_noexp_ablation(_oneadd_sfprobe_cp2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_REPEAT_SF_UTCCP=2)
+    add_noexp_ablation(_oneadd_sfprobe_cp4 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_REPEAT_SF_UTCCP=4)
+    add_noexp_ablation(_oneadd_sfprobe_sfv_late MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DISABLE_SFV_HOIST)
+    add_noexp_ablation(_oneadd_sfprobe_mma2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_oneadd_sfprobe_cp2_mma2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_REPEAT_SF_UTCCP=2 MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_oneadd_sfprobe_const_guard MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_SFB_CONST_GUARD MXFP8_SFV_CONST_GUARD)
+    add_noexp_ablation(_oneadd_sfprobe_const_sfb_once MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_SFB_CONST_ONCE MXFP8_SFV_CONST_GUARD)
+    add_noexp_ablation(_oneadd_sfprobe_const_sfv_once MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_SFB_CONST_GUARD MXFP8_SFV_CONST_ONCE)
+    add_noexp_ablation(_oneadd_sfprobe_const_once MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_SFB_CONST_ONCE MXFP8_SFV_CONST_ONCE)
+    add_noexp_ablation(_oneadd_sfprobe_noall MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_SF_UTCCP)
+    # Strict P-store A/B: both carry the same externally-live packed-P guard;
+    # the B version gates only the final TMEM store, while PV MMA stays live.
+    add_noexp_ablation(_oneadd_pguard MXFP8_SOFTMAX_ONEADD MXFP8_P_PACK_LIVE_GUARD)
+    add_noexp_ablation(_oneadd_pguard_nopsttm MXFP8_SOFTMAX_ONEADD MXFP8_P_PACK_LIVE_GUARD MXFP8_DROP_P_STTM)
+    # Post-softmax bottleneck probes. Each keeps both QK and PV MMA live and
+    # changes one dependency/resource at a time on top of softmax1add.
+    add_noexp_ablation(_softmax1add_nosldtm MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_S_LDTM)
+    add_noexp_ablation(_softmax1add_nopsttm MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM)
+    add_noexp_ablation(_softmax1add_odepth2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_ODEPTH2)
+    add_noexp_ablation(_softmax1add_nopsttm_odepth2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_ODEPTH2)
+    add_noexp_ablation(_softmax1add_nocorrmul MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_ABLATE_FMUL)
+    add_noexp_ablation(_softmax1add_nocorrmul_odepth2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_ABLATE_FMUL MXFP8_ODEPTH2)
+    add_noexp_ablation(_softmax1add_noqksfcp MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_QK_SFB_UTCCP)
+    add_noexp_ablation(_softmax1add_nopvsfcp MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_PV_SFV_UTCCP)
+    add_noexp_ablation(_softmax1add_nosfcp MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP)
+    add_noexp_ablation(_softmax1add_nopsttm_nosfcp MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP)
+    # MMA slope probes: fixed data movement/synchronization, 2x/4x real tcgen05
+    # work before the same commit. Final accumulators still flow to HBM.
+    add_noexp_ablation(_softmax1add_clean_rq2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_QK=2)
+    add_noexp_ablation(_softmax1add_clean_rq4 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_QK=4)
+    add_noexp_ablation(_softmax1add_clean_rp2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_softmax1add_clean_rp4 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_PV=4)
+    add_noexp_ablation(_softmax1add_clean_rb2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_QK=2 MXFP8_REPEAT_PV=2)
+    add_noexp_ablation(_softmax1add_clean_rb4 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_QK=4 MXFP8_REPEAT_PV=4)
+    add_noexp_ablation(_softmax1add_clean_nosftma MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_DROP_SF_TMA)
+    add_noexp_ablation(_softmax1add_clean_nokvtma MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_DROP_KV_TMA)
+    add_noexp_ablation(_softmax1add_clean_nokvpipe MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_DROP_KV_TMA MXFP8_DROP_KV_PIPE)
+    add_noexp_ablation(_softmax1add_clean_rb8 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_P_STTM MXFP8_DROP_QK_SFB_UTCCP MXFP8_DROP_PV_SFV_UTCCP MXFP8_REPEAT_QK=8 MXFP8_REPEAT_PV=8)
+    # Calibration ceiling: compile out the S/order/C handshakes but retain the
+    # QK and PV tcgen05 MMA operations and the O pipeline/output path.
+    add_noexp_ablation(_softmax1add_decouple MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_2SM_DECOUPLE_PERF)
+    add_noexp_ablation(_softmax1add_decouple_odepth2 MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_2SM_DECOUPLE_PERF MXFP8_ODEPTH2)
+    # [PV-MMA ablation] Skip P×V→O MMA entirely (always). Volatile fence keeps
+    # all inputs/handshakes live → no DCE. O stays stale (perf-only).
+    add_fa4_ablation(_nopv MXFP8_ABLATE_PV_MMA)
+    add_noexp_ablation(_noexp_raw_nopv MXFP8_NOEXP_RAW MXFP8_ABLATE_PV_MMA)
+    add_fa4_ablation(_noqk MXFP8_ABLATE_QK_MMA)
+    add_fa4_ablation(_nomma MXFP8_ABLATE_QK_MMA MXFP8_ABLATE_PV_MMA)
+    add_fa4_ablation(_nopv_nopstore MXFP8_ABLATE_PV_MMA MXFP8_DROP_P_STTM)
+    add_fa4_ablation(_nopv_nopstore_earlys MXFP8_ABLATE_PV_MMA MXFP8_DROP_P_STTM MXFP8_EARLY_S_RELEASE)
+    add_noexp_ablation(_noexp_raw_noqk MXFP8_NOEXP_RAW MXFP8_ABLATE_QK_MMA)
+    add_noexp_ablation(_noexp_raw_nomma MXFP8_NOEXP_RAW MXFP8_ABLATE_QK_MMA MXFP8_ABLATE_PV_MMA)
+    # Framework lower bounds. Keep the original S/O/correction handshakes;
+    # remove QK/PV, TMEM load/store, and SF copies. The final variant also
+    # removes KV/SF TMA and their KV pipeline protocol.
+    add_noexp_ablation(_syncframe MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_TMEM_LDST MXFP8_DROP_SF_UTCCP MXFP8_ABLATE_QK_MMA MXFP8_ABLATE_PV_MMA)
+    add_noexp_ablation(_syncframe_nokv MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_DROP_TMEM_LDST MXFP8_DROP_SF_UTCCP MXFP8_ABLATE_QK_MMA MXFP8_ABLATE_PV_MMA MXFP8_DROP_KV_TMA MXFP8_DROP_KV_PIPE MXFP8_DROP_SF_TMA)
+    add_noexp_ablation(_moveframe MXFP8_SOFTMAX_ONEADD MXFP8_ABLATE_CONVERT MXFP8_ABLATE_QK_MMA MXFP8_ABLATE_PV_MMA)
+    # [PV-after-first ablation] Real PV for first 2 tiles (fills both O pipeline
+    # slots with realistic data), skip after. Correction runs on real O, not zeros.
+    add_fa4_ablation(_pvfirst2 MXFP8_ABLATE_PV_AFTER_FIRST)
+    add_noexp_ablation(_noexp_raw_pvfirst2 MXFP8_NOEXP_RAW MXFP8_ABLATE_PV_AFTER_FIRST)
+
+    function(add_no_e2rsf_mufu_variant VARIANT_NAME BEGIN_PAIR END_PAIR PERIOD SLOT)
+      set(VARIANT_TARGET op6static2sm_no_e2rsf_fa4mufu${VARIANT_NAME}_b200_blackwell_fmha_${PREC})
+      cutlass_add_executable(
+          ${VARIANT_TARGET}
+          b200_blackwell_fmha.cu
+      )
+      target_link_libraries(${VARIANT_TARGET} PRIVATE
+        CUTLASS
+        cutlass_tools_util_includes
+        cuda
+      )
+      target_include_directories(${VARIANT_TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+      target_compile_definitions(${VARIANT_TARGET} PRIVATE
+        ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+        MXFP8_FA4_MUFU_SPLIT
+        MXFP8_FA4_MUFU_BEGIN_PAIR=${BEGIN_PAIR}
+        MXFP8_FA4_MUFU_END_PAIR=${END_PAIR}
+        MXFP8_FA4_MUFU_PERIOD=${PERIOD}
+        MXFP8_FA4_MUFU_SLOT=${SLOT}
+      )
+      target_compile_options(${VARIANT_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      set(OP6_NO_E2RSF_MUFU_VARIANT_TARGETS
+          ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS} ${VARIANT_TARGET}
+          PARENT_SCOPE)
+    endfunction()
+
+    # Ratios are relative to the 32 float2 pairs owned by one softmax group.
+    add_no_e2rsf_mufu_variant(12p5  8 24 4 0)  # 4 / 32 pairs
+    add_no_e2rsf_mufu_variant(18p75 4 28 4 0)  # 6 / 32 pairs
+    add_no_e2rsf_mufu_variant(25    8 24 2 0)  # 8 / 32 pairs
+
     function(add_op6_static_2sm_ablation ABLATION_NAME)
       set(ABLATION_TARGET op6static2sm_${ABLATION_NAME}_b200_blackwell_fmha_${PREC})
       set(ABLATION_DEFS ${OP6_STATIC_2SM_DEFS})
@@ -258,6 +615,33 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     add_op6_static_2sm_ablation(no_amaxfuse MXFP8_AMAXFUSE)
     add_op6_static_2sm_ablation(no_psf_vec16 MXFP8_PSF_VEC16)
 
+    # [EXPERIMENT: double-O handshake] same 128-col O, PipelineO depth-2 to unblock PV.
+    # Accepts ~1% wrong output (WAR race on the single O buffer). Perf-only.
+    set(ODEPTH2_TARGET op6static2sm_odepth2_b200_blackwell_fmha_${PREC})
+    cutlass_add_executable(${ODEPTH2_TARGET} b200_blackwell_fmha.cu)
+    target_link_libraries(${ODEPTH2_TARGET} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+    target_include_directories(${ODEPTH2_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${ODEPTH2_TARGET} PRIVATE ${OP6_STATIC_2SM_DEFS} MXFP8_ODEPTH2)
+    target_compile_options(${ODEPTH2_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # [EXPERIMENT: double-O + no-E2RSF + MUFU 18.75%] stack both optimizations.
+    # Accepts ~1% wrong output (WAR race on the single O buffer). Perf-only.
+    set(ODEPTH2_MUFU_DEFS ${OP6_FA4_MUFU_NO_E2RSF_DEFS})
+    set(ODEPTH2_MUFU_TARGET op6static2sm_odepth2_noe2rsf_mufu_b200_blackwell_fmha_${PREC})
+    cutlass_add_executable(${ODEPTH2_MUFU_TARGET} b200_blackwell_fmha.cu)
+    target_link_libraries(${ODEPTH2_MUFU_TARGET} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+    target_include_directories(${ODEPTH2_MUFU_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${ODEPTH2_MUFU_TARGET} PRIVATE
+      ${ODEPTH2_MUFU_DEFS}
+      MXFP8_ODEPTH2
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    target_compile_options(${ODEPTH2_MUFU_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
   endforeach()
 
   # 一键编译所有 target
@@ -265,6 +649,9 @@ if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC
     DEPENDS
       1ctab200_blackwell_fmha_mxfp8
       op6static2sm_b200_blackwell_fmha_mxfp8
+      op6static2sm_fa4mufu_b200_blackwell_fmha_mxfp8
+      op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_mxfp8
+      ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS}
       ${OP6_STATIC_2SM_ABLATION_TARGETS}
   )
 

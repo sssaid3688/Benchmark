@@ -125,11 +125,21 @@ public:
     cutlass::KernelHardwareInfo hw_info;
   };
 
+  // dQ workspace/staging dtype (BF16 under FAG_DQ_BF16_STAGING, else FP32).
+  // Defined independently (not via the kernel's nested type) so the MLA
+  // specialization never forces instantiation of the 2-SM kernel template.
+  using ElemDQAcc = cute::conditional_t<
+#if defined(FAG_DQ_BF16_STAGING)
+      !IsMla,
+#else
+      false,
+#endif
+      cutlass::bfloat16_t, ElementAccumulator>;
   using OperationSumOdO = cutlass::fmha::device::FMHA<
     cutlass::fmha::kernel::FmhaKernelBwdSumOdO<ProblemShape, Element, ElementAccumulator>
   >;
   using OperationConvert = cutlass::fmha::device::FMHA<
-    cutlass::fmha::kernel::FmhaKernelBwdConvert<ProblemShape, Element, ElementAccumulator>
+    cutlass::fmha::kernel::FmhaKernelBwdConvert<ProblemShape, Element, ElementAccumulator, ElemDQAcc>
   >;
 
   using OperationNormal= cutlass::fmha::device::FMHA<
@@ -153,7 +163,7 @@ public:
     OperationSumOdO op_sum_OdO;
     Operation op;
     OperationConvert op_convert;
-    ElementAccumulator* dQ_acc;
+    ElemDQAcc* dQ_acc;
     size_t dQ_acc_size;
   };
 
@@ -185,7 +195,7 @@ private:
       -1.0f, -log2_e,
       nullptr, {}
     };
-#if defined(FAG_ABLATION_NO_FUSED_ZERO)
+#if defined(FAG_ABLATION_NO_FUSED_ZERO) || defined(FAG_DQ_BF16_STAGING)
     // Ablation: disable the fused dQ_acc zeroing inside SumOdO so a separate
     // cudaMemsetAsync is required (mirrors the 1-SM device path). Isolates the
     // contribution of the kernel-fusion optimization.
@@ -199,7 +209,7 @@ private:
     return result;
   }
 
-  static typename OperationConvert::Arguments to_convert_arguments(Arguments const& args, ElementAccumulator* src = nullptr) {
+  static typename OperationConvert::Arguments to_convert_arguments(Arguments const& args, ElemDQAcc* src = nullptr) {
     using namespace cute;
     auto [Q_, K, D, D_VO, HB] = args.problem_shape;
     auto [H, B] = HB;
@@ -223,7 +233,7 @@ private:
       Arguments const& args,
       ElementAccumulator* sum_OdO = nullptr, cute::tuple<cute::_1, cute::tuple<cute::tuple<int, int>, int>> const& stride_sum_OdO = {},
       ElementAccumulator* scaled_lse = nullptr, cute::tuple<cute::_1, cute::tuple<cute::tuple<int, int>, int>> const& stride_scaled_lse = {},
-      ElementAccumulator* dQ_acc = nullptr, cute::tuple<int, cute::_1, cute::tuple<cute::tuple<int, int>, int>> const& stride_dQ = {}) {
+      ElemDQAcc* dQ_acc = nullptr, cute::tuple<int, cute::_1, cute::tuple<cute::tuple<int, int>, int>> const& stride_dQ = {}) {
 
     return typename Operation::Arguments{
       to_bwd_shape(args.problem_shape),
@@ -279,7 +289,7 @@ public:
     // scaled LSE vector
     workspace_bytes += B*H*Q * sizeof(ElementAccumulator);
     // FP32 versions of outputs that are churned (start off with Q only)
-    workspace_bytes += B*H*Q*D * sizeof(ElementAccumulator);
+    workspace_bytes += B*H*Q*D * sizeof(ElemDQAcc);
     return workspace_bytes;
   }
 
@@ -295,10 +305,13 @@ public:
     int Q = cutlass::round_up(static_cast<int>(Q_), 8);  // Alignment
     ElementAccumulator* sum_OdO = reinterpret_cast<ElementAccumulator*>(workspace_sum_OdO);
     ElementAccumulator* scaled_lse = reinterpret_cast<ElementAccumulator*>(workspace_scaled_lse);
-    ElementAccumulator* dQ_acc = reinterpret_cast<ElementAccumulator*>(workspace_dQ);
+    ElemDQAcc* dQ_acc = reinterpret_cast<ElemDQAcc*>(workspace_dQ);
     params_.dQ_acc = dQ_acc;
-    params_.dQ_acc_size = B*H*Q*D * sizeof(ElementAccumulator);
-    auto args_sum_OdO = to_sum_OdO_arguments(args, sum_OdO, scaled_lse, dQ_acc);
+    params_.dQ_acc_size = B*H*Q*D * sizeof(ElemDQAcc);
+    // Under FAG_DQ_BF16_STAGING the fused zero would write f32-sized elements
+    // into the bf16 workspace; the flag forces the memset path below.
+    auto args_sum_OdO = to_sum_OdO_arguments(args, sum_OdO, scaled_lse,
+        reinterpret_cast<ElementAccumulator*>(dQ_acc));
     auto args_convert = to_convert_arguments(args, dQ_acc);
     params_.op_sum_OdO.initialize(args_sum_OdO, nullptr, stream);
     params_.op_convert.initialize(args_convert, nullptr, stream);
@@ -327,7 +340,7 @@ public:
     workspace_chr += B*H*Q * sizeof(ElementAccumulator);
     ElementAccumulator* scaled_lse = reinterpret_cast<ElementAccumulator*>(workspace_chr);
     workspace_chr += B*H*Q * sizeof(ElementAccumulator);
-    ElementAccumulator* dQ_acc = reinterpret_cast<ElementAccumulator*>(workspace_chr);
+    ElemDQAcc* dQ_acc = reinterpret_cast<ElemDQAcc*>(workspace_chr);
     return initialize_split(args, dQ_acc, sum_OdO, scaled_lse, stream);
   }
 
@@ -343,7 +356,7 @@ public:
       return result;
     }
 
-#if defined(FAG_ABLATION_NO_FUSED_ZERO)
+#if defined(FAG_ABLATION_NO_FUSED_ZERO) || defined(FAG_DQ_BF16_STAGING)
     // Ablation fallback: SumOdO no longer zeroes dQ_acc, so emulate the 1-SM
     // device path with a separate cudaMemsetAsync before the main kernel.
     auto cuda_result = cudaMemsetAsync(params.dQ_acc, 0, params.dQ_acc_size, stream);
