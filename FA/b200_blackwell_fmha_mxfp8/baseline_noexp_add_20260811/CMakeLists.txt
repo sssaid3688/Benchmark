@@ -1,0 +1,426 @@
+# Copyright (c) 2014 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+# =============================================================
+# 独立编译的 CMakeLists.txt
+# cutlass 作为第三方库, 通过 add_subdirectory(../cutlass ...)引入
+#
+# 使用方式:
+#   mkdir build && cd build
+#   cmake .. -DCUTLASS_NVCC_ARCHS="100a"
+#   make b200_blackwell_fmha_mxfp8 -j
+# =============================================================
+
+set_property(
+  SOURCE
+      b200_blackwell_fmha.cu
+  PROPERTY
+      COMPILE_FLAGS "--use_fast_math -lineinfo -ftemplate-backtrace-limit=0"
+)
+
+# --- 测试参数 (供手动运行参考) --------------------------------
+set(TEST_BASIC --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no)
+set(TEST_CAUSAL_00 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=causal)
+set(TEST_CAUSAL_01 --verify --iterations=0 --b=1 --h=1 --h_k=1 --q=1013 --k=1024 --d=128 --mask=causal --causal-type=qend)
+set(TEST_VARLEN --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=residual --varlen)
+set(TEST_HDIM64 --b=2 --h=4 --q=512 --k=512 --d=64 --verify)
+set(TEST_GQA --b=2 --h=4 --h_k=2 --q=512 --k=512 --d=64 --verify)
+
+set(TEST_VARLEN_00 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_VARLEN_01 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_VARLEN_02 --verify --varlen --mask=causal,residual --d=128 --h=4 --h_k=2 --varlen-q=128 --varlen-k=128)
+set(TEST_VARLEN_03 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=8 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_VARLEN_04 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=4 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_VARLEN_05 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=1 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_VARLEN_06 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=2 --varlen-q=256:256:256:256 --varlen-k=256:768:512:512)
+set(TEST_VARLEN_07 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=2 --varlen-q=256:256:256:256 --varlen-k=256:0:1280:512)
+set(TEST_VARLEN_08 --verify --varlen --mask=causal,residual --d=128 --h=8 --h_k=2 --varlen-q=256:0:512:256 --varlen-k=256:256:1024:512)
+set(TEST_VARLEN_09 --verify --varlen --mask=causal,residual --d=64 --h=16 --h_k=16 --varlen-q=100:300 --varlen-k=100:300)
+set(TEST_VARLEN_10 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=4 --varlen-q=3:2 --varlen-k=2:5)
+set(TEST_VARLEN_11 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=2 --varlen-q=17:10 --varlen-k=13:10)
+set(TEST_VARLEN_12 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=4 --varlen-q=177:845 --varlen-k=257:766)
+set(TEST_VARLEN_13 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=2 --varlen-q=177:366:479 --varlen-k=257:0:766)
+set(TEST_VARLEN_14 --verify --varlen --mask=causal,residual --d=64 --h=4 --h_k=4 --varlen-q=1 --varlen-k=1)
+set(TEST_VARLEN_15 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_VARLEN_16 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=257)
+set(TEST_VARLEN_17 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=25)
+set(TEST_VARLEN_18 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_VARLEN_19 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=257)
+set(TEST_VARLEN_20 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=25)
+set(TEST_VARLEN_21 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=1013 --varlen-k=1024)
+set(TEST_VARLEN_22 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=1024 --varlen-k=1035)
+
+
+
+set(TEST_MLA_FWD_VARLEN_00 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_MLA_FWD_VARLEN_01 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_MLA_FWD_VARLEN_02 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=2 --varlen-q=128 --varlen-k=128)
+set(TEST_MLA_FWD_VARLEN_03 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=8 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_MLA_FWD_VARLEN_04 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=4 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_MLA_FWD_VARLEN_05 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=1 --varlen-q=256:256 --varlen-k=512:512)
+set(TEST_MLA_FWD_VARLEN_06 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=2 --varlen-q=256:256:256:256 --varlen-k=256:768:512:512)
+set(TEST_MLA_FWD_VARLEN_07 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=2 --varlen-q=256:256:256:256 --varlen-k=256:0:1280:512)
+set(TEST_MLA_FWD_VARLEN_08 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=8 --h_k=2 --varlen-q=256:0:512:256 --varlen-k=256:256:1024:512)
+set(TEST_MLA_FWD_VARLEN_09 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=16 --h_k=16 --varlen-q=100:300 --varlen-k=100:300)
+set(TEST_MLA_FWD_VARLEN_10 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=4 --varlen-q=2:3 --varlen-k=2:5)
+set(TEST_MLA_FWD_VARLEN_11 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=2 --varlen-q=11:10 --varlen-k=13:10)
+set(TEST_MLA_FWD_VARLEN_12 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=4 --varlen-q=177:766 --varlen-k=257:845)
+set(TEST_MLA_FWD_VARLEN_13 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=2 --varlen-q=177:0:479 --varlen-k=257:0:766)
+set(TEST_MLA_FWD_VARLEN_14 --verify --varlen --mask=causal,residual --dl=128 --dr=64 --h=4 --h_k=4 --varlen-q=1 --varlen-k=1)
+set(TEST_MLA_FWD_VARLEN_15 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_MLA_FWD_VARLEN_16 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=257)
+set(TEST_MLA_FWD_VARLEN_17 --verify --varlen --mask=causal --causal-type=qbegin --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=25)
+set(TEST_MLA_FWD_VARLEN_18 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=128 --varlen-k=128)
+set(TEST_MLA_FWD_VARLEN_19 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=257)
+set(TEST_MLA_FWD_VARLEN_20 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=17 --varlen-k=25)
+set(TEST_MLA_FWD_VARLEN_21 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=1013 --varlen-k=1024)
+set(TEST_MLA_FWD_VARLEN_22 --verify --varlen --mask=causal --causal-type=qend --d=128 --h=4 --h_k=4 --varlen-q=1024 --varlen-k=1035)
+
+
+set(TEST_GEN_BASIC --b=1 --h=4 --k=512 --d=128 --verify)
+set(TEST_GEN_VARLEN --b=1 --h=4 --k=512 --d=128 --verify  --varlen)
+set(TEST_GEN_HDIM64 --b=2 --h=4 --k=512 --d=64 --verify)
+set(TEST_GEN_GQA --b=2 --h=4 --h_k=2 --k=512 --d=128 --verify)
+set(TEST_GEN_REMAP --b=2 --h=4 --h_k=2 --k=512 --d=128 --verify --remap)
+set(TEST_GEN_CACHEONLY --b=2 --h=4 --h_k=2 --k=512 --d=128 --verify --cache-only)
+
+set(TEST_MLA_BASIC --b=1 --k=512 --page=128 --verify)
+set(TEST_BWD_MLA_BASIC --b=1 --h=4 --q=512 --k=512 --d=192 --d_vo=128 --verify --mask=no)
+set(TEST_BWD_MLA_VARLEN --b=1 --h=4 --q=512 --k=512 --d=192 --d_vo=128 --verify --mask=residual --varlen)
+
+set(TEST_MLA_SEP_REDUCTION  --b=1 --k=4096 --split_kv=8 --page=128 --verify)
+set(TEST_MLA_FUSE_REDUCTION --b=1 --k=4096 --split_kv=8 --page=128 --fuse_reduction --verify)
+
+set(TEST_MLA_LARGE_SPLIT_KV --verify --split_kv=20 --page=128)
+# -------------------------------------------------------------
+
+
+if(NOT WIN32 AND (NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang")) AND (CUTLASS_NVCC_ARCHS MATCHES 100a OR CUTLASS_NVCC_ARCHS MATCHES 103a))
+
+  foreach(PREC mxfp8)
+    string(TOUPPER "${PREC}" PREC_MACRO)
+
+    set(BASE_TARGET 1ctab200_blackwell_fmha_${PREC})
+    set(OP6_STATIC_2SM_TARGET op6static2sm_b200_blackwell_fmha_${PREC})
+    set(OP6_FA4_MUFU_TARGET op6static2sm_fa4mufu_b200_blackwell_fmha_${PREC})
+    set(OP6_FA4_MUFU_NO_E2RSF_TARGET op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_${PREC})
+    # [NOEXP probe] optimal no_e2rsf_fa4mufu baseline + softmax P exp2 replaced by
+    # a single add (exp2(out) -> out + row_max_safe). Perf-only (numerics wrong);
+    # retained as the exp-removed baseline for future experiments.
+    set(OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET op6static2sm_no_e2rsf_fa4mufu_noexp_b200_blackwell_fmha_${PREC})
+
+    # 使用 cutlass 提供的函数创建可执行文件
+    # （会自动设置 CUDA 编译选项和 gencode 标志）
+    cutlass_add_executable(
+        ${BASE_TARGET}
+        b200_blackwell_fmha.cu
+    )
+
+    # [重要] 链接 CUTLASS (header-only)、工具库和 CUDA 运行时
+    # cutlass_add_executable 只创建 target, 需要手动链接
+    # cutlass_tools_util_includes 提供 cutlass/util/command_line.h 等工具头文件
+    target_link_libraries(${BASE_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+
+    # 添加自己的头文件路径 (collective/, kernel/, reference/, ...)
+    target_include_directories(${BASE_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # 设置精度宏 (MXFP8)
+    target_compile_definitions(${BASE_TARGET} PRIVATE
+      ${PREC_MACRO}
+      MXFP8_N128
+      MXFP8_PSTATIC
+      MXFP8_PSTATIC_EXP=0
+    )
+
+    # [2-CTA] 通过 -DFMHA_2CTA_FLAG=1 配置开启 2-SM cluster 前向路径（默认关，保留 1-CTA 基线）
+    if(FMHA_2CTA_FLAG)
+      target_compile_definitions(${BASE_TARGET} PRIVATE FMHA_2CTA)
+    endif()
+
+    # 可选: 打印寄存器/共享内存使用情况 (去掉 -v 可静默 ptxas 输出)
+    # target_compile_options(b200_blackwell_fmha_${PREC} PRIVATE -Xptxas -v)
+    target_compile_options(${BASE_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # op6-style 2SM static-P profile used for the 1350 TFLOPS target.
+    cutlass_add_executable(
+        ${OP6_STATIC_2SM_TARGET}
+        b200_blackwell_fmha.cu
+    )
+
+    target_link_libraries(${OP6_STATIC_2SM_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+
+    target_include_directories(${OP6_STATIC_2SM_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    set(OP6_STATIC_2SM_DEFS
+      ${PREC_MACRO}
+      FMHA_2CTA
+      MXFP8_FULL
+      MXFP8_OP6_STATIC_2SM
+      MXFP8_N128
+      MXFP8_KV_STAGES=12
+      MXFP8_AMAXFUSE
+      MXFP8_PSF_VEC16
+      MXFP8_PSTATIC
+      MXFP8_PSTATIC_EXP=0
+      MXFP8_2SM_CREL
+      MXFP8_E2RSF
+      MXFP8_2SM_EXITDB
+      MXFP8_2SM_N128SINGLE
+      MXFP8_2SM_VPREFETCH
+      MXFP8_M2_COMBO
+      MXFP8_G_COMBO
+      MXFP8_R15_ORVLOG
+      MXFP8_WS_REGSM
+      MXFP8_REGSM_SOFTMAX=184
+    )
+
+    target_compile_definitions(${OP6_STATIC_2SM_TARGET} PRIVATE
+      ${OP6_STATIC_2SM_DEFS}
+    )
+
+    target_compile_options(${OP6_STATIC_2SM_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # Independent FA4-style MUFU/FMA split target.  Keeping this separate makes
+    # the baseline and optimized binaries directly comparable from one build.
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+    target_include_directories(${OP6_FA4_MUFU_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_TARGET} PRIVATE
+      ${OP6_STATIC_2SM_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=8
+      MXFP8_FA4_MUFU_END_PAIR=24
+      MXFP8_FA4_MUFU_PERIOD=8
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    target_compile_options(${OP6_FA4_MUFU_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # Interaction target: remove the lagged row-sum filler from the softmax
+    # burst, then apply the same compile-time MUFU/FMA split policy.  This keeps
+    # the experiment orthogonal to both the baseline and the single ablations.
+    set(OP6_FA4_MUFU_NO_E2RSF_DEFS ${OP6_STATIC_2SM_DEFS})
+    list(REMOVE_ITEM OP6_FA4_MUFU_NO_E2RSF_DEFS MXFP8_E2RSF)
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_NO_E2RSF_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+    target_include_directories(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      # Retained winner: 6 / 32 float2 pairs = 18.75% emulation.
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    target_compile_options(${OP6_FA4_MUFU_NO_E2RSF_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # [NOEXP probe] identical to op6static2sm_no_e2rsf_fa4mufu (E2RSF off + 18.75%
+    # MUFU split) plus MXFP8_NOEXP_ADD, which routes the softmax P-value exp2
+    # through exp2(out) -> out + row_max_safe in the mainloop. Only the softmax
+    # P-value exp is removed; the row_sum/O rescale exp2 stay as hardware MUFU.EX2.
+    cutlass_add_executable(
+        ${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET}
+        b200_blackwell_fmha.cu
+    )
+    target_link_libraries(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      CUTLASS
+      cutlass_tools_util_includes
+      cuda
+    )
+    target_include_directories(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_compile_definitions(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE
+      ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+      MXFP8_NOEXP_ADD
+    )
+    target_compile_options(${OP6_FA4_MUFU_NO_E2RSF_NOEXP_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    function(add_no_e2rsf_mufu_variant VARIANT_NAME BEGIN_PAIR END_PAIR PERIOD SLOT)
+      set(VARIANT_TARGET op6static2sm_no_e2rsf_fa4mufu${VARIANT_NAME}_b200_blackwell_fmha_${PREC})
+      cutlass_add_executable(
+          ${VARIANT_TARGET}
+          b200_blackwell_fmha.cu
+      )
+      target_link_libraries(${VARIANT_TARGET} PRIVATE
+        CUTLASS
+        cutlass_tools_util_includes
+        cuda
+      )
+      target_include_directories(${VARIANT_TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+      target_compile_definitions(${VARIANT_TARGET} PRIVATE
+        ${OP6_FA4_MUFU_NO_E2RSF_DEFS}
+        MXFP8_FA4_MUFU_SPLIT
+        MXFP8_FA4_MUFU_BEGIN_PAIR=${BEGIN_PAIR}
+        MXFP8_FA4_MUFU_END_PAIR=${END_PAIR}
+        MXFP8_FA4_MUFU_PERIOD=${PERIOD}
+        MXFP8_FA4_MUFU_SLOT=${SLOT}
+      )
+      target_compile_options(${VARIANT_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      set(OP6_NO_E2RSF_MUFU_VARIANT_TARGETS
+          ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS} ${VARIANT_TARGET}
+          PARENT_SCOPE)
+    endfunction()
+
+    # Ratios are relative to the 32 float2 pairs owned by one softmax group.
+    add_no_e2rsf_mufu_variant(12p5  8 24 4 0)  # 4 / 32 pairs
+    add_no_e2rsf_mufu_variant(18p75 4 28 4 0)  # 6 / 32 pairs
+    add_no_e2rsf_mufu_variant(25    8 24 2 0)  # 8 / 32 pairs
+
+    function(add_op6_static_2sm_ablation ABLATION_NAME)
+      set(ABLATION_TARGET op6static2sm_${ABLATION_NAME}_b200_blackwell_fmha_${PREC})
+      set(ABLATION_DEFS ${OP6_STATIC_2SM_DEFS})
+      foreach(REMOVED_DEF IN LISTS ARGN)
+        list(REMOVE_ITEM ABLATION_DEFS ${REMOVED_DEF})
+      endforeach()
+
+      cutlass_add_executable(
+          ${ABLATION_TARGET}
+          b200_blackwell_fmha.cu
+      )
+
+      target_link_libraries(${ABLATION_TARGET} PRIVATE
+        CUTLASS
+        cutlass_tools_util_includes
+        cuda
+      )
+
+      target_include_directories(${ABLATION_TARGET} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
+
+      target_compile_definitions(${ABLATION_TARGET} PRIVATE
+        ${ABLATION_DEFS}
+      )
+
+      target_compile_options(${ABLATION_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+      set(OP6_STATIC_2SM_ABLATION_TARGETS
+          ${OP6_STATIC_2SM_ABLATION_TARGETS} ${ABLATION_TARGET}
+          PARENT_SCOPE)
+    endfunction()
+
+    add_op6_static_2sm_ablation(no_crel MXFP8_2SM_CREL)
+    add_op6_static_2sm_ablation(no_e2rsf MXFP8_E2RSF)
+    add_op6_static_2sm_ablation(no_exitdb MXFP8_2SM_EXITDB)
+    add_op6_static_2sm_ablation(no_n128single MXFP8_2SM_N128SINGLE)
+    add_op6_static_2sm_ablation(no_vprefetch MXFP8_2SM_VPREFETCH)
+    add_op6_static_2sm_ablation(no_m2_combo MXFP8_M2_COMBO)
+    add_op6_static_2sm_ablation(no_g_combo MXFP8_G_COMBO)
+    add_op6_static_2sm_ablation(no_r15_orvlog MXFP8_R15_ORVLOG)
+    add_op6_static_2sm_ablation(kv_default MXFP8_KV_STAGES=12)
+    add_op6_static_2sm_ablation(regsm_default MXFP8_WS_REGSM MXFP8_REGSM_SOFTMAX=184)
+    add_op6_static_2sm_ablation(no_2cta FMHA_2CTA)
+    add_op6_static_2sm_ablation(no_amaxfuse MXFP8_AMAXFUSE)
+    add_op6_static_2sm_ablation(no_psf_vec16 MXFP8_PSF_VEC16)
+
+    # [EXPERIMENT: double-O handshake] same 128-col O, PipelineO depth-2 to unblock PV.
+    # Accepts ~1% wrong output (WAR race on the single O buffer). Perf-only.
+    set(ODEPTH2_TARGET op6static2sm_odepth2_b200_blackwell_fmha_${PREC})
+    cutlass_add_executable(${ODEPTH2_TARGET} b200_blackwell_fmha.cu)
+    target_link_libraries(${ODEPTH2_TARGET} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+    target_include_directories(${ODEPTH2_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${ODEPTH2_TARGET} PRIVATE ${OP6_STATIC_2SM_DEFS} MXFP8_ODEPTH2)
+    target_compile_options(${ODEPTH2_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+    # [EXPERIMENT: double-O + no-E2RSF + MUFU 18.75%] stack both optimizations.
+    # Accepts ~1% wrong output (WAR race on the single O buffer). Perf-only.
+    set(ODEPTH2_MUFU_DEFS ${OP6_FA4_MUFU_NO_E2RSF_DEFS})
+    set(ODEPTH2_MUFU_TARGET op6static2sm_odepth2_noe2rsf_mufu_b200_blackwell_fmha_${PREC})
+    cutlass_add_executable(${ODEPTH2_MUFU_TARGET} b200_blackwell_fmha.cu)
+    target_link_libraries(${ODEPTH2_MUFU_TARGET} PRIVATE CUTLASS cutlass_tools_util_includes cuda)
+    target_include_directories(${ODEPTH2_MUFU_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(${ODEPTH2_MUFU_TARGET} PRIVATE
+      ${ODEPTH2_MUFU_DEFS}
+      MXFP8_ODEPTH2
+      MXFP8_FA4_MUFU_SPLIT
+      MXFP8_FA4_MUFU_BEGIN_PAIR=4
+      MXFP8_FA4_MUFU_END_PAIR=28
+      MXFP8_FA4_MUFU_PERIOD=4
+      MXFP8_FA4_MUFU_SLOT=0
+    )
+    target_compile_options(${ODEPTH2_MUFU_TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+  endforeach()
+
+  # 一键编译所有 target
+  add_custom_target(b200_blackwell_fmha_all
+    DEPENDS
+      1ctab200_blackwell_fmha_mxfp8
+      op6static2sm_b200_blackwell_fmha_mxfp8
+      op6static2sm_fa4mufu_b200_blackwell_fmha_mxfp8
+      op6static2sm_no_e2rsf_fa4mufu_b200_blackwell_fmha_mxfp8
+      ${OP6_NO_E2RSF_MUFU_VARIANT_TARGETS}
+      ${OP6_STATIC_2SM_ABLATION_TARGETS}
+  )
+
+  # 打印使用说明
+  message(STATUS "========================================")
+  message(STATUS "构建完成! 运行方式:")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/1ctab200_blackwell_fmha_mxfp8 --b=1 --h=4 --q=512 --k=512 --d=128 --verify --mask=no")
+  message(STATUS "  ./b200_blackwell_fmha_mxfp8/op6static2sm_b200_blackwell_fmha_mxfp8 --b=1 --h=40 --q=170100 --k=170100 --d=128 --mask=no --iterations=3")
+  message(STATUS "========================================")
+
+endif()

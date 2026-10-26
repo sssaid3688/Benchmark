@@ -73,10 +73,15 @@
             
 */
 
+#include <chrono>
 #include <iostream>
 #include <random>
 #include <regex>
 #include <type_traits>
+
+#if defined(MXFP8_NVML_ENERGY)
+#include <nvml.h>
+#endif
 
 #include "cute/tensor.hpp"
 
@@ -143,6 +148,9 @@ struct Options {
   int tensor_ring_buffers = 1;
   bool verify = false;
   bool verbose = false;
+#if defined(MXFP8_NVML_ENERGY)
+  bool measure_energy = false;
+#endif
 
   bool causal = false;
   bool causal_q_begin = true;
@@ -162,6 +170,10 @@ struct Options {
   // The host SFP buffers are retained as ABI/debug placeholders only.
   InitStyle init_style_sfp = InitStyle::kRandom;
   InitStyle init_style_sfv = InitStyle::kRandom;
+
+  // [control] zero all input SF (Q/K/V) after init — to test whether SF VALUE
+  // (vs the UTCCP staging cost) affects perf. P-SF is static under PSTATIC.
+  bool zero_sf = false;
 
   static void get_init_style_argument(cutlass::CommandLine& cmd, const char* name, InitStyle& dst, InitStyle const& src) {
     std::string s;
@@ -289,6 +301,9 @@ struct Options {
 
     verify = cmd.check_cmd_line_flag("verify");
     verbose = cmd.check_cmd_line_flag("verbose");
+#if defined(MXFP8_NVML_ENERGY)
+    measure_energy = cmd.check_cmd_line_flag("measure-energy");
+#endif
     persistent = cmd.check_cmd_line_flag("persistent");
 
     std::string mask;
@@ -326,6 +341,7 @@ struct Options {
     get_init_style_argument(cmd, "init-style-sfp", init_style_sfp, init_style_sfp);
     get_init_style_argument(cmd, "init-style-sfv", init_style_sfv, init_style_sfv);
 
+    cmd.get_cmd_line_argument("zero-sf", zero_sf);
     cmd.get_cmd_line_argument("kernel-filter", kernel_filter, defaults.kernel_filter);
   }
 
@@ -350,6 +366,9 @@ struct Options {
       << "  --iterations=<int>          Benchmarking iterations\n"
       << "  --verify                    Verify results\n"
       << "  --verbose                   Print smem and execution time per kernel\n"
+#if defined(MXFP8_NVML_ENERGY)
+      << "  --measure-energy            Measure timed-loop GPU energy with NVML\n"
+#endif
       << "  --mask=<no|residual|causal> Enables masking\n"
       << "  --causal-type=<qbegin|qend> Causal mask type\n"
       << "  --persistent                Enables persistent scheduler\n"
@@ -1031,6 +1050,14 @@ struct FwdRunner {
       initialize_block(buffer.block_SFK, seed + 2026, options.init_style_sfk);
       initialize_block(buffer.block_SFP, seed + 2025, InitStyle::kOne);
       initialize_block(buffer.block_SFV, seed + 2024, options.init_style_sfv);
+
+      // [control] optionally zero Q/K/V SF (e8m0 byte 0 -> scale 2^-127 ~ 0).
+      // P-SF is static under PSTATIC, not touched here.
+      if (options.zero_sf) {
+        cudaMemset(buffer.block_SFQ.get(), 0, size(filter_zeros(layout_SFQ)) * sizeof(ElementScale));
+        cudaMemset(buffer.block_SFK.get(), 0, size(filter_zeros(layout_SFK)) * sizeof(ElementScale));
+        cudaMemset(buffer.block_SFV.get(), 0, size(filter_zeros(layout_SFV)) * sizeof(ElementScale));
+      }
       
       // Build reference SF buffers in row-major order from kernel buffer
       // CUTLASS layout encodes (row, group) in mode0 coord = row + group*128:
@@ -1405,6 +1432,34 @@ struct FwdRunner {
       }
     }
 
+#if defined(MXFP8_NVML_ENERGY)
+    nvmlDevice_t nvml_device{};
+    unsigned long long energy_start_mj = 0;
+    unsigned long long energy_end_mj = 0;
+    std::chrono::steady_clock::time_point energy_window_start{};
+    std::chrono::steady_clock::time_point energy_window_end{};
+    bool nvml_initialized = false;
+    bool nvml_energy_active = false;
+    if (options.measure_energy) {
+      nvmlReturn_t nvml_status = nvmlInit_v2();
+      if (nvml_status == NVML_SUCCESS) {
+        nvml_initialized = true;
+        nvml_status = nvmlDeviceGetHandleByIndex_v2(hw_info.device_id, &nvml_device);
+      }
+      if (nvml_status == NVML_SUCCESS) {
+        energy_window_start = std::chrono::steady_clock::now();
+        nvml_status = nvmlDeviceGetTotalEnergyConsumption(nvml_device, &energy_start_mj);
+      }
+      if (nvml_status != NVML_SUCCESS) {
+        std::cerr << "NVML energy measurement setup failed: "
+                  << nvmlErrorString(nvml_status) << std::endl;
+      }
+      else {
+        nvml_energy_active = true;
+      }
+    }
+#endif
+
     // Record an event at the start of a series of GEMMs
     result = cudaEventRecord(events[0]);
     if (result != cudaSuccess) {
@@ -1447,6 +1502,19 @@ struct FwdRunner {
       return example_result;
     }
 
+#if defined(MXFP8_NVML_ENERGY)
+    if (nvml_energy_active) {
+      nvmlReturn_t nvml_status =
+          nvmlDeviceGetTotalEnergyConsumption(nvml_device, &energy_end_mj);
+      energy_window_end = std::chrono::steady_clock::now();
+      if (nvml_status != NVML_SUCCESS) {
+        std::cerr << "NVML energy measurement read failed: "
+                  << nvmlErrorString(nvml_status) << std::endl;
+        nvml_energy_active = false;
+      }
+    }
+#endif
+
     // Measure elapsed runtime
     float runtime_ms = 0;
     result = cudaEventElapsedTime(&runtime_ms, events[0], events[1]);
@@ -1455,7 +1523,32 @@ struct FwdRunner {
       return example_result;
     }
 
+    float total_runtime_ms = runtime_ms;
     runtime_ms /= static_cast<float>(options.iterations);
+
+#if defined(MXFP8_NVML_ENERGY)
+    if (nvml_energy_active) {
+      unsigned long long const energy_delta_mj = energy_end_mj - energy_start_mj;
+      double const energy_window_ms =
+          std::chrono::duration<double, std::milli>(
+              energy_window_end - energy_window_start).count();
+      double const average_power_w =
+          energy_window_ms > 0.0 ? static_cast<double>(energy_delta_mj) / energy_window_ms : 0.0;
+      double const energy_per_iteration_mj =
+          static_cast<double>(energy_delta_mj) / static_cast<double>(options.iterations);
+      std::cout << std::fixed << std::setprecision(3)
+                << "NVML_ENERGY total_mJ=" << energy_delta_mj
+                << " gpu_total_latency_ms=" << total_runtime_ms
+                << " energy_window_ms=" << energy_window_ms
+                << " iterations=" << options.iterations
+                << " energy_per_iter_mJ=" << energy_per_iteration_mj
+                << " average_power_W=" << average_power_w
+                << std::defaultfloat << std::endl;
+    }
+    if (nvml_initialized) {
+      nvmlShutdown();
+    }
+#endif
 
     double flops;
     if (kIsVarlen) {
@@ -1728,6 +1821,18 @@ int main_single(int argc, char const **args) {
   std::cout << "Forward" << " " << (options.causal ? "Causal" : (options.residual ? "Residual" : "None")) << " ";
   std::cout << "#SM " << hw_info.sm_count << std::endl;
 
+#if defined(MXFP8_TIMELINE_PROBE)
+  void* tl_qk_ptr = nullptr;
+  void* tl_pv_ptr = nullptr;
+  void* tl_sm_ptr = nullptr;
+  cudaGetSymbolAddress(&tl_qk_ptr, g_tl_qk);
+  cudaGetSymbolAddress(&tl_pv_ptr, g_tl_pv);
+  cudaGetSymbolAddress(&tl_sm_ptr, g_tl_sm);
+  cudaMemset(tl_qk_ptr, 0, sizeof(g_tl_qk));
+  cudaMemset(tl_pv_ptr, 0, sizeof(g_tl_pv));
+  cudaMemset(tl_sm_ptr, 0, sizeof(g_tl_sm));
+#endif
+
   auto with_mask = [&](auto fn) {
     if (options.causal) {
       if(options.causal_q_begin) {
@@ -1758,6 +1863,35 @@ int main_single(int argc, char const **args) {
       std::cout << "No kernel instantiated for d=" << options.d << std::endl;
     }
   });
+
+#if defined(MXFP8_TIMELINE_PROBE)
+  cudaDeviceSynchronize();
+  unsigned long long h_qk[64][4] = {};
+  unsigned long long h_pv[64][8] = {};
+  unsigned long long h_sm[2][64][8] = {};
+  cudaMemcpyFromSymbol(h_qk, g_tl_qk, sizeof(h_qk));
+  cudaMemcpyFromSymbol(h_pv, g_tl_pv, sizeof(h_pv));
+  cudaMemcpyFromSymbol(h_sm, g_tl_sm, sizeof(h_sm));
+  for (int tile = 0; tile < 64; ++tile) {
+    if (h_qk[tile][0] || h_qk[tile][2]) {
+      std::cout << "TL,QK," << tile;
+      for (int s = 0; s < 4; ++s) std::cout << ',' << h_qk[tile][s];
+      std::cout << '\n';
+    }
+    if (h_pv[tile][0] || h_pv[tile][5]) {
+      std::cout << "TL,PV," << tile;
+      for (int s = 0; s < 8; ++s) std::cout << ',' << h_pv[tile][s];
+      std::cout << '\n';
+    }
+    for (int group = 0; group < 2; ++group) {
+      if (h_sm[group][tile][0] || h_sm[group][tile][3]) {
+        std::cout << "TL,SM" << group << ',' << tile;
+        for (int s = 0; s < 8; ++s) std::cout << ',' << h_sm[group][tile][s];
+        std::cout << '\n';
+      }
+    }
+  }
+#endif
 #endif
 
   return main_result;

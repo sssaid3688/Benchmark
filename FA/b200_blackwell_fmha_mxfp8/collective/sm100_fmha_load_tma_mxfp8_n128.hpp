@@ -536,7 +536,9 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     // (gmem 64-tiles 2k / 2k+1 -> smem sub-slots 2*stage / 2*stage+1), matching
     // the N=64 sub-MMA's per-CTA 32-row N-split partitioning. Same total bytes.
     int k_index = 0;
+#if !defined(MXFP8_DROP_KV_PIPE)
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+#endif
     // [续19an-perf] cluster fence removed: it only ordered the (deleted) manual expect-tx; arming now rides producer_acquire's arrive_and_expect_tx (stock has no fence here).
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -545,8 +547,12 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       // [刀27 N128SINGLE] N128 QK collective: ONE K copy/stage (per-CTA B = 64-N),
       // ONE slot. SFB tile is now N128 -> index k_index (not 2*k_index). The
       // IsCtaN64 SFB reshape still holds (gates the SF mcast). (oyhj 406-407.)
+#if !defined(MXFP8_DROP_KV_TMA)
       copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, k_index), tKsK(_, kv_slot));
+#endif
+#if !defined(MXFP8_DROP_SF_TMA) && !defined(MXFP8_DROP_KV_TMA)
       copy(params.tma_load_sfb.with(*tma_barrier, mcast_sfb), tKgSFB(_, k_index), tKsSFK(_, kv_slot));  // [MXFP8]
+#endif
 #else
       copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, 2*k_index    ), tKsK(_, 2*kv_slot    ));
       copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, 2*k_index + 1), tKsK(_, 2*kv_slot + 1));
@@ -561,7 +567,9 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     // [MXFP8 N128] single-stage: no second Q tile is loaded.
 
     // V1 (+ SFV1) — V-slot now carries real V-SF (was K-SF filler).
+#if !defined(MXFP8_DROP_KV_PIPE)
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+#endif
     // [续19an-perf] cluster fence removed: it only ordered the (deleted) manual expect-tx; arming now rides producer_acquire's arrive_and_expect_tx (stock has no fence here).
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -573,8 +581,12 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       // is the full 128-D-row SF atom (serves both sub-MMAs).
       copy(params.tma_load_sfv.with(*tma_barrier, mcast_sfb), tVgSFV(_, k_index), tVsSFV(_, v_slot));
 #else
+#if !defined(MXFP8_DROP_KV_TMA)
       copy(params.tma_load_v.with(*tma_barrier, mcast_b), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
+#endif
+#if !defined(MXFP8_DROP_SF_TMA) && !defined(MXFP8_DROP_KV_TMA)
       copy(params.tma_load_sfv.with(*tma_barrier, mcast_sfb), tVgSFV(_, k_index), tVsSFV(_, pipeline_kv_producer_state.index()));  // [PVMX 2a.1b]
+#endif
 #endif
     }
     ++pipeline_kv_producer_state;
@@ -586,21 +598,27 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
 
       // Ki (+ SFBi) — [M3 sub-tile] 2 sub-tile copies per stage (see K1 above).
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+#endif
       // [续19an-perf] cluster fence removed: it only ordered the (deleted) manual expect-tx; arming now rides producer_acquire's arrive_and_expect_tx (stock has no fence here).
       if (lane_predicate) {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         int kv_slot = pipeline_kv_producer_state.index();
 #if defined(MXFP8_2SM_N128SINGLE)
         // [刀27 N128SINGLE] ONE K copy + ONE SFB copy / stage (oyhj 433-434).
+#if !defined(MXFP8_DROP_KV_TMA)
         copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, k_index), tKsK(_, kv_slot));
+#endif
+#if !defined(MXFP8_DROP_SF_TMA) && !defined(MXFP8_DROP_KV_TMA)
         copy(params.tma_load_sfb.with(*tma_barrier, mcast_sfb), tKgSFB(_, k_index), tKsSFK(_, kv_slot));  // [MXFP8]
+#endif
 #else
         copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, 2*k_index    ), tKsK(_, 2*kv_slot    ));
         copy(params.tma_load_k.with(*tma_barrier, mcast_b), tKgK(_, 2*k_index + 1), tKsK(_, 2*kv_slot + 1));
         copy(params.tma_load_sfb.with(*tma_barrier, mcast_sfb), tKgSFB(_, 2*k_index), tKsSFK(_, kv_slot));  // [MXFP8] [M3] one SF atom/stage
 #endif
-#if defined(MXFP8_2SM_VPREFETCH)
+#if defined(MXFP8_2SM_VPREFETCH) && !defined(MXFP8_DROP_KV_TMA)
         // [刀r4 RANK-1] Blackwell MLA load-pipeline hint (oyhj load:440): warm the
         // current V tile's L2 lookup while K is in flight so the following V
         // producer_acquire+TMA does not pay full L2 latency on its critical path.
@@ -616,7 +634,9 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
       ++pipeline_kv_producer_state;
 
       // Vi (+ SFVi) — V-slot now carries real V-SF.
+#if !defined(MXFP8_DROP_KV_PIPE)
       pipeline_kv.producer_acquire(pipeline_kv_producer_state);
+#endif
       // [续19an-perf] cluster fence removed: it only ordered the (deleted) manual expect-tx; arming now rides producer_acquire's arrive_and_expect_tx (stock has no fence here).
       if (lane_predicate) {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -626,8 +646,12 @@ struct Sm100FmhaLoadTmaWarpspecializedMxfp8 {
         copy(params.tma_load_v.with(*tma_barrier, mcast_b), tVgV(_, 1, k_index), tVsV(_, 2*v_slot + 1));
         copy(params.tma_load_sfv.with(*tma_barrier, mcast_sfb), tVgSFV(_, k_index), tVsSFV(_, v_slot));  // [刀12] one SF atom/stage
 #else
+#if !defined(MXFP8_DROP_KV_TMA)
         copy(params.tma_load_v.with(*tma_barrier, mcast_b), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index()));
+#endif
+#if !defined(MXFP8_DROP_SF_TMA) && !defined(MXFP8_DROP_KV_TMA)
         copy(params.tma_load_sfv.with(*tma_barrier, mcast_sfb), tVgSFV(_, k_index), tVsSFV(_, pipeline_kv_producer_state.index()));  // [PVMX 2a.1b]
+#endif
 #endif
       }
       ++pipeline_kv_producer_state;
