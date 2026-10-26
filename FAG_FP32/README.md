@@ -40,6 +40,8 @@ $BIN --b=1 --h=16 --d=128 --d_vo=128 \
 
 Run on an otherwise idle GPU for representative measurements.
 
+The program's `tma` line is an end-to-end CUDA-event result for the main BWD kernel plus the `SumOdO` and `Convert` helper kernels. It is useful for three-kernel throughput, but it is not a main-kernel-only measurement.
+
 ## Reproduce the main-kernel nsys measurement
 
 The following sequence measures the fused 2-SM backward main kernel. The `fag3_reduce` target is a timing-only dQ-reduce ablation: it deliberately removes the reduce data path and must not be used as a correctness or final-performance target.
